@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv/
+.python-version
+
+# ML Models (Crucial: do not push large weights)
+**/models/
+*.safetensors
+*.bin
+*.pth
+*.pt
+*.onnx
+
+# Audio & Media
+*.wav
+*.mp3
+*.m4a
+*.flac
+
+# OS & IDE
+.DS_Store
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Logs & Data
+*.log
+QwenTTS-App/data/*.json
+!QwenTTS-App/data/.gitkeep
+
+# Backups
+*-backup-*/
+qwen-tts-extension-backup-pcm/
