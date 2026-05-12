@@ -12,7 +12,7 @@ class Storage:
             "temperature": 0.2,
             "top_p": 0.5,
             "seed": 42,
-            "repetition_penalty": 1.0,
+            "repetition_penalty": 1.1,
             "lang_code": "zh"
         }
         

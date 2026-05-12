@@ -1,27 +1,38 @@
 import re
 
 class TextProcessor:
-    def __init__(self, max_length=100):
+    def __init__(self, max_length=160):
         self.max_length = max_length
-        self.punctuations = ["。", "！", "？", "；", "!", "?", ";", "."]
+
+    def strip_markdown(self, text):
+        text = re.sub(r'^---[\s\S]*?---\n', '', text)
+        text = re.sub(r'!\[\[.*?\]\]', '', text)
+        text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
+        text = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', text)
+        text = re.sub(r'^\s*#+\s+', '', text, flags=re.MULTILINE)
+        text = re.sub(r'\*\*|__|\*|_', '', text)
+        text = re.sub(r'^\s*>\s+', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^\s*[\*\-\+]\s+', '', text, flags=re.MULTILINE)
+        text = re.sub(r'https?://[^\s]+', '', text)
+        return text
 
     def clean_text(self, text):
-        """
-        激进清洗：删除段落内部所有空格和制表符
-        """
-        # 1. 统一换行符
+        text = self.strip_markdown(text)
         text = text.replace('\r\n', '\n').replace('\r', '\n')
-        # 2. 按行切分，对每一行进行空格剔除
-        lines = text.split('\n')
-        cleaned_lines = [re.sub(r'[ \t]+', '', line).strip() for line in lines]
-        return "\n".join([l for l in cleaned_lines if l])
+        
+        def protect_match(m):
+            return m.group(0).replace(' ', '____SPACE____')
+        
+        text = re.sub(r'[a-zA-Z0-9,.\'\-!]+(?:\s+[a-zA-Z0-9,.\'\-!]+)+', protect_match, text)
+        text = re.sub(r'[ \t]+', '', text)
+        text = text.replace('____SPACE____', ' ')
+        text = text.replace('·', '，')
+        
+        return text.strip()
 
     def smart_split(self, text):
-        """
-        智能切片：按换行和标点符号切分（约100字）
-        """
         cleaned_text = self.clean_text(text)
-        paragraphs = cleaned_text.split('\n')
+        paragraphs = [p.strip() for p in re.split(r'\n+', cleaned_text) if p.strip()]
         chunks = []
 
         for p in paragraphs:
@@ -35,15 +46,24 @@ class TextProcessor:
                         chunks.append(p[current_pos:])
                         break
                     
-                    # 回溯寻找断句标点
                     break_point = -1
                     for i in range(end_pos, current_pos, -1):
-                        if p[i] in self.punctuations:
-                            break_point = i + 1
+                        if i+1 < len(p) and p[i] in ["。", "！", "？", "!"] and p[i+1] in ["”", "』", "'", "\""]:
+                            break_point = i + 2
                             break
+                    if break_point == -1:
+                        for i in range(end_pos, current_pos, -1):
+                            if p[i] in ["。", "！", "？", "!", "?", "；", ";"]:
+                                break_point = i + 1
+                                break
+                    if break_point == -1:
+                        for i in range(end_pos, current_pos, -1):
+                            if p[i] in ["，", ",", " "]:
+                                break_point = i + 1
+                                break
                     
                     if break_point == -1:
-                        break_point = end_pos # 硬切
+                        break_point = end_pos
                     
                     chunks.append(p[current_pos:break_point])
                     current_pos = break_point

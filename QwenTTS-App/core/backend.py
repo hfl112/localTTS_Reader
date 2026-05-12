@@ -1,24 +1,16 @@
 import os
-
-# 1. 彻底禁用 tqdm 监控
-os.environ["TQDM_DISABLE"] = "1"
-os.environ["TQDM_MONITOR_INTERVAL"] = "0"
-try:
-    import tqdm
-    tqdm._monitor.TqdmMonitor = None
-    tqdm.tqdm.monitor_interval = 0
-except:
-    pass
-
 import sys
-import uvicorn
+import time
+import threading
+import multiprocessing as mp
+import mlx.core as mx
+import numpy as np
+import hashlib
 from fastapi import FastAPI, Body
 from contextlib import asynccontextmanager
-import threading
-import queue
-import mlx.core as mx
-import time
+import uvicorn
 import traceback
+import signal
 
 # 确保能找到 core 目录
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -30,145 +22,294 @@ from core.player import PCMPlayer
 from core.processor import TextProcessor
 from core.storage import Storage
 
-# 全局组件
-storage = Storage(data_dir=os.path.join(BASE_DIR, "data"))
-player = PCMPlayer()
-processor = TextProcessor()
-engine = None # 将在专用线程中初始化
+CACHE_DIR = os.path.join(BASE_DIR, "data", "cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-# 任务队列
-task_queue = queue.Queue()
+# 终极同步信号：必须是字符串，确保跨进程一致
+GLOBAL_SENTINEL = "PIPELINE_END_STRICT_V1"
 
-# 全局状态
-class GlobalState:
-    is_playing = False
-    stop_event = threading.Event()
-    current_title = ""
-    current_progress = "0/0"
+def get_text_hash(text):
+    return hashlib.md5(text.encode('utf-8')).hexdigest()
 
-def tts_worker_thread():
-    """
-    【绝对核心】专用的 TTS 推理线程
-    保证模型加载、推理、播放都在同一个线程内完成，解决 MLX Stream 绑定问题
-    """
-    global engine
-    
-    print("[WorkerThread] 正在初始化 MLX 环境...")
+def manage_cache_limit(max_items=10):
     try:
-        mx.set_default_device(mx.gpu)
-        engine = TTSEngine(
-            model_path="models/Qwen3-TTS-1.7B-8bit", 
-            mlx_audio_path="../../mlx_audio"
-        )
-        engine.ensure_model_loaded()
-        print("[WorkerThread] 模型加载成功，准备就绪")
-    except Exception as e:
-        print(f"[WorkerThread] 环境初始化失败: {e}")
-        return
+        files = [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR) if f.endswith('.npy')]
+        if len(files) <= max_items: return
+        files.sort(key=os.path.getmtime)
+        for f in files[:-max_items]: os.remove(f)
+    except: pass
+
+def clear_all_cache():
+    try:
+        for f in os.listdir(CACHE_DIR): os.remove(os.path.join(CACHE_DIR, f))
+    except: pass
+
+# ==========================================
+# 1. 跨进程共享状态
+# ==========================================
+class SharedState:
+    def __init__(self):
+        self.text_q = mp.Queue()
+        self.audio_q = mp.Queue()
+        self.stop_event = mp.Event()
+        self.vram_mb = mp.Value('d', 0.0)
+        self.status_code = mp.Value('i', 0) # 0:IDLE, 1:BUSY, 2:COOLING
+        self.current_task_id = mp.Value('i', 0)
+
+    def set_status(self, status):
+        m = {"IDLE": 0, "BUSY": 1, "COOLING": 2}
+        self.status_code.value = m.get(status, 0)
+
+    def get_status(self):
+        m = {0: "IDLE", 1: "BUSY", 2: "COOLING"}
+        return m.get(self.status_code.value, "IDLE")
+
+# ==========================================
+# 2. 推理子进程
+# ==========================================
+def inference_worker(shared_state):
+    print(f"[InferenceProcess] 启动成功, PID: {os.getpid()}")
+    engine = None
+    last_active_time = time.time()
+    
+    def handle_signal(sig, frame):
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, handle_signal)
 
     while True:
         try:
-            # 等待新任务
-            task = task_queue.get()
-            if task is None: break # 退出信号
+            shared_state.vram_mb.value = mx.get_active_memory() / 1024 / 1024
             
-            # 使用 .get 提供默认值，防止 KeyError
-            text = task.get('text', "")
-            index = task.get('index', 0)
-            is_resume = (text == "RESUME_MODE")
+            try:
+                task = shared_state.text_q.get(timeout=2)
+                last_active_time = time.time()
+            except mp.queues.Empty:
+                if engine and engine.model is not None and (time.time() - last_active_time > 600):
+                    print("[InferenceProcess] 空闲自动卸载模型...")
+                    engine.model = None
+                    mx.clear_cache()
+                    import gc
+                    gc.collect()
+                continue
+
+            if task is None: break
             
-            # 加载最新配置
-            config = storage.load_config()
-            state = storage.load_state()
-            speed = config.get("speed", 1.0)
+            # 识别可靠的字符串哨兵
+            if isinstance(task, str) and task == GLOBAL_SENTINEL:
+                shared_state.audio_q.put(GLOBAL_SENTINEL)
+                continue
+
+            if not isinstance(task, dict): continue
+
+            # 校验 Task ID
+            task_id = task.get('task_id', -1)
+            if task_id != shared_state.current_task_id.value:
+                continue
+
+            config = task['config']
+            target_model_name = config.get("model", "Qwen3-TTS-1.7B-8bit")
+            target_path = f"models/{target_model_name}"
+
+            if engine is None:
+                engine = TTSEngine(model_path=target_path, mlx_audio_path="../../mlx_audio")
             
-            GlobalState.stop_event.clear()
-            GlobalState.is_playing = True
+            if engine.abs_model_path != os.path.abspath(os.path.join(engine.base_dir, target_path)):
+                print(f"[InferenceProcess] 模型切换 -> {target_model_name}")
+                engine = TTSEngine(model_path=target_path, mlx_audio_path="../../mlx_audio")
             
-            # 处理切片
-            if is_resume:
-                current_art = state.get("current_article", {})
-                chunks = current_art.get("chunks", [])
-                curr_idx = current_art.get("current_index", 0) if index == -1 else index
-            else:
-                chunks = processor.smart_split(text)
-                state["current_article"] = {
-                    "title": text[:15].replace("\n", " ") + "...",
-                    "chunks": chunks,
-                    "current_index": 0
-                }
-                storage.save_state(state)
-                curr_idx = 0
+            if engine.model is None:
+                engine.ensure_model_loaded()
             
-            GlobalState.current_title = state["current_article"]["title"]
+            # 针对 0.6B Base 模型的音色加固
+            if "0.6B" in target_model_name:
+                config["instruct"] = f"Persona Anchor: {config.get('voice', 'Serena')}. " + config.get("instruct", "")
+
+            text = task['text']
+            text_hash = task.get('hash')
             
-            if curr_idx < len(chunks):
-                player.start(speed=speed)
-                
-                while curr_idx < len(chunks) and not GlobalState.stop_event.is_set():
-                    chunk_text = chunks[curr_idx]
-                    GlobalState.current_progress = f"{curr_idx+1}/{len(chunks)}"
-                    print(f"[WorkerThread] 正在朗读: {GlobalState.current_progress}")
-                    
-                    for pcm_chunk in engine.generate_stream(chunk_text, config):
-                        if GlobalState.stop_event.is_set():
-                            break
-                        player.play_chunk(pcm_chunk)
-                    
-                    if not GlobalState.stop_event.is_set():
-                        curr_idx += 1
-                        # 更新持久化进度
-                        s = storage.load_state()
-                        s["current_article"]["current_index"] = curr_idx
-                        storage.save_state(s)
-                
-                player.stop(graceful=not GlobalState.stop_event.is_set())
+            # 1. 检查缓存
+            cache_file = os.path.join(CACHE_DIR, f"{text_hash}.npy") if text_hash else None
+            if cache_file and os.path.exists(cache_file):
+                try:
+                    cached_audio = np.load(cache_file)
+                    SR = 16000
+                    for s in range(0, len(cached_audio), SR):
+                        if shared_state.stop_event.is_set() or task_id != shared_state.current_task_id.value: break
+                        shared_state.audio_q.put((task_id, cached_audio[s:s+SR]))
+                        time.sleep(0.005)
+                    shared_state.audio_q.put("CHUNK_DONE")
+                    continue
+                except: pass
+
+            # 2. 实时推理
+            full_audio = []
+            # 针对不同模型决定“喘气”频率：小模型睡得更久，因为生成更快，发热更集中
+            is_small_model = "0.6B" in target_model_name
+            throttle_sleep = 0.04 if is_small_model else 0.01
+
+            for samples in engine.generate_stream(text, config):
+                if shared_state.stop_event.is_set() or task_id != shared_state.current_task_id.value: 
+                    break
+                shared_state.audio_q.put((tid if 'tid' in locals() else task_id, samples))
+                full_audio.append(samples)
+                # 巡航节流
+                time.sleep(throttle_sleep)
             
-            GlobalState.is_playing = False
-            task_queue.task_done()
-            print("[WorkerThread] 任务处理完成")
+            if not shared_state.stop_event.is_set() and task_id == shared_state.current_task_id.value and cache_file and full_audio:
+                try:
+                    np.save(cache_file, np.concatenate(full_audio))
+                    manage_cache_limit(10)
+                except: pass
+            
+            shared_state.audio_q.put("CHUNK_DONE")
+            # 注意：子进程不再随意 set_status("IDLE")，防止监控误报
             
         except Exception as e:
-            print(f"[WorkerThread] 运行报错: {e}")
+            print(f"[InferenceProcess] 异常: {e}")
             traceback.print_exc()
-            GlobalState.is_playing = False
 
-# 使用现代的 lifespan 管理 FastAPI 启动和关闭
+# ==========================================
+# 3. 主进程逻辑
+# ==========================================
+S = SharedState()
+storage = Storage(data_dir=os.path.join(BASE_DIR, "data"))
+# 强制播放器的 SENTINEL 与全局一致
+player = PCMPlayer(sample_rate=16000)
+player.SENTINEL = GLOBAL_SENTINEL
+
+processor = TextProcessor()
+MAIN_IS_PLAYING = False
+MAIN_TITLE = ""
+MAIN_PROGRESS = "0/0"
+
+def performance_monitor_thread():
+    import psutil
+    process = psutil.Process(os.getpid())
+    print("[Monitor] 性能监控就绪")
+    last_status = "IDLE"
+    while True:
+        try:
+            st = S.get_status()
+            if MAIN_IS_PLAYING and st == "IDLE": st = "PLAYING"
+            
+            if st == "IDLE" and last_status != "IDLE":
+                print(f"--- [DIAGNOSE] 任务已结束 (ID: {S.current_task_id.value}) ---\n")
+            
+            last_status = st
+            if st == "IDLE":
+                time.sleep(2)
+                continue
+
+            cpu = process.cpu_percent(interval=None) 
+            log_msg = (
+                f"--- [DIAGNOSE] ---\n"
+                f"Task ID: {S.current_task_id.value} | Status: {st}\n"
+                f"CPU: {cpu}% | VRAM: {S.vram_mb.value:.1f}MB\n"
+                f"Buffer: {player.audio_queue.qsize() * (2048/16000):.1f}s\n"
+                f"------------------\n"
+            )
+            print(log_msg)
+            time.sleep(5)
+        except: time.sleep(5)
+
+def audio_feeder_thread():
+    while True:
+        try:
+            item = S.audio_q.get()
+            if item is None: break
+            if isinstance(item, str) and item == GLOBAL_SENTINEL:
+                player.signal_end_of_article()
+                continue
+            
+            if isinstance(item, tuple) and len(item) == 2:
+                tid, samples = item
+                if tid == S.current_task_id.value:
+                    player.play_chunk(samples)
+        except: pass
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动工作线程
-    worker = threading.Thread(target=tts_worker_thread, daemon=True)
-    worker.start()
+    clear_all_cache()
+    mp.set_start_method('spawn', force=True)
+    p = mp.Process(target=inference_worker, args=(S,), daemon=True)
+    p.start()
+    threading.Thread(target=audio_feeder_thread, daemon=True).start()
+    threading.Thread(target=performance_monitor_thread, daemon=True).start()
     yield
-    # 关闭时发送退出信号
-    task_queue.put(None)
+    p.terminate()
+    clear_all_cache()
+    S.text_q.put(None)
 
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/read")
 async def read_text(data: dict = Body(...)):
-    # 停止当前正在播放的任务
-    GlobalState.stop_event.set()
-    player.stop()
+    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS
+    text = data.get('text', "")
     
-    # 将新任务放入队列
-    task_queue.put(data)
+    with S.current_task_id.get_lock():
+        S.current_task_id.value += 1
+    new_task_id = S.current_task_id.value
+
+    S.stop_event.set()
+    player.stop()
+    S.stop_event.clear()
+    
+    state = storage.load_state()
+    config = storage.load_config()
+    if text == "RESUME_MODE":
+        current_art = state.get("current_article", {})
+        chunks = current_art.get("chunks", [])
+        curr_idx = current_art.get("current_index", 0)
+    else:
+        chunks = processor.smart_split(text)
+        state["current_article"] = {"title": text[:15].replace("\n", " ") + "...", "chunks": chunks, "current_index": 0}
+        storage.save_state(state)
+        curr_idx = 0
+    
+    MAIN_TITLE = state["current_article"]["title"]
+    MAIN_IS_PLAYING = True
+    
+    def task_loop(tid):
+        global MAIN_IS_PLAYING, MAIN_PROGRESS
+        player.start()
+        S.set_status("BUSY")
+        for i in range(curr_idx, len(chunks)):
+            if S.stop_event.is_set() or tid != S.current_task_id.value: break
+            MAIN_PROGRESS = f"{i+1}/{len(chunks)}"
+            chunk_text = chunks[i]
+            S.text_q.put({'task_id': tid, 'text': chunk_text, 'config': config, 'hash': get_text_hash(chunk_text)})
+            state["current_article"]["current_index"] = i
+            storage.save_state(state)
+            while player.audio_queue.qsize() * (2048/16000) > 20.0 and not S.stop_event.is_set() and tid == S.current_task_id.value:
+                S.set_status("COOLING")
+                time.sleep(1.0)
+                S.set_status("BUSY")
+        
+        if tid == S.current_task_id.value:
+            S.text_q.put(GLOBAL_SENTINEL)
+            player.wait_until_finished()
+            MAIN_IS_PLAYING = False
+            S.set_status("IDLE")
+
+    threading.Thread(target=task_loop, args=(new_task_id,), daemon=True).start()
     return {"status": "ok"}
 
 @app.post("/stop")
 async def stop_read():
-    GlobalState.stop_event.set()
+    global MAIN_IS_PLAYING
+    with S.current_task_id.get_lock():
+        S.current_task_id.value += 1
+    S.stop_event.set()
     player.stop()
+    MAIN_IS_PLAYING = False
+    S.set_status("IDLE")
     return {"status": "ok"}
 
 @app.get("/status")
 async def get_status():
-    return {
-        "is_playing": GlobalState.is_playing,
-        "title": GlobalState.current_title,
-        "current_index": GlobalState.current_progress.split('/')[0] if "/" in GlobalState.current_progress else 0,
-        "total_chunks": GlobalState.current_progress.split('/')[1] if "/" in GlobalState.current_progress else 0
-    }
+    buf_sec = player.audio_queue.qsize() * (2048/16000)
+    return {"is_playing": MAIN_IS_PLAYING, "title": MAIN_TITLE, "current_index": MAIN_PROGRESS.split('/')[0] if "/" in MAIN_PROGRESS else 0, "total_chunks": MAIN_PROGRESS.split('/')[1] if "/" in MAIN_PROGRESS else 0, "buffer_sec": buf_sec}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001, log_level="error")
