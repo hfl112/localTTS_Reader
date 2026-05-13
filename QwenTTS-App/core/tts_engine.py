@@ -8,7 +8,7 @@ import time
 class TTSEngine:
     def __init__(self, model_path="models/Qwen3-TTS-1.7B-8bit", mlx_audio_path="../../mlx_audio"):
         # ... (existing path logic)
-        self.sample_rate = 16000 # 强制设定目标采样率为 16k
+        self.sample_rate = 24000 # 改回 24k 原生采样率
         # 计算绝对路径
         self.base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), mlx_audio_path))
         self.abs_model_path = os.path.join(self.base_dir, model_path)
@@ -100,16 +100,8 @@ class TTSEngine:
                 audio_data = mx.concatenate([audio_data, audio_data], axis=1) # [N, 2]
                 audio_data = audio_data * 0.8 # 安全增益
                 
-                # 3. 降采样到 16kHz (如果模型输出不是 16k)
-                # MLX 原生不支持高质量重采样，我们转为 numpy 后用简单线性插值或直接跳步
-                # Qwen3-TTS 默认输出是 24k，转 16k 比例是 1.5
+                # 直接输出 24kHz，无需 scipy resampling
                 samples = np.array(audio_data)
-                if self.sample_rate != 24000:
-                    from scipy import signal
-                    # 使用 scipy.signal.resample 进行高质量降采样
-                    num_samples = int(len(samples) * self.sample_rate / 24000)
-                    samples = signal.resample(samples, num_samples)
-                
                 yield samples.astype(np.float32)
         except Exception as e:
             print(f"[TTSEngine] 生成过程发生错误: {e}")
