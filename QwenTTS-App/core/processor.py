@@ -1,7 +1,7 @@
 import re
 
 class TextProcessor:
-    def __init__(self, max_length=160):
+    def __init__(self, max_length=80):
         self.max_length = max_length
 
     def strip_markdown(self, text):
