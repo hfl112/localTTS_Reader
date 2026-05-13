@@ -7,7 +7,7 @@ import time
 class PCMPlayer:
     SENTINEL = object()
 
-    def __init__(self, sample_rate=16000):
+    def __init__(self, sample_rate=24000):
         self.sample_rate = sample_rate
         self.audio_queue = queue.Queue()
         self.is_active = False  
