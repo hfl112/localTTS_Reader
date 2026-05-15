@@ -11,7 +11,8 @@ class PCMPlayer:
         self.sample_rate = sample_rate
         self.audio_queue = queue.Queue()
         self.is_active = False  
-        self.is_prebuffering = True 
+        self.is_prebuffering = True
+        self.is_paused = False # New state for pausing
         self.min_chunks_to_start = 2
         
         self.stream = None
@@ -42,7 +43,8 @@ class PCMPlayer:
         # 极简回调，排除一切干扰
         data_to_fill = np.zeros((frames, 2), dtype=np.float32)
         
-        if not self.is_active:
+        # If not active OR paused, output silence without consuming queue
+        if not self.is_active or self.is_paused:
             outdata.fill(0)
             return
 
@@ -99,12 +101,19 @@ class PCMPlayer:
 
     def start(self, speed=1.0):
         self.is_active = True
+        self.is_paused = False
         self.is_prebuffering = True 
         self.leftover_data = None
         self.playback_finished_event.clear()
         while not self.audio_queue.empty():
             try: self.audio_queue.get_nowait()
             except: break
+
+    def pause(self):
+        self.is_paused = True
+
+    def resume(self):
+        self.is_paused = False
 
     def play_chunk(self, chunk):
         self.audio_queue.put(chunk)
@@ -118,6 +127,7 @@ class PCMPlayer:
     def stop(self, graceful=False):
         if graceful: self.wait_until_finished()
         self.is_active = False
+        self.is_paused = False
         self.leftover_data = None
         while not self.audio_queue.empty():
             try: self.audio_queue.get_nowait()
