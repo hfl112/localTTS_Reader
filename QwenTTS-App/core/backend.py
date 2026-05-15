@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import json
 import threading
 import multiprocessing as mp
 import mlx.core as mx
@@ -308,8 +309,125 @@ async def stop_read():
 
 @app.get("/status")
 async def get_status():
-    buf_sec = player.audio_queue.qsize() * (2048/16000)
-    return {"is_playing": MAIN_IS_PLAYING, "title": MAIN_TITLE, "current_index": MAIN_PROGRESS.split('/')[0] if "/" in MAIN_PROGRESS else 0, "total_chunks": MAIN_PROGRESS.split('/')[1] if "/" in MAIN_PROGRESS else 0, "buffer_sec": buf_sec}
+    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS
+    # is_playing should be True if MAIN_IS_PLAYING and the player is not paused
+    return {
+        "is_playing": MAIN_IS_PLAYING and not player.is_paused,
+        "title": MAIN_TITLE,
+        "progress": MAIN_PROGRESS,
+        "buffer_sec": player.get_queue_duration(),
+        "status_code": S.get_status()
+    }
+
+@app.post("/pause")
+async def pause_playback():
+    player.pause()
+    return {"status": "paused"}
+
+@app.post("/resume")
+async def resume_playback():
+    player.resume()
+    return {"status": "resumed"}
+
+@app.post("/seek")
+async def seek_playback(data: dict = Body(...)):
+    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS
+    direction = data.get("direction", 1) # 1 for next, -1 for prev
+    
+    state = storage.load_state()
+    current_art = state.get("current_article", {})
+    chunks = current_art.get("chunks", [])
+    
+    if not chunks:
+        return {"error": "No active article"}
+        
+    # Get current index from the global progress string (e.g., "3/10")
+    try:
+        curr = int(MAIN_PROGRESS.split("/")[0]) - 1
+    except:
+        curr = 0
+        
+    new_idx = curr + direction
+    if new_idx < 0: new_idx = 0
+    if new_idx >= len(chunks): new_idx = len(chunks) - 1
+    
+    # Update state
+    state["current_article"]["current_index"] = new_idx
+    storage.save_state(state)
+    
+    # Restart playback at new index by triggering the read flow but simulating "RESUME_MODE"
+    # We must stop current task first
+    with S.current_task_id.get_lock():
+        S.current_task_id.value += 1
+    new_task_id = S.current_task_id.value
+
+    S.stop_event.set()
+    player.stop()
+    S.stop_event.clear()
+    
+    MAIN_IS_PLAYING = True
+    
+    def task_loop(tid, start_idx):
+        global MAIN_PROGRESS
+        player.start()
+        S.set_status("BUSY")
+        for i in range(start_idx, len(chunks)):
+            if S.stop_event.is_set() or tid != S.current_task_id.value: break
+            MAIN_PROGRESS = f"{i+1}/{len(chunks)}"
+            chunk_text = chunks[i]
+            
+            task = {
+                "task_id": tid,
+                "text": chunk_text,
+                "hash": get_text_hash(chunk_text),
+                "config": storage.load_config()
+            }
+            S.text_q.put(task)
+            
+            while S.text_q.qsize() > 2:
+                if S.stop_event.is_set() or tid != S.current_task_id.value: break
+                time.sleep(0.1)
+                
+        if not S.stop_event.is_set() and tid == S.current_task_id.value:
+            S.text_q.put(GLOBAL_SENTINEL)
+            S.set_status("COOLING")
+            global MAIN_IS_PLAYING
+            MAIN_IS_PLAYING = False
+            
+    threading.Thread(target=task_loop, args=(new_task_id, new_idx), daemon=True).start()
+    return {"status": "seeking", "new_index": new_idx}
+
+@app.post("/save_for_later")
+async def save_for_later(data: dict = Body(...)):
+    text = data.get("text", "").strip()
+    if not text:
+        return {"error": "Empty text"}
+        
+    save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
+    saved_items = []
+    
+    if os.path.exists(save_file):
+        try:
+            with open(save_file, "r", encoding="utf-8") as f:
+                saved_items = json.load(f)
+        except:
+            pass
+            
+    # Append new item
+    saved_items.append({
+        "timestamp": time.time(),
+        "text": text,
+        "title": text[:20].replace("\n", " ") + "..."
+    })
+    
+    # Keep only the 3 most recent
+    if len(saved_items) > 3:
+        saved_items = saved_items[-3:]
+        
+    with open(save_file, "w", encoding="utf-8") as f:
+        json.dump(saved_items, f, ensure_ascii=False, indent=2)
+        
+    return {"status": "saved", "count": len(saved_items)}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001, log_level="error")
