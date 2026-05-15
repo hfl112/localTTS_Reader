@@ -114,7 +114,11 @@ export default defineContentScript({
     btnSave.innerHTML = '💾';
     btnSave.title = 'Save Selection for Later';
 
-    controls.append(btnPrev, btnPlayPause, btnNext, btnStop, sep, btnSave);
+    const btnPodcast = document.createElement('button');
+    btnPodcast.innerHTML = '🎙️';
+    btnPodcast.title = 'Generate Podcast from Saved Items';
+
+    controls.append(btnPrev, btnPlayPause, btnNext, btnStop, sep, btnSave, btnPodcast);
     wrapper.append(iconBtn, controls);
     shadow.appendChild(wrapper);
 
@@ -157,6 +161,20 @@ export default defineContentScript({
         alert("Saved for later!");
       } else {
         alert("Please select some text first.");
+      }
+    };
+
+    btnPodcast.onclick = async () => {
+      try {
+        const res = await fetch(`${API_URL}/generate_podcast`, { method: 'POST' });
+        const data = await res.json();
+        if (data.error) {
+          alert("Error: " + data.error);
+        } else {
+          alert("Podcast generation started in background! Check 'data/podcasts' folder later.");
+        }
+      } catch (err) {
+        console.error("API call failed:", err);
       }
     };
 
