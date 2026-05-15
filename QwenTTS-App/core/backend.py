@@ -6,6 +6,7 @@ import threading
 import multiprocessing as mp
 import mlx.core as mx
 import numpy as np
+import scipy.io.wavfile
 import hashlib
 from fastapi import FastAPI, Body
 from contextlib import asynccontextmanager
@@ -183,27 +184,34 @@ MAIN_IS_PLAYING = False
 MAIN_TITLE = ""
 MAIN_PROGRESS = "0/0"
 save_file_lock = threading.Lock()
+PODCAST_FILE = None
+PODCAST_BUFFER = []
 
-def shared_task_loop(tid, start_idx, chunks, config, state):
+def shared_task_loop(tid, start_idx, chunks, config, state, is_podcast=False):
     global MAIN_IS_PLAYING, MAIN_PROGRESS
-    player.start()
+    if not is_podcast:
+        player.start()
     S.set_status("BUSY")
     for i in range(start_idx, len(chunks)):
         if S.stop_event.is_set() or tid != S.current_task_id.value: break
         MAIN_PROGRESS = f"{i+1}/{len(chunks)}"
         chunk_text = chunks[i]
         S.text_q.put({'task_id': tid, 'text': chunk_text, 'config': config, 'hash': get_text_hash(chunk_text)})
-        state["current_article"]["current_index"] = i
-        storage.save_state(state)
-        while player.audio_queue.qsize() * (2048/16000) > 20.0 and not S.stop_event.is_set() and tid == S.current_task_id.value:
+        if not is_podcast:
+            state["current_article"]["current_index"] = i
+            storage.save_state(state)
+        
+        # Don't cool down based on player queue if it's podcast mode (since player isn't playing)
+        while (not is_podcast and player.audio_queue.qsize() * (2048/16000) > 20.0) and not S.stop_event.is_set() and tid == S.current_task_id.value:
             S.set_status("COOLING")
             time.sleep(1.0)
             S.set_status("BUSY")
     
     if tid == S.current_task_id.value:
         S.text_q.put(GLOBAL_SENTINEL)
-        player.wait_until_finished()
-        MAIN_IS_PLAYING = False
+        if not is_podcast:
+            player.wait_until_finished()
+            MAIN_IS_PLAYING = False
         S.set_status("IDLE")
 
 def performance_monitor_thread():
@@ -237,18 +245,34 @@ def performance_monitor_thread():
         except: time.sleep(5)
 
 def audio_feeder_thread():
+    global PODCAST_FILE, PODCAST_BUFFER
     while True:
         try:
             item = S.audio_q.get()
             if item is None: break
             if isinstance(item, str) and item == GLOBAL_SENTINEL:
-                player.signal_end_of_article()
+                if PODCAST_FILE:
+                    try:
+                        if PODCAST_BUFFER:
+                            wav_data = np.concatenate(PODCAST_BUFFER)
+                            scipy.io.wavfile.write(PODCAST_FILE, 24000, wav_data)
+                            print(f"[Podcast] Saved to {PODCAST_FILE}")
+                    except Exception as e:
+                        print(f"[Podcast] Error saving: {e}")
+                    finally:
+                        PODCAST_FILE = None
+                        PODCAST_BUFFER = []
+                else:
+                    player.signal_end_of_article()
                 continue
             
             if isinstance(item, tuple) and len(item) == 2:
                 tid, samples = item
                 if tid == S.current_task_id.value:
-                    player.play_chunk(samples)
+                    if PODCAST_FILE is not None:
+                        PODCAST_BUFFER.append(samples)
+                    else:
+                        player.play_chunk(samples)
         except: pass
 
 @asynccontextmanager
@@ -400,6 +424,50 @@ async def save_for_later(data: dict = Body(...)):
             json.dump(saved_items, f, ensure_ascii=False, indent=2)
         
     return {"status": "saved", "count": len(saved_items)}
+
+@app.post("/generate_podcast")
+async def generate_podcast():
+    global PODCAST_FILE, PODCAST_BUFFER
+    save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
+    saved_items = []
+    
+    with save_file_lock:
+        if os.path.exists(save_file):
+            try:
+                with open(save_file, "r", encoding="utf-8") as f:
+                    saved_items = json.load(f)
+            except: pass
+            
+        if not saved_items:
+            return {"error": "No saved items"}
+            
+        # Clear the saved items after reading
+        with open(save_file, "w", encoding="utf-8") as f:
+            json.dump([], f)
+            
+    text = ""
+    for item in saved_items:
+        text += item.get("text", "") + "\n\n"
+        
+    os.makedirs(os.path.join(BASE_DIR, "data", "podcasts"), exist_ok=True)
+    filename = os.path.join(BASE_DIR, "data", "podcasts", f"podcast_{int(time.time())}.wav")
+    
+    with S.current_task_id.get_lock():
+        S.current_task_id.value += 1
+    new_task_id = S.current_task_id.value
+
+    S.stop_event.set()
+    player.stop()
+    S.stop_event.clear()
+    
+    PODCAST_FILE = filename
+    PODCAST_BUFFER = []
+    
+    chunks = processor.smart_split(text)
+    config = storage.load_config()
+    
+    threading.Thread(target=shared_task_loop, args=(new_task_id, 0, chunks, config, {}, True), daemon=True).start()
+    return {"status": "generating", "file": filename}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001, log_level="error")
