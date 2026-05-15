@@ -176,7 +176,7 @@ def inference_worker(shared_state):
 S = SharedState()
 storage = Storage(data_dir=os.path.join(BASE_DIR, "data"))
 # 强制播放器的 SENTINEL 与全局一致
-player = PCMPlayer(sample_rate=16000)
+player = PCMPlayer(sample_rate=24000)
 player.SENTINEL = GLOBAL_SENTINEL
 
 processor = TextProcessor()
@@ -204,7 +204,8 @@ def shared_task_loop(tid, start_idx, chunks, config, state, is_podcast=False):
                 storage.save_state(state)
             
             # Don't cool down based on player queue if it's podcast mode (since player isn't playing)
-            while (not is_podcast and player.audio_queue.qsize() * (2048/16000) > 20.0) and not S.stop_event.is_set() and tid == S.current_task_id.value:
+            # Use 24000 for calculation
+            while (not is_podcast and player.audio_queue.qsize() * (2048/24000) > 20.0) and not S.stop_event.is_set() and tid == S.current_task_id.value:
                 S.set_status("COOLING")
                 time.sleep(1.0)
                 S.set_status("BUSY")
@@ -239,7 +240,7 @@ def performance_monitor_thread():
                 f"--- [DIAGNOSE] ---\n"
                 f"Task ID: {S.current_task_id.value} | Status: {st}\n"
                 f"CPU: {cpu}% | VRAM: {S.vram_mb.value:.1f}MB\n"
-                f"Buffer: {player.audio_queue.qsize() * (2048/16000):.1f}s\n"
+                f"Buffer: {player.audio_queue.qsize() * (2048/24000):.1f}s\n"
                 f"------------------\n"
             )
             print(log_msg)
@@ -432,21 +433,20 @@ async def save_for_later(data: dict = Body(...)):
                     saved_items = json.load(f)
             except:
                 pass
-                
+
         # Append new item
         saved_items.append({
             "timestamp": time.time(),
             "text": text,
             "title": text[:20].replace("\n", " ") + "..."
         })
-        
+
         # Keep only the 3 most recent
         if len(saved_items) > 3:
             saved_items = saved_items[-3:]
-            
+
         with open(save_file, "w", encoding="utf-8") as f:
             json.dump(saved_items, f, ensure_ascii=False, indent=2)
-        
     return {"status": "saved", "count": len(saved_items)}
 
 @app.post("/generate_podcast")
