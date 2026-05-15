@@ -5,7 +5,7 @@ export default defineConfig({
   manifest: {
     name: "Qwen TTS Reader",
     permissions: ["contextMenus", "storage", "activeTab", "scripting"],
-    host_permissions: ["http://127.0.0.1:8001/*"],
+    host_permissions: ["<all_urls>", "http://127.0.0.1:8001/*"],
     commands: {
       "qwen-tts-read": {
         "suggested_key": {
