@@ -182,6 +182,29 @@ processor = TextProcessor()
 MAIN_IS_PLAYING = False
 MAIN_TITLE = ""
 MAIN_PROGRESS = "0/0"
+save_file_lock = threading.Lock()
+
+def shared_task_loop(tid, start_idx, chunks, config, state):
+    global MAIN_IS_PLAYING, MAIN_PROGRESS
+    player.start()
+    S.set_status("BUSY")
+    for i in range(start_idx, len(chunks)):
+        if S.stop_event.is_set() or tid != S.current_task_id.value: break
+        MAIN_PROGRESS = f"{i+1}/{len(chunks)}"
+        chunk_text = chunks[i]
+        S.text_q.put({'task_id': tid, 'text': chunk_text, 'config': config, 'hash': get_text_hash(chunk_text)})
+        state["current_article"]["current_index"] = i
+        storage.save_state(state)
+        while player.audio_queue.qsize() * (2048/16000) > 20.0 and not S.stop_event.is_set() and tid == S.current_task_id.value:
+            S.set_status("COOLING")
+            time.sleep(1.0)
+            S.set_status("BUSY")
+    
+    if tid == S.current_task_id.value:
+        S.text_q.put(GLOBAL_SENTINEL)
+        player.wait_until_finished()
+        MAIN_IS_PLAYING = False
+        S.set_status("IDLE")
 
 def performance_monitor_thread():
     import psutil
@@ -271,29 +294,7 @@ async def read_text(data: dict = Body(...)):
     MAIN_TITLE = state["current_article"]["title"]
     MAIN_IS_PLAYING = True
     
-    def task_loop(tid):
-        global MAIN_IS_PLAYING, MAIN_PROGRESS
-        player.start()
-        S.set_status("BUSY")
-        for i in range(curr_idx, len(chunks)):
-            if S.stop_event.is_set() or tid != S.current_task_id.value: break
-            MAIN_PROGRESS = f"{i+1}/{len(chunks)}"
-            chunk_text = chunks[i]
-            S.text_q.put({'task_id': tid, 'text': chunk_text, 'config': config, 'hash': get_text_hash(chunk_text)})
-            state["current_article"]["current_index"] = i
-            storage.save_state(state)
-            while player.audio_queue.qsize() * (2048/16000) > 20.0 and not S.stop_event.is_set() and tid == S.current_task_id.value:
-                S.set_status("COOLING")
-                time.sleep(1.0)
-                S.set_status("BUSY")
-        
-        if tid == S.current_task_id.value:
-            S.text_q.put(GLOBAL_SENTINEL)
-            player.wait_until_finished()
-            MAIN_IS_PLAYING = False
-            S.set_status("IDLE")
-
-    threading.Thread(target=task_loop, args=(new_task_id,), daemon=True).start()
+    threading.Thread(target=shared_task_loop, args=(new_task_id, curr_idx, chunks, config, state), daemon=True).start()
     return {"status": "ok"}
 
 @app.post("/stop")
@@ -341,11 +342,7 @@ async def seek_playback(data: dict = Body(...)):
     if not chunks:
         return {"error": "No active article"}
         
-    # Get current index from the global progress string (e.g., "3/10")
-    try:
-        curr = int(MAIN_PROGRESS.split("/")[0]) - 1
-    except:
-        curr = 0
+    curr = current_art.get("current_index", 0)
         
     new_idx = curr + direction
     if new_idx < 0: new_idx = 0
@@ -366,35 +363,9 @@ async def seek_playback(data: dict = Body(...)):
     S.stop_event.clear()
     
     MAIN_IS_PLAYING = True
+    config = storage.load_config()
     
-    def task_loop(tid, start_idx):
-        global MAIN_PROGRESS
-        player.start()
-        S.set_status("BUSY")
-        for i in range(start_idx, len(chunks)):
-            if S.stop_event.is_set() or tid != S.current_task_id.value: break
-            MAIN_PROGRESS = f"{i+1}/{len(chunks)}"
-            chunk_text = chunks[i]
-            
-            task = {
-                "task_id": tid,
-                "text": chunk_text,
-                "hash": get_text_hash(chunk_text),
-                "config": storage.load_config()
-            }
-            S.text_q.put(task)
-            
-            while S.text_q.qsize() > 2:
-                if S.stop_event.is_set() or tid != S.current_task_id.value: break
-                time.sleep(0.1)
-                
-        if not S.stop_event.is_set() and tid == S.current_task_id.value:
-            S.text_q.put(GLOBAL_SENTINEL)
-            S.set_status("COOLING")
-            global MAIN_IS_PLAYING
-            MAIN_IS_PLAYING = False
-            
-    threading.Thread(target=task_loop, args=(new_task_id, new_idx), daemon=True).start()
+    threading.Thread(target=shared_task_loop, args=(new_task_id, new_idx, chunks, config, state), daemon=True).start()
     return {"status": "seeking", "new_index": new_idx}
 
 @app.post("/save_for_later")
@@ -406,26 +377,27 @@ async def save_for_later(data: dict = Body(...)):
     save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
     saved_items = []
     
-    if os.path.exists(save_file):
-        try:
-            with open(save_file, "r", encoding="utf-8") as f:
-                saved_items = json.load(f)
-        except:
-            pass
-            
-    # Append new item
-    saved_items.append({
-        "timestamp": time.time(),
-        "text": text,
-        "title": text[:20].replace("\n", " ") + "..."
-    })
-    
-    # Keep only the 3 most recent
-    if len(saved_items) > 3:
-        saved_items = saved_items[-3:]
+    with save_file_lock:
+        if os.path.exists(save_file):
+            try:
+                with open(save_file, "r", encoding="utf-8") as f:
+                    saved_items = json.load(f)
+            except:
+                pass
+                
+        # Append new item
+        saved_items.append({
+            "timestamp": time.time(),
+            "text": text,
+            "title": text[:20].replace("\n", " ") + "..."
+        })
         
-    with open(save_file, "w", encoding="utf-8") as f:
-        json.dump(saved_items, f, ensure_ascii=False, indent=2)
+        # Keep only the 3 most recent
+        if len(saved_items) > 3:
+            saved_items = saved_items[-3:]
+            
+        with open(save_file, "w", encoding="utf-8") as f:
+            json.dump(saved_items, f, ensure_ascii=False, indent=2)
         
     return {"status": "saved", "count": len(saved_items)}
 
