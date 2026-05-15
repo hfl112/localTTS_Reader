@@ -184,6 +184,7 @@ MAIN_IS_PLAYING = False
 MAIN_TITLE = ""
 MAIN_PROGRESS = "0/0"
 save_file_lock = threading.Lock()
+podcast_buffer_lock = threading.Lock()
 PODCAST_FILE = None
 PODCAST_BUFFER = []
 
@@ -254,21 +255,23 @@ def audio_feeder_thread():
             if isinstance(item, str) and item == GLOBAL_SENTINEL:
                 if PODCAST_FILE:
                     try:
-                        if PODCAST_BUFFER:
-                            wav_data = np.concatenate(PODCAST_BUFFER)
-                            wav_data = (np.clip(wav_data, -1.0, 1.0) * 32767).astype(np.int16)
-                            scipy.io.wavfile.write(PODCAST_FILE, 24000, wav_data)
-                            print(f"[Podcast] Saved to {PODCAST_FILE}")
-                            
-                            save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
-                            with save_file_lock:
-                                with open(save_file, "w", encoding="utf-8") as f:
-                                    json.dump([], f)
+                        with podcast_buffer_lock:
+                            if PODCAST_BUFFER:
+                                wav_data = np.concatenate(PODCAST_BUFFER)
+                                wav_data = (np.clip(wav_data, -1.0, 1.0) * 32767).astype(np.int16)
+                                scipy.io.wavfile.write(PODCAST_FILE, 24000, wav_data)
+                                print(f"[Podcast] Saved to {PODCAST_FILE}")
+                                
+                                save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
+                                with save_file_lock:
+                                    with open(save_file, "w", encoding="utf-8") as f:
+                                        json.dump([], f)
                     except Exception as e:
                         print(f"[Podcast] Error saving: {e}")
                     finally:
                         PODCAST_FILE = None
-                        PODCAST_BUFFER = []
+                        with podcast_buffer_lock:
+                            PODCAST_BUFFER = []
                 else:
                     player.signal_end_of_article()
                 continue
@@ -277,7 +280,8 @@ def audio_feeder_thread():
                 tid, samples = item
                 if tid == S.current_task_id.value:
                     if PODCAST_FILE is not None:
-                        PODCAST_BUFFER.append(samples)
+                        with podcast_buffer_lock:
+                            PODCAST_BUFFER.append(samples)
                     else:
                         player.play_chunk(samples)
         except: pass
@@ -303,7 +307,8 @@ async def read_text(data: dict = Body(...)):
     text = data.get('text', "")
     
     PODCAST_FILE = None
-    PODCAST_BUFFER = []
+    with podcast_buffer_lock:
+        PODCAST_BUFFER = []
     
     with S.current_task_id.get_lock():
         S.current_task_id.value += 1
@@ -336,7 +341,8 @@ async def stop_read():
     global MAIN_IS_PLAYING, PODCAST_FILE, PODCAST_BUFFER
     
     PODCAST_FILE = None
-    PODCAST_BUFFER = []
+    with podcast_buffer_lock:
+        PODCAST_BUFFER = []
     
     with S.current_task_id.get_lock():
         S.current_task_id.value += 1
@@ -374,7 +380,8 @@ async def seek_playback(data: dict = Body(...)):
     direction = data.get("direction", 1) # 1 for next, -1 for prev
     
     PODCAST_FILE = None
-    PODCAST_BUFFER = []
+    with podcast_buffer_lock:
+        PODCAST_BUFFER = []
     
     state = storage.load_state()
     current_art = state.get("current_article", {})
@@ -458,10 +465,6 @@ async def generate_podcast():
         if not saved_items:
             return {"error": "No saved items"}
             
-        # Clear the saved items after reading
-        with open(save_file, "w", encoding="utf-8") as f:
-            json.dump([], f)
-            
     text = ""
     for item in saved_items:
         text += item.get("text", "") + "\n\n"
@@ -478,7 +481,8 @@ async def generate_podcast():
     S.stop_event.clear()
     
     PODCAST_FILE = filename
-    PODCAST_BUFFER = []
+    with podcast_buffer_lock:
+        PODCAST_BUFFER = []
     
     chunks = processor.smart_split(text)
     config = storage.load_config()
