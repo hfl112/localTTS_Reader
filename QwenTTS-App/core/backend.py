@@ -189,30 +189,31 @@ PODCAST_BUFFER = []
 
 def shared_task_loop(tid, start_idx, chunks, config, state, is_podcast=False):
     global MAIN_IS_PLAYING, MAIN_PROGRESS
-    if not is_podcast:
-        player.start()
-    S.set_status("BUSY")
-    for i in range(start_idx, len(chunks)):
-        if S.stop_event.is_set() or tid != S.current_task_id.value: break
-        MAIN_PROGRESS = f"{i+1}/{len(chunks)}"
-        chunk_text = chunks[i]
-        S.text_q.put({'task_id': tid, 'text': chunk_text, 'config': config, 'hash': get_text_hash(chunk_text)})
+    try:
         if not is_podcast:
-            state["current_article"]["current_index"] = i
-            storage.save_state(state)
-        
-        # Don't cool down based on player queue if it's podcast mode (since player isn't playing)
-        while (not is_podcast and player.audio_queue.qsize() * (2048/16000) > 20.0) and not S.stop_event.is_set() and tid == S.current_task_id.value:
-            S.set_status("COOLING")
-            time.sleep(1.0)
-            S.set_status("BUSY")
-    
-    if tid == S.current_task_id.value:
-        S.text_q.put(GLOBAL_SENTINEL)
-        if not is_podcast:
-            player.wait_until_finished()
-            MAIN_IS_PLAYING = False
-        S.set_status("IDLE")
+            player.start()
+        S.set_status("BUSY")
+        for i in range(start_idx, len(chunks)):
+            if S.stop_event.is_set() or tid != S.current_task_id.value: break
+            MAIN_PROGRESS = f"{i+1}/{len(chunks)}"
+            chunk_text = chunks[i]
+            S.text_q.put({'task_id': tid, 'text': chunk_text, 'config': config, 'hash': get_text_hash(chunk_text)})
+            if not is_podcast:
+                state["current_article"]["current_index"] = i
+                storage.save_state(state)
+            
+            # Don't cool down based on player queue if it's podcast mode (since player isn't playing)
+            while (not is_podcast and player.audio_queue.qsize() * (2048/16000) > 20.0) and not S.stop_event.is_set() and tid == S.current_task_id.value:
+                S.set_status("COOLING")
+                time.sleep(1.0)
+                S.set_status("BUSY")
+    finally:
+        if tid == S.current_task_id.value:
+            S.text_q.put(GLOBAL_SENTINEL)
+            if not is_podcast:
+                player.wait_until_finished()
+                MAIN_IS_PLAYING = False
+            S.set_status("IDLE")
 
 def performance_monitor_thread():
     import psutil
@@ -255,8 +256,14 @@ def audio_feeder_thread():
                     try:
                         if PODCAST_BUFFER:
                             wav_data = np.concatenate(PODCAST_BUFFER)
+                            wav_data = (np.clip(wav_data, -1.0, 1.0) * 32767).astype(np.int16)
                             scipy.io.wavfile.write(PODCAST_FILE, 24000, wav_data)
                             print(f"[Podcast] Saved to {PODCAST_FILE}")
+                            
+                            save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
+                            with save_file_lock:
+                                with open(save_file, "w", encoding="utf-8") as f:
+                                    json.dump([], f)
                     except Exception as e:
                         print(f"[Podcast] Error saving: {e}")
                     finally:
@@ -292,8 +299,11 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/read")
 async def read_text(data: dict = Body(...)):
-    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS
+    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS, PODCAST_FILE, PODCAST_BUFFER
     text = data.get('text', "")
+    
+    PODCAST_FILE = None
+    PODCAST_BUFFER = []
     
     with S.current_task_id.get_lock():
         S.current_task_id.value += 1
@@ -323,7 +333,11 @@ async def read_text(data: dict = Body(...)):
 
 @app.post("/stop")
 async def stop_read():
-    global MAIN_IS_PLAYING
+    global MAIN_IS_PLAYING, PODCAST_FILE, PODCAST_BUFFER
+    
+    PODCAST_FILE = None
+    PODCAST_BUFFER = []
+    
     with S.current_task_id.get_lock():
         S.current_task_id.value += 1
     S.stop_event.set()
@@ -356,8 +370,11 @@ async def resume_playback():
 
 @app.post("/seek")
 async def seek_playback(data: dict = Body(...)):
-    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS
+    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS, PODCAST_FILE, PODCAST_BUFFER
     direction = data.get("direction", 1) # 1 for next, -1 for prev
+    
+    PODCAST_FILE = None
+    PODCAST_BUFFER = []
     
     state = storage.load_state()
     current_art = state.get("current_article", {})
