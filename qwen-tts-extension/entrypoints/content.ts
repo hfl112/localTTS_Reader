@@ -56,7 +56,7 @@ export default defineContentScript({
         pointer-events: none;
       }
       .fab-container.expanded .controls {
-        width: 200px;
+        width: 240px;
         opacity: 1;
         pointer-events: auto;
         padding-left: 10px;
@@ -134,13 +134,20 @@ export default defineContentScript({
 
     const callApi = async (endpoint: string, data?: any) => {
       try {
-        await fetch(`${API_URL}${endpoint}`, {
+        const response = await fetch(`${API_URL}${endpoint}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: data ? JSON.stringify(data) : undefined
         });
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          return { error: errData.detail || errData.error || "Server error" };
+        }
+        return await response.json().catch(() => ({ success: true }));
       } catch (err) {
         console.error("API call failed:", err);
+        alert("Cannot connect to QwenTTS server. Please ensure it is running at " + API_URL);
+        return { error: "Connection failed" };
       }
     };
 
@@ -165,16 +172,13 @@ export default defineContentScript({
     };
 
     btnPodcast.onclick = async () => {
-      try {
-        const res = await fetch(`${API_URL}/generate_podcast`, { method: 'POST' });
-        const data = await res.json();
-        if (data.error) {
+      const data = await callApi("/generate_podcast");
+      if (data && data.error) {
+        if (data.error !== "Connection failed") {
           alert("Error: " + data.error);
-        } else {
-          alert("Podcast generation started in background! Check 'data/podcasts' folder later.");
         }
-      } catch (err) {
-        console.error("API call failed:", err);
+      } else if (data) {
+        alert("Podcast generation started in background! Check 'data/podcasts' folder later.");
       }
     };
 
