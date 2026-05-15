@@ -490,5 +490,47 @@ async def generate_podcast():
     threading.Thread(target=shared_task_loop, args=(new_task_id, 0, chunks, config, {}, True), daemon=True).start()
     return {"status": "generating", "file": filename}
 
+@app.get("/saved_items")
+async def get_saved_items():
+    save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
+    with save_file_lock:
+        if os.path.exists(save_file):
+            try:
+                with open(save_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except: pass
+    return []
+
+@app.post("/play_saved")
+async def play_saved(data: dict = Body(...)):
+    indices = data.get("indices", []) # list of indices to play
+    if not indices:
+        return {"error": "No items selected"}
+        
+    save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
+    saved_items = []
+    with save_file_lock:
+        if os.path.exists(save_file):
+            try:
+                with open(save_file, "r", encoding="utf-8") as f:
+                    saved_items = json.load(f)
+            except: pass
+            
+    if not saved_items:
+        return {"error": "Queue empty"}
+        
+    # Concatenate text from selected indices
+    text_to_play = ""
+    for idx in indices:
+        if 0 <= idx < len(saved_items):
+            text_to_play += saved_items[idx].get("text", "") + "\n\n"
+            
+    if not text_to_play.strip():
+        return {"error": "Selected items are empty"}
+        
+    # Trigger normal playback by calling the same logic as /read
+    # We must reset the current task state exactly like /read does
+    return await read_text({"text": text_to_play})
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001, log_level="error")
