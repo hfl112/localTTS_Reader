@@ -1,31 +1,52 @@
 export default defineBackground(() => {
-  const APP_API_URL = "http://127.0.0.1:8001/read";
+  const API_URL = "http://127.0.0.1:8001";
 
-  const sendToApp = async (text: string, tabId?: number) => {
-    console.log("Sending text to Qwen App...");
+  // Shared state for all tabs
+  let lastState = { is_playing: false };
+
+  const callBackend = async (endpoint: string, method: string = 'POST', data?: any) => {
     try {
-      const response = await fetch(APP_API_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: text, index: 0 }),
+      const response = await fetch(`${API_URL}${endpoint}`, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: data ? JSON.stringify(data) : undefined
       });
-
-      if (!response.ok) {
-        throw new Error(`App is not responding (HTTP ${response.status})`);
-      }
-      console.log("Success! App is reading the text.");
-
-    } catch (err: any) {
-      console.error("Remote Read Error:", err);
-      if (tabId) {
-        browser.tabs.sendMessage(tabId, { 
-          type: "TTS_ERROR", 
-          error: "无法连接到 Qwen App，请确保它正在菜单栏运行 (Port 8001)" 
-        });
-      }
+      if (!response.ok) return { error: `Server error: ${response.status}` };
+      return await response.json();
+    } catch (err) {
+      console.error("Backend communication failed:", err);
+      return { error: "Connection failed" };
     }
   };
 
+  // Poll backend status and broadcast to all tabs
+  setInterval(async () => {
+    try {
+      const data = await callBackend("/status", "GET");
+      if (data && !data.error) {
+        lastState = data;
+        const tabs = await browser.tabs.query({});
+        tabs.forEach(tab => {
+          if (tab.id) {
+            browser.tabs.sendMessage(tab.id, { type: "QWEN_STATUS_UPDATE", data }).catch(() => {});
+          }
+        });
+      }
+    } catch (e) {}
+  }, 1000);
+
+  // Listen for messages from content script
+  browser.runtime.onMessage.addListener(async (message: any, sender) => {
+    if (message.type === "QWEN_COMMAND") {
+      const result = await callBackend(message.endpoint, 'POST', message.data);
+      return result;
+    }
+    if (message.type === "GET_LAST_STATE") {
+      return lastState;
+    }
+  });
+
+  // Original context menu and shortcut logic
   browser.runtime.onInstalled.addListener(() => {
     browser.contextMenus.removeAll(() => {
       browser.contextMenus.create({
@@ -33,36 +54,27 @@ export default defineBackground(() => {
         title: "使用 Qwen App 朗读",
         contexts: ["selection"],
       });
-      console.log("Qwen App Remote Ready.");
     });
   });
 
-  // Handle Context Menu clicks
   browser.contextMenus.onClicked.addListener((info, tab) => {
     if (info.menuItemId === "qwen-tts-read-v2" && info.selectionText) {
-      sendToApp(info.selectionText, tab?.id);
+      callBackend("/read", "POST", { text: info.selectionText, index: 0 });
     }
   });
 
-  // Handle Keyboard Shortcuts
   browser.commands.onCommand.addListener(async (command) => {
     if (command === "qwen-tts-read") {
-      try {
-        const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-        if (!tab || !tab.id) return;
-        
-        // Inject script to get the selected text from the active tab
+      const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+      if (tab?.id) {
         const results = await browser.scripting.executeScript({
           target: { tabId: tab.id },
           func: () => window.getSelection()?.toString() || ""
         });
-        
         const selectionText = results[0]?.result;
         if (selectionText) {
-          sendToApp(selectionText, tab.id);
+          callBackend("/read", "POST", { text: selectionText, index: 0 });
         }
-      } catch (err) {
-        console.error("Error handling command:", err);
       }
     }
   });
