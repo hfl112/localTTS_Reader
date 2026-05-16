@@ -77,15 +77,15 @@ export default defineContentScript({
           position: absolute; bottom: 52px; right: 8px; width: 230px;
           background: rgba(24, 24, 27, 0.88); backdrop-filter: blur(28px);
           border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 16px;
-          box-shadow: 0 15px 45px rgba(0, 0, 0, 0.35); padding: 10px;
-          display: none; flex-direction: column; gap: 4px; animation: fadeIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+          box-shadow: 0 15px 45px rgba(0, 0, 0, 0.35); padding: 8px;
+          display: none; flex-direction: column; gap: 2px; animation: fadeIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
           z-index: 1000;
         }
         .queue-popup.show { display: flex; }
-        .queue-header { font-size: 12px; font-weight: 500; color: rgba(255, 255, 255, 0.6); padding: 2px 4px 6px; border-bottom: 1px solid rgba(255, 255, 255, 0.05); }
-        .queue-list { max-height: 180px; overflow-y: auto; display: flex; flex-direction: column; padding-top: 4px; }
+        .queue-header { font-size: 13px; font-weight: 500; color: rgba(255, 255, 255, 0.75); padding: 2px 4px 4px; border-bottom: 1px solid rgba(255, 255, 255, 0.05); }
+        .queue-list { max-height: 180px; overflow-y: auto; display: flex; flex-direction: column; padding-top: 2px; }
         .queue-item {
-          display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 8px; border-radius: 10px;
+          display: flex; align-items: center; gap: 8px; height: 38px; padding: 0 6px; border-radius: 8px;
           cursor: pointer; transition: 0.2s;
         }
         .queue-item:hover { background: rgba(255, 255, 255, 0.06); }
@@ -93,26 +93,26 @@ export default defineContentScript({
           appearance: none; width: 14px; height: 14px; border: 1px solid rgba(255, 255, 255, 0.25); 
           border-radius: 4px; cursor: pointer; transition: 0.2s; position: relative;
         }
-        .queue-item input[type="checkbox"]:checked { background: #4DA3FF; border-color: transparent; }
+        .queue-item input[type="checkbox"]:checked { background: rgba(77, 163, 255, 0.85); border-color: transparent; }
         .queue-item input[type="checkbox"]:checked::after {
           content: '✓'; color: white; font-size: 10px; position: absolute; left: 1.5px; top: -1px;
         }
         .queue-item-text { flex: 1; font-size: 13px; color: rgba(255,255,255,0.9); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .queue-item-time { font-size: 11px; color: rgba(255, 255, 255, 0.3); }
         .btn-del {
-          opacity: 0; width: 24px; height: 24px; border-radius: 6px;
+          opacity: 0; width: 22px; height: 22px; border-radius: 6px;
           display: flex; align-items: center; justify-content: center;
           color: #FF4D4D; transition: 0.2s;
         }
         .queue-item:hover .btn-del { opacity: 0.7; }
         .btn-del:hover { background: rgba(255, 77, 77, 0.12); opacity: 1; }
         
-        .queue-footer { padding-top: 10px; display: flex; justify-content: center; }
+        .queue-footer { padding-top: 6px; display: flex; justify-content: flex-end; }
         .btn-play-selected {
-          background: rgba(255, 255, 255, 0.1); border: 1px solid rgba(255, 255, 255, 0.05); color: rgba(255, 255, 255, 0.9); 
-          height: 32px; padding: 0 16px; border-radius: 10px; font-size: 12px; font-weight: 500; cursor: pointer; transition: 0.2s;
+          background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.05); color: rgba(255, 255, 255, 0.85); 
+          height: 28px; padding: 0 12px; border-radius: 8px; font-size: 12px; font-weight: 500; cursor: pointer; transition: 0.2s;
         }
-        .btn-play-selected:hover { background: rgba(255, 255, 255, 0.15); }
+        .btn-play-selected:hover { background: rgba(255, 255, 255, 0.15); color: white; }
 
         .empty-state { padding: 8px 4px 4px; text-align: left; }
         .empty-main { font-size: 13px; color: rgba(255,255,255,0.8); margin-bottom: 2px; }
@@ -194,7 +194,7 @@ export default defineContentScript({
       queuePopup.onmouseleave = () => queuePopup.classList.remove('show');
 
       function renderQueue(items: any[]) {
-        queuePopup.innerHTML = `<div class="queue-header">Saved Queue · ${items.length}</div><div class="queue-list"></div>`;
+        queuePopup.innerHTML = `<div class="queue-header">Saved · ${items.length}</div><div class="queue-list"></div>`;
         const list = queuePopup.querySelector('.queue-list')!;
         if (items.length === 0) {
           list.innerHTML = `<div class="empty-state"><div class="empty-main">还没有收藏内容</div><div class="empty-sub">划词后点击 🔖 即可保存</div></div>`;
