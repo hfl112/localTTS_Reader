@@ -64,15 +64,17 @@ export default defineContentScript({
         .btn.active { color: #4DA3FF; background: rgba(77, 163, 255, 0.12); }
         
         .btn-play-main {
-          color: white; background: rgba(255, 255, 255, 0.1); border: 1px solid rgba(255, 255, 255, 0.12);
+          color: white; background: rgba(255, 255, 255, 0.16); border: 1px solid rgba(255, 255, 255, 0.12);
+          transform: scale(1.06); margin: 0 4px;
         }
+        .btn-play-main:hover { transform: scale(1.12); background: rgba(255, 255, 255, 0.22); }
         .btn-play-main.active { color: #4DA3FF; background: rgba(77, 163, 255, 0.15); box-shadow: 0 0 12px rgba(77, 163, 255, 0.3); border-color: rgba(77, 163, 255, 0.4); }
 
         .divider { width: 1px; height: 16px; background: rgba(255, 255, 255, 0.08); margin: 0 4px; }
         
         /* Queue Popup - Narrow Card Anchored to Right */
         .queue-popup {
-          position: absolute; bottom: 54px; right: 0; width: 280px;
+          position: absolute; bottom: 52px; right: 8px; width: 230px;
           background: rgba(24, 24, 27, 0.88); backdrop-filter: blur(28px);
           border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 16px;
           box-shadow: 0 15px 45px rgba(0, 0, 0, 0.35); padding: 10px;
@@ -81,7 +83,7 @@ export default defineContentScript({
         }
         .queue-popup.show { display: flex; }
         .queue-header { font-size: 12px; font-weight: 500; color: rgba(255, 255, 255, 0.6); padding: 2px 4px 6px; border-bottom: 1px solid rgba(255, 255, 255, 0.05); }
-        .queue-list { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; padding-top: 4px; }
+        .queue-list { max-height: 180px; overflow-y: auto; display: flex; flex-direction: column; padding-top: 4px; }
         .queue-item {
           display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 8px; border-radius: 10px;
           cursor: pointer; transition: 0.2s;
@@ -112,7 +114,7 @@ export default defineContentScript({
         }
         .btn-play-selected:hover { background: rgba(255, 255, 255, 0.15); }
 
-        .empty-state { padding: 12px 6px; text-align: left; }
+        .empty-state { padding: 8px 4px 4px; text-align: left; }
         .empty-main { font-size: 13px; color: rgba(255,255,255,0.8); margin-bottom: 2px; }
         .empty-sub { font-size: 11px; color: rgba(255,255,255,0.4); }
 
