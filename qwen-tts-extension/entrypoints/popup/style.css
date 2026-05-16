@@ -1,11 +1,12 @@
 body {
   margin: 0;
-  padding: 12px 16px;
-  background: #18181b;
+  padding: 8px 12px;
+  background: rgba(40, 40, 42, 0.95);
+  backdrop-filter: blur(20px);
   color: white;
   font-family: system-ui, -apple-system, sans-serif;
   width: max-content;
-  min-width: 200px;
+  min-width: 180px;
 }
 
 .menu-list {
@@ -19,10 +20,20 @@ body {
   justify-content: space-between;
   width: 100%;
   color: rgba(255, 255, 255, 0.9);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
   cursor: pointer;
   user-select: none;
+}
+
+.item-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.item-label svg {
+  color: rgba(255, 255, 255, 0.7);
 }
 
 /* Toggle Switch Styles */
