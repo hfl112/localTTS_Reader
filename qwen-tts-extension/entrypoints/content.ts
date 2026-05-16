@@ -88,7 +88,7 @@ export default defineContentScript({
           display: flex; align-items: center; gap: 8px; height: 38px; padding: 0 6px; border-radius: 8px;
           cursor: pointer; transition: 0.2s;
         }
-        .queue-item:hover { background: rgba(255, 255, 255, 0.06); }
+        .queue-item:hover { background: rgba(255, 255, 255, 0.04); }
         .queue-item input[type="checkbox"] { 
           appearance: none; width: 14px; height: 14px; border: 1px solid rgba(255, 255, 255, 0.25); 
           border-radius: 4px; cursor: pointer; transition: 0.2s; position: relative;
@@ -102,10 +102,10 @@ export default defineContentScript({
         .btn-del {
           opacity: 0; width: 22px; height: 22px; border-radius: 6px;
           display: flex; align-items: center; justify-content: center;
-          color: #FF4D4D; transition: 0.2s;
+          color: rgba(255, 255, 255, 0.25); transition: 0.2s;
         }
-        .queue-item:hover .btn-del { opacity: 0.7; }
-        .btn-del:hover { background: rgba(255, 77, 77, 0.12); opacity: 1; }
+        .queue-item:hover .btn-del { opacity: 1; }
+        .btn-del:hover { background: rgba(255, 77, 77, 0.12); color: #FF4D4D; }
         
         .queue-footer { padding-top: 6px; display: flex; justify-content: flex-end; }
         .btn-play-selected {
@@ -215,8 +215,7 @@ export default defineContentScript({
 
         const footer = document.createElement('div'); footer.className = 'queue-footer';
         const pBtn = document.createElement('button'); pBtn.className = 'btn-play-selected';
-        const selectedCount = items.length;
-        pBtn.textContent = `▶ Play ${selectedCount} Selected`;
+        pBtn.textContent = `▶ Play Selected`;
         pBtn.onclick = async () => {
           const idxs = Array.from(queuePopup.querySelectorAll('input:checked')).map(cb => parseInt((cb as HTMLElement).getAttribute('data-idx')!));
           if (idxs.length) { await callApi("/play_saved", { indices: idxs }); queuePopup.classList.remove('show'); showToast("🎙️ 开始朗读队列..."); }
