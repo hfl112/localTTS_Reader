@@ -35,30 +35,57 @@ export default defineBackground(() => {
     } catch (e) {}
   }, 1000);
 
-  // Listen for messages from content script
-  browser.runtime.onMessage.addListener(async (message: any, sender) => {
+  // Consolidated message listener
+  browser.runtime.onMessage.addListener((message: any, sender, sendResponse) => {
+    console.log("[Qwen TTS] Message received:", message.type);
+
     if (message.type === "QWEN_COMMAND") {
-      const result = await callBackend(message.endpoint, 'POST', message.data);
-      return result;
+      const method = message.method || 'POST';
+      callBackend(message.endpoint, method, message.data)
+        .then(result => sendResponse(result))
+        .catch(() => sendResponse({ error: "Command failed" }));
+      return true;
     }
+
+    if (message.type === "READ_CLIPBOARD") {
+      browser.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+        if (tab?.id) {
+          browser.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: () => navigator.clipboard.readText()
+          }).then(results => {
+            const clipText = results[0]?.result;
+            if (clipText) {
+              callBackend("/read", "POST", { text: clipText, index: 0 })
+                .then(res => sendResponse(res));
+            } else {
+              sendResponse({ error: "Clipboard empty" });
+            }
+          }).catch(() => sendResponse({ error: "Scripting failed" }));
+        } else {
+          sendResponse({ error: "No active tab" });
+        }
+      });
+      return true;
+    }
+
     if (message.type === "GET_LAST_STATE") {
-      return lastState;
+      sendResponse(lastState);
+      return false;
     }
   });
 
-  // Original context menu and shortcut logic
+  // Setup context menu
   browser.runtime.onInstalled.addListener(() => {
-    browser.contextMenus.removeAll(() => {
-      browser.contextMenus.create({
-        id: "qwen-tts-read-v2",
-        title: "使用 Qwen App 朗读",
-        contexts: ["selection"],
-      });
+    browser.contextMenus.create({
+      id: "qwen-read-selection",
+      title: "使用 Qwen 朗读选中内容",
+      contexts: ["selection"],
     });
   });
 
-  browser.contextMenus.onClicked.addListener((info, tab) => {
-    if (info.menuItemId === "qwen-tts-read-v2" && info.selectionText) {
+  browser.contextMenus.onClicked.addListener(async (info, tab) => {
+    if (info.menuItemId === "qwen-read-selection" && info.selectionText) {
       callBackend("/read", "POST", { text: info.selectionText, index: 0 });
     }
   });

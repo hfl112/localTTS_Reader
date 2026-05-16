@@ -52,7 +52,7 @@ export default defineContentScript({
           display: flex; align-items: center; gap: 2px; opacity: 0;
           transition: opacity 0.3s; pointer-events: none; margin-left: 0;
         }
-        .bar:hover .content, .bar.active .content { opacity: 1; pointer-events: auto; margin-left: 6px; }
+        .bar:hover .content, .bar.active .content, .bar.expanded .content { opacity: 1; pointer-events: auto; margin-left: 6px; }
         .btn {
           width: 32px; height: 32px; border-radius: 10px; display: flex; align-items: center;
           justify-content: center; color: rgba(255, 255, 255, 0.75); background: transparent;
