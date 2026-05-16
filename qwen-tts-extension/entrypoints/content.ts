@@ -41,7 +41,7 @@ export default defineContentScript({
           transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1); overflow: hidden;
           max-width: 38px; height: 38px; 
         }
-        .bar:hover, .bar.active { max-width: 440px; padding: 4px 6px; }
+        .bar:hover, .bar.active, .bar.expanded { max-width: 440px; padding: 4px 6px; }
         .logo {
           width: 30px; height: 30px; border-radius: 50%; background: transparent;
           display: flex; align-items: center; justify-content: center; color: rgba(255, 255, 255, 0.7);
@@ -157,7 +157,12 @@ export default defineContentScript({
       shadow.appendChild(queuePopup);
       shadow.appendChild(bar);
 
-      let isPlaying = false, hideTimeout: any = null;
+      let isPlaying = false, hideTimeout: any = null, isExpanded = false;
+
+      logo.onclick = () => {
+        isExpanded = !isExpanded;
+        bar.classList.toggle('expanded', isExpanded);
+      };
 
       btnPlayPause.onclick = () => callApi(isPlaying ? "/pause" : "/resume");
       btnStop.onclick = () => callApi("/stop");
@@ -193,7 +198,8 @@ export default defineContentScript({
       };
       queuePopup.onmouseleave = () => queuePopup.classList.remove('show');
 
-      function renderQueue(items: any[]) {
+      function renderQueue(items: any) {
+        if (!Array.isArray(items)) items = [];
         queuePopup.innerHTML = `<div class="queue-header">Saved · ${items.length}</div><div class="queue-list"></div>`;
         const list = queuePopup.querySelector('.queue-list')!;
         if (items.length === 0) {
