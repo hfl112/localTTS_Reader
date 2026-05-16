@@ -35,10 +35,13 @@ class QwenTTSApp(rumps.App):
         self.start_backend_service()
 
         # 构造 UI
-        self.item_read = rumps.MenuItem("▶ 朗读新剪贴板", callback=self.on_read_clipboard)
-        self.item_stop = rumps.MenuItem("⏹ 停止播放", callback=self.on_stop_click)
-        self.item_resume = rumps.MenuItem("⏯ 继续上次朗读", callback=self.on_resume_click)
+        self.item_read_clip = rumps.MenuItem("📋 朗读剪贴板", callback=self.on_read_clipboard)
+        self.item_play_pause = rumps.MenuItem("⏸ 播放 / 暂停", callback=self.on_play_pause)
+        self.item_prev = rumps.MenuItem("⏮ 上一段", callback=self.on_prev_click)
         self.item_next = rumps.MenuItem("⏭ 下一段", callback=self.on_next_click)
+        self.item_stop = rumps.MenuItem("⏹ 停止播放", callback=self.on_stop_click)
+        self.item_save = rumps.MenuItem("💾 保存当前朗读", callback=self.on_save_current)
+        self.item_podcast = rumps.MenuItem("🎙️ 生成收藏播客", callback=self.on_generate_podcast)
         
         self.menu_speed = rumps.MenuItem("语速")
         self.speed_items = {}
@@ -70,11 +73,15 @@ class QwenTTSApp(rumps.App):
             self.model_items[val] = item
 
         self.menu = [
-            self.item_read,
+            self.item_read_clip,
+            rumps.separator,
+            self.item_play_pause,
+            self.item_prev,
+            self.item_next,
             self.item_stop,
             rumps.separator,
-            self.item_resume,
-            self.item_next,
+            self.item_save,
+            self.item_podcast,
             rumps.separator,
             self.menu_model,
             self.menu_speed,
@@ -83,6 +90,7 @@ class QwenTTSApp(rumps.App):
             rumps.MenuItem("当前设置", callback=self.on_show_info),
             rumps.MenuItem("退出", callback=self.on_quit)
         ]
+
 
     def start_backend_service(self):
         print("[App] 正在清理旧的后端进程...")
@@ -102,7 +110,6 @@ class QwenTTSApp(rumps.App):
 
     @rumps.timer(1)
     def monitor_backend(self, _):
-        # 检查后端进程是否存活，如果挂了则尝试重启
         if self.backend_process and self.backend_process.poll() is not None:
             print("[App] 警告: 后端进程异常退出，正在尝试自动重启...")
             self.start_backend_service()
@@ -112,24 +119,27 @@ class QwenTTSApp(rumps.App):
             response = requests.get(f"{self.backend_url}/status", timeout=0.5)
             if response.status_code == 200:
                 data = response.json()
-                # 核心修复：更激进的按钮状态逻辑
-                # 只要后台报正在播放，或者缓冲区里还有存货，就允许停止
-                is_busy = data.get("is_playing", False) or float(data.get("buffer_sec", 0)) > 0.1
+                is_playing = data.get("is_playing", False)
+                has_buffer = float(data.get("buffer_sec", 0)) > 0.1
                 
-                self.item_stop.set_callback(self.on_stop_click if is_busy else None)
-                self.item_resume.set_callback(None if is_busy else self.on_resume_click)
-                
-                if data["title"]:
-                    total = data.get("total_chunks", 0)
-                    curr = data.get("current_index", 0)
-                    self.item_resume.title = f"⏯ 继续: {data['title']} ({curr}/{total})"
+                # Update Play/Pause UI
+                if is_playing:
+                    self.item_play_pause.title = "⏸ 暂停"
                 else:
-                    self.item_resume.title = "⏯ 继续上次朗读"
+                    self.item_play_pause.title = "▶ 继续"
+                
+                # Update Title if reading
+                if data.get("title"):
+                    total = data.get("total_chunks", 0) # Note: backend currently doesn't return total_chunks but we keep it safe
+                    progress = data.get("progress", "0/0")
+                    self.title = f" {data['title']} ({progress})"
+                else:
+                    self.title = ""
         except:
-            pass
+            self.title = " (离线)"
 
     def on_read_clipboard(self, _):
-        """强制开始新的朗读"""
+        """朗读剪贴板"""
         try:
             raw_text = pyperclip.paste()
             text = raw_text.strip() if raw_text else ""
@@ -140,28 +150,49 @@ class QwenTTSApp(rumps.App):
         except Exception as e:
             print(f"[App] 通信错误: {e}")
 
+    def on_play_pause(self, _):
+        try:
+            res = requests.get(f"{self.backend_url}/status").json()
+            is_playing = res.get("is_playing", False)
+            if is_playing:
+                requests.post(f"{self.backend_url}/pause", timeout=1)
+            else:
+                requests.post(f"{self.backend_url}/resume", timeout=1)
+        except: pass
+
     def on_stop_click(self, _):
         """停止播放"""
         try:
-            requests.post(f"{self.backend_url}/stop")
-        except:
-            pass
+            requests.post(f"{self.backend_url}/stop", timeout=1)
+        except: pass
 
-    def on_resume_click(self, _):
-        """恢复上次朗读"""
+    def on_prev_click(self, _):
         try:
-            requests.post(f"{self.backend_url}/read", json={"text": "RESUME_MODE", "index": -1}, timeout=1)
-        except:
-            pass
+            requests.post(f"{self.backend_url}/seek", json={"direction": -1}, timeout=1)
+        except: pass
 
     def on_next_click(self, _):
-        """下一段"""
         try:
-            res = requests.get(f"{self.backend_url}/status").json()
-            idx = int(res["current_index"])
-            requests.post(f"{self.backend_url}/read", json={"text": "RESUME_MODE", "index": idx}, timeout=1)
-        except:
-            pass
+            requests.post(f"{self.backend_url}/seek", json={"direction": 1}, timeout=1)
+        except: pass
+
+    def on_save_current(self, _):
+        try:
+            res = requests.post(f"{self.backend_url}/save_current", timeout=1).json()
+            if res.get("error"):
+                rumps.notification("Qwen TTS", "保存失败", res["error"])
+            else:
+                rumps.notification("Qwen TTS", "保存成功", "已保存当前朗读文章")
+        except: pass
+
+    def on_generate_podcast(self, _):
+        try:
+            res = requests.post(f"{self.backend_url}/generate_podcast", timeout=1).json()
+            if res.get("error"):
+                rumps.notification("Qwen TTS", "生成失败", res["error"])
+            else:
+                rumps.notification("Qwen TTS", "生成中", "播客开始生成，请查看 data/podcasts 目录")
+        except: pass
 
     def on_speed_change(self, sender):
         val = float(sender.title.replace('x', ''))
