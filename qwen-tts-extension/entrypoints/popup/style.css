@@ -1,20 +1,20 @@
-html {
+html, body {
+  margin: 0;
+  padding: 0;
   background: transparent;
+  font-family: system-ui, -apple-system, sans-serif;
 }
 
-body {
-  margin: 0;
-  padding: 10px 12px;
-  background: rgba(30, 30, 34, 0.9); 
+.popup-card {
+  width: 230px;
+  margin: 8px;
+  padding: 12px;
+  background: rgba(30, 30, 34, 0.92);
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
   border-radius: 16px;
   border: 1px solid rgba(255, 255, 255, 0.06);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
-  color: white;
-  font-family: system-ui, -apple-system, sans-serif;
-  width: max-content;
-  min-width: 170px;
 }
 
 .menu-list {
@@ -26,27 +26,20 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  width: 100%;
-  padding: 6px 8px;
+  padding: 4px 2px;
   background: transparent;
   border: none;
-  border-radius: 8px;
-  color: rgba(255, 255, 255, 0.95);
-  font-size: 14px;
-  font-weight: 500;
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 13px;
+  font-weight: 400; /* Lighter font weight for Chinese */
   cursor: pointer;
   user-select: none;
-  transition: background 0.2s;
-}
-
-.menu-item:hover {
-  background: rgba(255, 255, 255, 0.05);
 }
 
 .item-label {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .item-label svg {
@@ -56,18 +49,11 @@ body {
   color: white;
 }
 
-.toggle-wrapper {
-  padding-right: 8px;
-  display: flex;
-  align-items: center;
-}
-
 /* Toggle Switch Styles */
 .toggle-switch {
   position: relative;
-  width: 34px;
-  height: 20px;
-  transform: scale(0.88);
+  width: 30px;
+  height: 18px;
 }
 
 .toggle-switch input {
@@ -92,8 +78,8 @@ body {
 .slider:before {
   position: absolute;
   content: "";
-  height: 16px;
-  width: 16px;
+  height: 14px;
+  width: 14px;
   left: 2px;
   bottom: 2px;
   background-color: white;
@@ -107,5 +93,5 @@ input:checked + .slider {
 }
 
 input:checked + .slider:before {
-  transform: translateX(14px);
+  transform: translateX(12px);
 }
