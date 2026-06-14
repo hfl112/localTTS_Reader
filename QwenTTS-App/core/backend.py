@@ -306,6 +306,7 @@ app = FastAPI(lifespan=lifespan)
 async def read_text(data: dict = Body(...)):
     global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS, PODCAST_FILE, PODCAST_BUFFER
     text = data.get('text', "")
+    voice = data.get("voice", None)
     
     PODCAST_FILE = None
     with podcast_buffer_lock:
@@ -321,6 +322,9 @@ async def read_text(data: dict = Body(...)):
     
     state = storage.load_state()
     config = storage.load_config()
+    if voice:
+        config["voice"] = voice
+        
     if text == "RESUME_MODE":
         current_art = state.get("current_article", {})
         chunks = current_art.get("chunks", [])
@@ -339,7 +343,7 @@ async def read_text(data: dict = Body(...)):
 
 @app.post("/stop")
 async def stop_read():
-    global MAIN_IS_PLAYING, PODCAST_FILE, PODCAST_BUFFER
+    global MAIN_IS_PLAYING, PODCAST_FILE, PODCAST_BUFFER, ACTIVE_PODCAST_PROCS
     
     PODCAST_FILE = None
     with podcast_buffer_lock:
@@ -351,6 +355,22 @@ async def stop_read():
     player.stop()
     MAIN_IS_PLAYING = False
     S.set_status("IDLE")
+    
+    # Cancel all active podcast generation processes
+    for p in ACTIVE_PODCAST_PROCS:
+        if p.is_alive():
+            try: p.terminate()
+            except: pass
+    ACTIVE_PODCAST_PROCS.clear()
+    
+    # Cleanup pending podcast files
+    podcasts_dir = os.path.join(BASE_DIR, "data", "podcasts")
+    if os.path.exists(podcasts_dir):
+        for f in os.listdir(podcasts_dir):
+            if ".pending_" in f:
+                try: os.remove(os.path.join(podcasts_dir, f))
+                except: pass
+                
     return {"status": "ok"}
 
 @app.get("/status")
@@ -417,120 +437,434 @@ async def seek_playback(data: dict = Body(...)):
     threading.Thread(target=shared_task_loop, args=(new_task_id, new_idx, chunks, config, state), daemon=True).start()
     return {"status": "seeking", "new_index": new_idx}
 
+import asyncio
+import subprocess
+
+ACTIVE_URL_TASKS: dict[str, dict] = {}
+ACTIVE_PODCAST_PROCS = []
+
+GLOBAL_PAUSE_EVENT = mp.Event()
+GLOBAL_PODCAST_GPU_LOCK = mp.Lock()
+LAST_ACTIVE_TIME = time.time()
+
+def podcast_manager_loop():
+    global LAST_ACTIVE_TIME
+    while True:
+        # Update last active time if anything is actively playing or URL is being fetched
+        if MAIN_IS_PLAYING or len(ACTIVE_URL_TASKS) > 0:
+            LAST_ACTIVE_TIME = time.time()
+            
+        if MAIN_IS_PLAYING or len(ACTIVE_URL_TASKS) > 0 or (time.time() - LAST_ACTIVE_TIME < 120):
+            if not GLOBAL_PAUSE_EVENT.is_set():
+                GLOBAL_PAUSE_EVENT.set()
+        else:
+            if GLOBAL_PAUSE_EVENT.is_set():
+                GLOBAL_PAUSE_EVENT.clear()
+        time.sleep(2)
+
+threading.Thread(target=podcast_manager_loop, daemon=True).start()
+
+def run_single_podcast_generation_thread(text: str, config: dict, md5: str, source: str, pause_event, gpu_lock) -> None:
+    import traceback
+    safe_title = "".join(c for c in text[:20] if c.isalnum() or '\u4e00' <= c <= '\u9fff')
+    if not safe_title: safe_title = "无标题"
+    
+    pending_file = os.path.join(BASE_DIR, "data", "podcasts", f".pending_单篇_{source}_{safe_title}_{md5[:8]}")
+    os.makedirs(os.path.dirname(pending_file), exist_ok=True)
+    with open(pending_file, "w") as f: f.write(text[:20])
+    try:
+        with gpu_lock:
+            engine = TTSEngine(model_path=f"models/{config.get('model', 'Qwen3-TTS-1.7B-8bit')}", mlx_audio_path="../../mlx_audio")
+            engine.ensure_model_loaded()
+            chunks = TextProcessor().smart_split(text)
+            audio_data = []
+            for chunk in chunks:
+                # Wait if paused by the manager
+                while pause_event.is_set():
+                    time.sleep(2)
+                    
+                for samples in engine.generate_stream(chunk, config):
+                    audio_data.append(samples)
+                # Let the GPU cool down between sentences
+                time.sleep(1.5)
+            if audio_data:
+                full_wav = np.concatenate(audio_data)
+                wav_data = (np.clip(full_wav, -1.0, 1.0) * 32767).astype(np.int16)
+                out_name = f"podcast_单篇_{source}_{safe_title}_{md5[:8]}_{int(time.time())}.wav"
+                scipy.io.wavfile.write(os.path.join(BASE_DIR, "data", "podcasts", out_name), 24000, wav_data)
+    except Exception as e:
+        print(f"[PodcastProcess] Error: {e}")
+        traceback.print_exc()
+    finally:
+        if os.path.exists(pending_file): os.remove(pending_file)
+
+def run_podcast_generation_thread(filename: str, text: str, config: dict, pause_event, gpu_lock) -> None:
+    import traceback
+    pending_file = filename.replace(".wav", "") + ".pending_合集"
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    with open(pending_file, "w") as f: f.write("pending")
+    try:
+        with gpu_lock:
+            engine = TTSEngine(model_path=f"models/{config.get('model', 'Qwen3-TTS-1.7B-8bit')}", mlx_audio_path="../../mlx_audio")
+            engine.ensure_model_loaded()
+            chunks = TextProcessor().smart_split(text)
+            audio_data = []
+            for chunk in chunks:
+                while pause_event.is_set():
+                    time.sleep(2)
+                    
+                for samples in engine.generate_stream(chunk, config):
+                    audio_data.append(samples)
+                # Let the GPU cool down between sentences
+                time.sleep(1.5)
+            if audio_data:
+                full_wav = np.concatenate(audio_data)
+                wav_data = (np.clip(full_wav, -1.0, 1.0) * 32767).astype(np.int16)
+                scipy.io.wavfile.write(filename, 24000, wav_data)
+    except Exception as e:
+        print(f"[PodcastProcess] Error: {e}")
+    finally:
+        if os.path.exists(pending_file): os.remove(pending_file)
+
+@app.post("/read_url")
+async def read_url(payload: dict = Body(...)) -> dict:
+    global ACTIVE_URL_TASKS
+    url = payload.get("url", "").strip()
+    translate = payload.get("translate", False)
+    save = payload.get("save", False)
+    podcast = payload.get("podcast", False)
+    if not url: return {"error": "Empty URL"}
+        
+    current_time = time.time()
+    ACTIVE_URL_TASKS = {u: t for u, t in ACTIVE_URL_TASKS.items() if current_time - t["timestamp"] < 60}
+    if url in ACTIVE_URL_TASKS:
+        return {"status": "error", "message": "该网页正处于后台解析抓取中，请不要重复点击，稍候可在下方收藏列表中查看！"}
+        
+    ACTIVE_URL_TASKS[url] = {"timestamp": current_time, "is_podcast": podcast}
+    
+    cli_path = os.path.join(os.path.dirname(BASE_DIR), "URL-Reader", "read_url_cli.py")
+    cmd = [sys.executable, cli_path, url]
+    if translate: cmd.append("-t")
+    if save: cmd.append("--save")
+    if podcast: cmd.append("--podcast")
+    
+    async def run_cli_task():
+        try:
+            proc = await asyncio.create_subprocess_exec(*cmd)
+            await proc.wait()
+        finally:
+            ACTIVE_URL_TASKS.pop(url, None)
+            
+    asyncio.create_task(run_cli_task())
+    return {"status": "ok", "message": "Read URL task dispatched"}
+
+@app.post("/delete_saved")
+async def delete_saved(data: dict = Body(...)):
+    index = data.get("index")
+    save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
+    with save_file_lock:
+        if os.path.exists(save_file):
+            with open(save_file, "r", encoding="utf-8") as f: items = json.load(f)
+            if 0 <= index < len(items):
+                items.pop(index)
+                with open(save_file, "w", encoding="utf-8") as f: json.dump(items, f, ensure_ascii=False, indent=2)
+                return {"status": "ok"}
+    return {"error": "Item not found"}
+
+@app.get("/podcasts/list")
+async def list_podcasts():
+    podcasts_dir = os.path.join(BASE_DIR, "data", "podcasts")
+    if not os.path.exists(podcasts_dir): return []
+    files = []
+    for f in os.listdir(podcasts_dir):
+        path = os.path.join(podcasts_dir, f)
+        is_pinned = "pinned_" in f
+        
+        clean_f = f.replace("pinned_", "")
+        parts = clean_f.split("_")
+        
+        title = clean_f
+        source = "web"
+        is_pending = ".pending_" in f
+        
+        if len(parts) >= 5 and (parts[0] == "podcast" or parts[0] == ".pending"):
+            # Format: podcast_单篇_source_title_hash_timestamp.wav
+            if parts[1] == "单篇":
+                source = parts[2]
+                title = parts[3]
+            elif parts[1] == "合集":
+                source = "web"
+                title = "大合集播客"
+                
+        if f.endswith(".wav"):
+            try: size_mb = os.path.getsize(path) / (1024 * 1024)
+            except: size_mb = 0
+            files.append({"title": title, "filename": f, "timestamp": os.path.getmtime(path), "is_pending": False, "source": source, "is_pinned": is_pinned, "size_mb": size_mb})
+        elif is_pending:
+            files.append({"title": title + " (正在生成中...)", "filename": f, "timestamp": os.path.getmtime(path), "is_pending": True, "source": source, "is_pinned": False})
+    
+    current_time = time.time()
+    for url, info in list(ACTIVE_URL_TASKS.items()):
+        if info.get("is_podcast", False) and current_time - info["timestamp"] < 60:
+            files.insert(0, {
+                "title": "⏳ 正在抓取网页正文...",
+                "filename": url,
+                "timestamp": info["timestamp"],
+                "is_pending": True,
+                "source": "web",
+                "is_pinned": False,
+                "size_mb": 0
+            })
+            
+    # Sort by pinned (True first), then timestamp descending
+    files.sort(key=lambda x: (not x["is_pinned"], -x["timestamp"]))
+    return files
+
+@app.post("/podcasts/toggle_pin")
+async def toggle_pin(data: dict = Body(...)):
+    filename = data.get("filename", "")
+    filepath = os.path.join(BASE_DIR, "data", "podcasts", filename)
+    if not os.path.exists(filepath): return {"error": "File not found"}
+    
+    if "pinned_" in filename:
+        new_name = filename.replace("pinned_", "")
+    else:
+        new_name = "pinned_" + filename
+        
+    new_path = os.path.join(BASE_DIR, "data", "podcasts", new_name)
+    os.rename(filepath, new_path)
+    return {"status": "ok"}
+
+@app.post("/podcasts/clear")
+async def clear_podcasts():
+    podcasts_dir = os.path.join(BASE_DIR, "data", "podcasts")
+    if not os.path.exists(podcasts_dir): return {"status": "ok"}
+    
+    deleted_count = 0
+    for f in os.listdir(podcasts_dir):
+        if f.endswith(".wav") and "pinned_" not in f:
+            try:
+                os.remove(os.path.join(podcasts_dir, f))
+                deleted_count += 1
+            except: pass
+    return {"status": "ok", "deleted_count": deleted_count}
+
+@app.post("/podcasts/play")
+async def play_podcast(data: dict = Body(...)):
+    filename = data.get("filename", "")
+    filepath = os.path.join(BASE_DIR, "data", "podcasts", filename)
+    if not os.path.exists(filepath): return {"error": "File not found"}
+    
+    import subprocess
+    try:
+        subprocess.Popen(["open", filepath])
+    except Exception as e:
+        return {"error": str(e)}
+    return {"status": "ok"}
+
 @app.post("/save_for_later")
 async def save_for_later(data: dict = Body(...)):
+    global LAST_ACTIVE_TIME
+    LAST_ACTIVE_TIME = time.time()
     text = data.get("text", "").strip()
-    if not text:
-        return {"error": "Empty text"}
-        
+    source = data.get("source", "web")
+    voice = data.get("voice", None)
+    if not text: return {"error": "Empty text"}
+    
     save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
     saved_items = []
+    md5_val = hashlib.md5(text.encode("utf-8")).hexdigest()
     
     with save_file_lock:
         if os.path.exists(save_file):
             try:
-                with open(save_file, "r", encoding="utf-8") as f:
-                    saved_items = json.load(f)
-            except:
-                pass
-
-        # Append new item
+                with open(save_file, "r", encoding="utf-8") as f: saved_items = json.load(f)
+            except: pass
+            
         saved_items.append({
             "timestamp": time.time(),
             "text": text,
-            "title": text[:20].replace("\n", " ") + "..."
+            "title": text[:20].replace("\n", " ") + "...",
+            "source": source,
+            "voice": voice,
+            "is_exported": False,
+            "md5": md5_val
         })
-
-        # Keep only the 3 most recent
-        if len(saved_items) > 3:
-            saved_items = saved_items[-3:]
-
-        with open(save_file, "w", encoding="utf-8") as f:
-            json.dump(saved_items, f, ensure_ascii=False, indent=2)
+        if len(saved_items) > 5: saved_items = saved_items[-5:]
+        with open(save_file, "w", encoding="utf-8") as f: json.dump(saved_items, f, ensure_ascii=False, indent=2)
+            
     return {"status": "saved", "count": len(saved_items)}
 
+@app.post("/generate_single_podcast")
+async def generate_single_podcast(data: dict = Body(...)):
+    global ACTIVE_PODCAST_PROCS, LAST_ACTIVE_TIME
+    LAST_ACTIVE_TIME = time.time()
+    text = data.get("text", "").strip()
+    source = data.get("source", "web")
+    voice = data.get("voice", None)
+    if not text: return {"error": "Empty text"}
+    
+    md5_val = hashlib.md5(text.encode("utf-8")).hexdigest()
+    config = storage.load_config()
+    if voice:
+        config["voice"] = voice
+    p = mp.Process(target=run_single_podcast_generation_thread, args=(text, config, md5_val, source, GLOBAL_PAUSE_EVENT, GLOBAL_PODCAST_GPU_LOCK), daemon=True)
+    p.start()
+    
+    ACTIVE_PODCAST_PROCS = [proc for proc in ACTIVE_PODCAST_PROCS if proc.is_alive()]
+    ACTIVE_PODCAST_PROCS.append(p)
+    
+    async def cleanup(proc):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, proc.join)
+    asyncio.create_task(cleanup(p))
+    
+    return {"status": "generating", "md5": md5_val}
+
+@app.post("/saved_items/clear")
+async def clear_saved_items():
+    save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
+    with save_file_lock:
+        with open(save_file, "w", encoding="utf-8") as f:
+            json.dump([], f)
+    return {"status": "ok"}
+
 @app.post("/generate_podcast")
-async def generate_podcast():
-    global PODCAST_FILE, PODCAST_BUFFER
+async def generate_podcast_api():
     save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
     saved_items = []
-    
     with save_file_lock:
         if os.path.exists(save_file):
             try:
-                with open(save_file, "r", encoding="utf-8") as f:
-                    saved_items = json.load(f)
+                with open(save_file, "r", encoding="utf-8") as f: saved_items = json.load(f)
             except: pass
-            
-        if not saved_items:
-            return {"error": "No saved items"}
-            
-    text = ""
-    for item in saved_items:
-        text += item.get("text", "") + "\n\n"
-        
+    if not saved_items: return {"error": "No saved items"}
+    
+    text = "\n\n".join(item.get("text", "") for item in saved_items)
     os.makedirs(os.path.join(BASE_DIR, "data", "podcasts"), exist_ok=True)
-    filename = os.path.join(BASE_DIR, "data", "podcasts", f"podcast_{int(time.time())}.wav")
+    filename = os.path.join(BASE_DIR, "data", "podcasts", f"podcast_合集_web_大合集播客_{int(time.time())}.wav")
     
-    with S.current_task_id.get_lock():
-        S.current_task_id.value += 1
-    new_task_id = S.current_task_id.value
-
-    S.stop_event.set()
-    player.stop()
-    S.stop_event.clear()
-    
-    PODCAST_FILE = filename
-    with podcast_buffer_lock:
-        PODCAST_BUFFER = []
-    
-    chunks = processor.smart_split(text)
     config = storage.load_config()
+    first_voice = saved_items[0].get("voice") if saved_items else None
+    if first_voice:
+        config["voice"] = first_voice
+        
+    p = mp.Process(target=run_podcast_generation_thread, args=(filename, text, config, GLOBAL_PAUSE_EVENT, GLOBAL_PODCAST_GPU_LOCK), daemon=True)
+    p.start()
     
-    threading.Thread(target=shared_task_loop, args=(new_task_id, 0, chunks, config, {}, True), daemon=True).start()
-    return {"status": "generating", "file": filename}
+    global ACTIVE_PODCAST_PROCS
+    ACTIVE_PODCAST_PROCS = [proc for proc in ACTIVE_PODCAST_PROCS if proc.is_alive()]
+    ACTIVE_PODCAST_PROCS.append(p)
+    
+    async def cleanup(proc):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, proc.join)
+    asyncio.create_task(cleanup(p))
+    
+    with save_file_lock:
+        with open(save_file, "w", encoding="utf-8") as f: json.dump([], f)
+    return {"status": "generating", "filename": filename}
 
 @app.get("/saved_items")
 async def get_saved_items():
     save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
+    saved_items = []
     with save_file_lock:
         if os.path.exists(save_file):
             try:
-                with open(save_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                with open(save_file, "r", encoding="utf-8") as f: saved_items = json.load(f)
             except: pass
-    return []
+    
+    current_time = time.time()
+    for url, info in list(ACTIVE_URL_TASKS.items()):
+        if not info.get("is_podcast", False) and current_time - info["timestamp"] < 60:
+            saved_items.insert(0, {
+                "timestamp": info["timestamp"],
+                "text": url,
+                "title": "⏳ 正在抓取网页正文...",
+                "source": "web",
+                "is_exported": False,
+                "is_pending": True
+            })
+    return saved_items
 
 @app.post("/play_saved")
 async def play_saved(data: dict = Body(...)):
-    indices = data.get("indices", []) # list of indices to play
-    if not indices:
-        return {"error": "No items selected"}
-        
+    indices = data.get("indices", [])
+    if not indices: return {"error": "No items selected"}
     save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
     saved_items = []
     with save_file_lock:
         if os.path.exists(save_file):
             try:
-                with open(save_file, "r", encoding="utf-8") as f:
-                    saved_items = json.load(f)
+                with open(save_file, "r", encoding="utf-8") as f: saved_items = json.load(f)
             except: pass
-            
-    if not saved_items:
-        return {"error": "Queue empty"}
-        
-    # Concatenate text from selected indices
-    text_to_play = ""
-    for idx in indices:
-        if 0 <= idx < len(saved_items):
-            text_to_play += saved_items[idx].get("text", "") + "\n\n"
-            
-    if not text_to_play.strip():
-        return {"error": "Selected items are empty"}
-        
-    # Trigger normal playback by calling the same logic as /read
-    # We must reset the current task state exactly like /read does
-    return await read_text({"text": text_to_play})
+    if not saved_items: return {"error": "Queue empty"}
+    text_to_play = "\n\n".join(saved_items[idx].get("text", "") for idx in indices if 0 <= idx < len(saved_items))
+    if not text_to_play.strip(): return {"error": "Selected items are empty"}
+    
+    # Extract voice from the first selected item, if any
+    first_idx = indices[0] if indices else 0
+    voice = None
+    if 0 <= first_idx < len(saved_items):
+        voice = saved_items[first_idx].get("voice")
+    
+    payload = {"text": text_to_play}
+    if voice: payload["voice"] = voice
+    
+    return await read_text(payload)
+
+
+
+@app.get("/cache/items")
+async def get_cache_items():
+    items = storage.get_all_cache()
+    podcast_dir = os.path.join(BASE_DIR, "data", "podcasts")
+    for item in items:
+        md5 = item.get("md5")
+        is_exported = False
+        if md5 and os.path.exists(podcast_dir):
+            for f in os.listdir(podcast_dir):
+                if f.startswith(f"podcast_") and f.endswith(".wav") and md5[:8] in f:
+                    is_exported = True
+                    break
+        item["is_exported"] = is_exported
+    return items
+
+@app.post("/cache/play")
+async def play_cache(data: dict = Body(...)):
+    md5 = data.get("md5")
+    item = storage.get_cache_by_md5(md5)
+    if not item: return {"error": "Cache not found"}
+    text = item.get("text", "")
+    return await read_text({"text": text})
+
+@app.post("/cache/export")
+async def export_cache(data: dict = Body(...)):
+    md5 = data.get("md5")
+    item = storage.get_cache_by_md5(md5)
+    if not item: return {"error": "Cache not found"}
+    text = item.get("text", "")
+    return await generate_single_podcast({"text": text, "source": "cache"})
+
+@app.post("/cache/delete")
+async def delete_cache(data: dict = Body(...)):
+    md5 = data.get("md5")
+    storage.delete_cache_by_md5(md5)
+    return {"status": "ok"}
+
+@app.post("/cache/clear")
+async def clear_cache_endpoint():
+    clear_all_cache()
+    import sqlite3
+    try:
+        conn = sqlite3.connect(storage.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM cache_metadata")
+        conn.commit()
+        conn.close()
+    except: pass
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001, log_level="error")

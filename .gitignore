@@ -36,3 +36,12 @@ QwenTTS-App/data/*.json
 # Backups
 *-backup-*/
 qwen-tts-extension-backup-pcm/
+
+# Cache & DB
+*.npy
+*.db
+.pending_*
+QwenTTS-App/data/cache/
+QwenTTS-App/data/exported/
+QwenTTS-App/data/podcasts/
+podcasts/

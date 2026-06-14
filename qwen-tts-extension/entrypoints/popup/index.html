@@ -6,19 +6,87 @@
 </head>
 <body>
   <div class="popup-card">
-    <div class="menu-list">
-      <label class="menu-item toggle-item">
-        <div class="item-label">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-          <span>显示网页悬浮窗</span>
+    <div class="read-url-section">
+      <input type="text" id="txtTargetUrl" class="url-input" placeholder="输入或粘贴网页 URL..." />
+      <div class="url-control-row">
+        <select id="selLangMode" class="lang-select">
+          <option value="original">原文</option>
+          <option value="translate" selected>翻译</option>
+        </select>
+        <div class="action-buttons-group">
+          <button id="btnStop" class="action-icon-btn" title="停止播放">
+            <svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+          </button>
+          <button id="btnPlayToggle" class="action-icon-btn" title="直接朗读当前 URL">
+            <svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+          </button>
+          <button id="btnReadClipboard" class="action-icon-btn" title="朗读剪贴板文本">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
+          </button>
+          <button id="btnSaveForLater" class="action-icon-btn" title="保存正文并加入稍后朗读">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+          </button>
+          <button id="btnSaveAndPodcast" class="action-icon-btn" title="一键提取网页生成播客">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+          </button>
         </div>
-        <div class="toggle-wrapper">
-          <div class="toggle-switch">
-            <input type="checkbox" id="toggleFab" checked />
-            <span class="slider"></span>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="cache-section">
+      <div class="section-header">
+        <span>稍后朗读 (Saved Text)</span>
+        <div class="header-actions">
+          <button id="btnRefreshSaved" title="刷新收藏">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+          </button>
+          <button id="btnClearSaved" title="清空收藏">清空</button>
+          <button id="btnGenPodcast" title="一键生成播客">合成播客</button>
+        </div>
+      </div>
+      <div class="cache-list" id="savedList">
+        <div class="loading-state">加载中...</div>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="cache-section">
+      <div class="section-header">
+        <span>我的播客 (Podcasts)</span>
+        <div class="header-actions">
+          <button id="btnRefreshPodcasts" title="刷新播客列表">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+          </button>
+          <button id="btnClearPodcasts" title="清空播客">清空</button>
+        </div>
+      </div>
+      <div class="cache-list" id="podcastList">
+        <div class="loading-state">加载中...</div>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="cache-section">
+      <details>
+        <summary class="section-header" style="outline: none; cursor: pointer; display: flex; align-items: center; list-style: none;">
+          <span style="display: flex; align-items: center; gap: 4px;">
+            <span class="fold-arrow">▶</span> 快速倒带缓存 (Temp Cache)
+          </span>
+          <div class="header-actions" onclick="event.stopPropagation()">
+            <button id="btnRefresh" title="刷新">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+            </button>
+            <button id="btnClearCache" title="清空所有缓存">清空</button>
           </div>
+        </summary>
+        <div class="cache-list" id="cacheList" style="margin-top: 6px;">
+          <div class="loading-state">加载中...</div>
         </div>
-      </label>
+      </details>
     </div>
   </div>
   <script type="module" src="./main.ts"></script>

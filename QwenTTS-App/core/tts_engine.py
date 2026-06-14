@@ -6,12 +6,36 @@ import mlx.core as mx
 import time
 
 class TTSEngine:
-    def __init__(self, model_path="models/Qwen3-TTS-1.7B-8bit", mlx_audio_path="../../mlx_audio"):
-        # ... (existing path logic)
+    def __init__(self, model_path="models/Qwen3-TTS-1.7B-8bit", mlx_audio_path=None):
         self.sample_rate = 24000 # 改回 24k 原生采样率
-        # 计算绝对路径
-        self.base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), mlx_audio_path))
-        self.abs_model_path = os.path.join(self.base_dir, model_path)
+        
+        # 1. 动态确定 mlx_audio 的绝对路径
+        resolved_mlx_audio_path = mlx_audio_path
+        
+        # 优先从环境变量获取
+        if not resolved_mlx_audio_path:
+            resolved_mlx_audio_path = os.environ.get("MLX_AUDIO_PATH")
+            
+        if not resolved_mlx_audio_path:
+            workspace_env = os.environ.get("TTS_WORKSPACE_PATH")
+            if workspace_env:
+                resolved_mlx_audio_path = os.path.join(workspace_env, "mlx_audio")
+                
+        # 默认回退到原有的相对路径
+        if not resolved_mlx_audio_path:
+            resolved_mlx_audio_path = "../../mlx_audio"
+            
+        # 如果是相对路径，以当前文件位置为基准计算绝对路径；如果是绝对路径，直接使用
+        if os.path.isabs(resolved_mlx_audio_path):
+            self.base_dir = os.path.abspath(resolved_mlx_audio_path)
+        else:
+            self.base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), resolved_mlx_audio_path))
+            
+        # 2. 动态确定 model_path 的绝对路径
+        if os.path.isabs(model_path):
+            self.abs_model_path = os.path.abspath(model_path)
+        else:
+            self.abs_model_path = os.path.join(self.base_dir, model_path)
         
         # 将 mlx_audio 加入路径以确保能导入内部组件
         if self.base_dir not in sys.path:
@@ -35,9 +59,12 @@ class TTSEngine:
                     print(f"[TTSEngine] 加载失败: {e}")
                     raise e
                 print("[TTSEngine] 模型加载完成")
+                return True
+            return False
 
     def generate_stream(self, text, config):
-        self.ensure_model_loaded()
+        if self.ensure_model_loaded():
+            self.warmup()
         
         if config.get("seed") is not None:
             mx.random.seed(config["seed"])
@@ -73,9 +100,12 @@ class TTSEngine:
         print(f"[TTSEngine] 开始生成: \"{text_to_generate[:20]}...\", MaxTokens: {dynamic_max_tokens}, Penalty: {generate_kwargs['repetition_penalty']}")
 
         start_time = time.time()
-        # 动态超时：每个汉字给 1 秒的时间，最少 30 秒，最多 120 秒
-        # 这样即使是 160 字的长段落，也有 160s 的缓冲时间，绝不会被掐断
-        timeout = max(30, min(len(text_to_generate) * 1.0, 120)) 
+        # 动态超时：如果是后台预热编译阶段，给足 MLX JIT 算子编译所需时间 (180s)；
+        # 日常朗读给每个汉字 1 秒的时间，最少 30 秒，最多 120 秒，绝不掐断
+        if config.get("is_warmup", False):
+            timeout = 180.0
+        else:
+            timeout = max(30, min(len(text_to_generate) * 1.0, 120)) 
         
         try:
             for result in self.model.generate(text_to_generate, **generate_kwargs):
@@ -116,7 +146,8 @@ class TTSEngine:
             "voice": "Serena",
             "temperature": 0.2,
             "top_p": 0.5,
-            "seed": 42
+            "seed": 42,
+            "is_warmup": True
         }
         # 使用极短文本预热
         for _ in self.generate_stream("预热。", warmup_config):

@@ -6,15 +6,14 @@ html, body {
 }
 
 .popup-card {
-  width: 230px;
+  width: 320px;
   margin: 8px;
   padding: 12px;
-  background: rgba(248, 250, 252, 0.92);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  background: #f4f4f5; /* 优雅的浅灰色背景 */
   border-radius: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.7);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08); /* 柔和的高级阴影 */
+  box-sizing: border-box;
 }
 
 .menu-list {
@@ -29,7 +28,7 @@ html, body {
   padding: 4px 2px;
   background: transparent;
   border: none;
-  color: #111827;
+  color: #18181b; /* 深黑色文字 */
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
@@ -43,10 +42,10 @@ html, body {
 }
 
 .item-label svg {
-  width: 18px;
-  height: 18px;
-  opacity: 0.75;
-  color: #111827;
+  width: 16px;
+  height: 16px;
+  opacity: 0.8;
+  color: #27272a;
 }
 
 /* Toggle Switch Styles */
@@ -69,10 +68,9 @@ html, body {
   left: 0;
   right: 0;
   bottom: 0;
-  background-color: rgba(0, 0, 0, 0.12);
+  background-color: rgba(0, 0, 0, 0.08);
   transition: .3s;
   border-radius: 20px;
-  box-shadow: inset 0 1px 2px rgba(0,0,0,0.05);
 }
 
 .slider:before {
@@ -85,13 +83,347 @@ html, body {
   background-color: white;
   transition: .3s;
   border-radius: 50%;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
 }
 
 input:checked + .slider {
-  background-color: #4DA3FF;
+  background-color: #3b82f6; /* 统一为亮蓝色 */
 }
 
 input:checked + .slider:before {
   transform: translateX(12px);
+}
+
+.divider {
+  height: 1px;
+  background: rgba(0, 0, 0, 0.06);
+  margin: 10px 0;
+}
+
+/* Cache Section */
+.cache-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #71717a; /* 辅助性文字颜色 */
+  font-weight: 600;
+  padding: 0 2px;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.header-actions button {
+  background: transparent;
+  border: none;
+  color: #71717a;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 5px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.header-actions button:hover {
+  background: rgba(0, 0, 0, 0.05);
+  color: #18181b;
+}
+
+#btnRefresh svg,
+#btnRefreshSaved svg,
+#btnRefreshPodcasts svg {
+  width: 12px;
+  height: 12px;
+  stroke: currentColor;
+}
+
+.cache-list {
+  max-height: 110px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-right: 2px;
+}
+
+/* Scrollbar styles */
+.cache-list::-webkit-scrollbar {
+  width: 4px;
+}
+.cache-list::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.12);
+  border-radius: 2px;
+}
+
+.loading-state, .empty-state {
+  text-align: center;
+  padding: 16px 0;
+  font-size: 12px;
+  color: #a1a1aa;
+}
+
+.cache-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.65); /* 浅色卡片背景 */
+  border: 1px solid rgba(0, 0, 0, 0.04);
+  border-radius: 8px;
+  gap: 8px;
+  transition: all 0.2s;
+}
+
+.cache-item:hover {
+  background: white;
+  border-color: rgba(0, 0, 0, 0.08);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.02);
+}
+
+.cache-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.cache-text {
+  font-size: 12px;
+  color: #18181b; /* 深色正文 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+
+.cache-meta {
+  font-size: 10px;
+  color: #71717a;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cache-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.cache-actions button {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: #71717a;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: 0.2s;
+}
+
+.cache-actions button:hover {
+  background: rgba(0, 0, 0, 0.05);
+  color: #18181b;
+}
+
+.btn-export:hover {
+  color: #2563eb !important;
+}
+
+.btn-play:hover {
+  color: #10b981 !important; /* 在白色底上深绿色更好看 */
+}
+
+.btn-delete:hover {
+  color: #dc2626 !important;
+  background: rgba(220, 38, 38, 0.08) !important;
+}
+
+.cache-actions svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* URL Reader Section */
+.read-url-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 2px;
+  padding: 2px 2px 0 2px;
+}
+
+.url-input {
+  width: 100%;
+  height: 32px;
+  padding: 0 10px;
+  background: white; /* 纯白背景提高清晰度 */
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 8px;
+  color: #18181b;
+  font-size: 12px;
+  font-weight: 500;
+  box-sizing: border-box;
+  transition: all 0.2s;
+}
+
+.url-input:focus {
+  outline: none;
+  border-color: #8b5cf6;
+  box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.15);
+}
+
+.url-control-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+}
+
+.lang-select {
+  flex: 0.65;
+  height: 32px;
+  padding: 0 24px 0 10px;
+  background: white;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 8px;
+  color: #18181b;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  outline: none;
+  box-sizing: border-box;
+  transition: all 0.2s;
+  
+  /* 移除系统默认下拉箭头，用定制风格 */
+  appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' fill='none' stroke='rgba(0,0,0,0.5)' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 12px;
+  padding-right: 24px;
+}
+
+.lang-select:hover {
+  background-color: #f4f4f5;
+}
+
+.lang-select option {
+  background: white;
+  color: #18181b;
+}
+
+.action-buttons-group {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  justify-content: flex-end;
+  flex: 1.35;
+}
+
+.action-icon-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: white;
+  color: #52525b; /* 稍微深一点的冷灰色图标，极具质感 */
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  box-sizing: border-box;
+}
+
+.action-icon-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+#btnStop:hover {
+  background: #dc2626;
+  border-color: #dc2626;
+  color: white;
+  box-shadow: 0 4px 10px rgba(220, 38, 38, 0.25);
+}
+
+#btnReadCurrent:hover {
+  background: #8b5cf6;
+  border-color: #8b5cf6;
+  color: white;
+  box-shadow: 0 4px 10px rgba(139, 92, 246, 0.25);
+}
+
+#btnPause:hover {
+  background: #d97706;
+  border-color: #d97706;
+  color: white;
+  box-shadow: 0 4px 10px rgba(217, 119, 6, 0.25);
+}
+
+#btnReadClipboard:hover {
+  background: #3b82f6;
+  border-color: #3b82f6;
+  color: white;
+  box-shadow: 0 4px 10px rgba(59, 130, 246, 0.25);
+}
+
+#btnSaveForLater:hover {
+  background: #10b981;
+  border-color: #10b981;
+  color: white;
+  box-shadow: 0 4px 10px rgba(16, 185, 129, 0.25);
+}
+
+#btnSaveAndPodcast:hover {
+  background: #a855f7;
+  border-color: #a855f7;
+  color: white;
+  box-shadow: 0 4px 10px rgba(168, 85, 247, 0.25);
+}
+
+.action-icon-btn:active {
+  transform: translateY(1px);
+}
+
+/* details fold arrow animation */
+summary::-webkit-details-marker {
+  display: none;
+}
+summary {
+  list-style: none;
+}
+
+.fold-arrow {
+  display: inline-block;
+  transition: transform 0.2s;
+  font-size: 8px;
+  color: #71717a;
+}
+
+details[open] .fold-arrow {
+  transform: rotate(90deg);
 }

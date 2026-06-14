@@ -4,7 +4,7 @@ import { defineConfig } from 'wxt';
 export default defineConfig({
   manifest: {
     name: "Qwen TTS Reader",
-    permissions: ["contextMenus", "storage", "activeTab", "scripting"],
+    permissions: ["contextMenus", "storage", "activeTab", "scripting", "clipboardRead"],
     host_permissions: ["<all_urls>", "http://127.0.0.1:8001/*"],
     commands: {
       "qwen-tts-read": {

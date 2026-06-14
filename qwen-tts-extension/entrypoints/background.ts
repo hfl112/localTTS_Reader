@@ -19,21 +19,42 @@ export default defineBackground(() => {
     }
   };
 
-  // Poll backend status and broadcast to all tabs
-  setInterval(async () => {
-    try {
-      const data = await callBackend("/status", "GET");
-      if (data && !data.error) {
+  let eventSource: EventSource | null = null;
+
+  // 使用 Server-Sent Events (SSE) 推送状态，彻底消除 1Hz HTTP 轮询的 CPU 和进程唤醒开销
+  const startSSEConnection = () => {
+    if (eventSource) {
+      eventSource.close();
+    }
+
+    eventSource = new EventSource(`${API_URL}/stream/status`);
+
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
         lastState = data;
-        const tabs = await browser.tabs.query({});
-        tabs.forEach(tab => {
-          if (tab.id) {
-            browser.tabs.sendMessage(tab.id, { type: "QWEN_STATUS_UPDATE", data }).catch(() => {});
-          }
+
+        // 仅广播给活跃网页标签页，保护后台标签页性能
+        browser.tabs.query({ active: true }).then(tabs => {
+          tabs.forEach(tab => {
+            if (tab.id) {
+              browser.tabs.sendMessage(tab.id, { type: "QWEN_STATUS_UPDATE", data }).catch(() => {});
+            }
+          });
         });
+      } catch (err) {
+        console.error("[Qwen TTS] 无法解析推送的状态数据", err);
       }
-    } catch (e) {}
-  }, 1000);
+    };
+
+    eventSource.onerror = () => {
+      console.warn("[Qwen TTS] 与后台 SSE 推送流断开，将在 5 秒后尝试自动重连...");
+      eventSource?.close();
+      setTimeout(startSSEConnection, 5000);
+    };
+  };
+
+  startSSEConnection();
 
   // Consolidated message listener
   browser.runtime.onMessage.addListener((message: any, sender, sendResponse) => {
