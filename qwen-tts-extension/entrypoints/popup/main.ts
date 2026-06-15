@@ -631,6 +631,29 @@ const autoFillCurrentUrl = async () => {
   }
 };
 
+// 从活跃标签页中获取已渲染好的 HTML outerHTML 源码，以解决后端因代理/登录鉴权抓取失败的问题
+const getActiveTabHtml = async (targetUrl: string): Promise<string | null> => {
+  try {
+    let tabs;
+    try {
+      tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    } catch {
+      tabs = await browser.tabs.query({ active: true, currentWindow: true });
+    }
+    const activeTab = tabs && tabs[0];
+    if (activeTab && activeTab.id && activeTab.url === targetUrl) {
+      const results = await browser.scripting.executeScript({
+        target: { tabId: activeTab.id },
+        func: () => document.documentElement.outerHTML
+      });
+      return results[0]?.result || null;
+    }
+  } catch (err) {
+    console.warn("[Qwen TTS] Failed to get HTML from active tab:", err);
+  }
+  return null;
+};
+
 // 状态缓存变量 (提升到前面)
 let localIsPaused = false;
 let localIsPlaying = false;
@@ -743,7 +766,8 @@ btnPlayToggle.onclick = async () => {
       const originalPlaceholder = txtTargetUrl.placeholder;
       txtTargetUrl.placeholder = "⏳ 正在推送网页朗读任务...";
 
-      const res = await callBackend("/read_url", "POST", { url, translate, mode });
+      const html = await getActiveTabHtml(url);
+      const res = await callBackend("/read_url", "POST", { url, translate, mode, html });
       if (res && (res.error || res.status === "error")) {
         alert(`❌ 朗读推送失败: ${res.error || res.message}`);
         txtTargetUrl.placeholder = originalPlaceholder;
@@ -830,7 +854,8 @@ btnSaveForLater.onclick = async () => {
   txtTargetUrl.placeholder = "⏳ 正在抓取并保存至稍后朗读...";
 
   try {
-    const res = await callBackend("/read_url", "POST", { url, translate, mode, save: true });
+    const html = await getActiveTabHtml(url);
+    const res = await callBackend("/read_url", "POST", { url, translate, mode, save: true, html });
     if (res && (res.error || res.status === "error")) {
       alert(`❌ 保存失败: ${res.error || res.message}`);
       txtTargetUrl.placeholder = originalPlaceholder;
@@ -874,7 +899,8 @@ if (btnSaveAndPodcast) {
     txtTargetUrl.placeholder = "⏳ 正在保存并生成播客...";
 
     try {
-      const res = await callBackend("/read_url", "POST", { url, translate, mode, podcast: true });
+      const html = await getActiveTabHtml(url);
+      const res = await callBackend("/read_url", "POST", { url, translate, mode, podcast: true, html });
       if (res && (res.error || res.status === "error")) {
         alert(`❌ 保存并生成失败: ${res.error || res.message}`);
         txtTargetUrl.placeholder = originalPlaceholder;

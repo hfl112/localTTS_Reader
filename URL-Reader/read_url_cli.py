@@ -159,6 +159,20 @@ def run_defuddle(url: str) -> str:
         
     return markdown_result
 
+def run_defuddle_with_local_file(html_file_path: str) -> str:
+    markdown_result: str = ""
+    try:
+        result = subprocess.run(
+            ["defuddle", "parse", html_file_path, "--md"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        markdown_result = result.stdout
+    except Exception as e:
+        print(f"[Error] 调用 defuddle 失败: {e}")
+    return markdown_result
+
 def send_to_qwentts(text: str, voice: Optional[str] = None, source: str = "web") -> None:
     """
     将文本投喂给本地正在运行的 QwenTTS-App 接口进行朗读。
@@ -214,8 +228,15 @@ def main() -> None:
     save_flag: bool = False
     podcast_flag: bool = False
     url_args: List[str] = []
+    html_file_path: Optional[str] = None
     
-    for arg in sys.argv[1:]:
+    args = sys.argv[1:]
+    skip = False
+    for i in range(len(args)):
+        if skip:
+            skip = False
+            continue
+        arg = args[i]
         if arg in ("--translate", "-t"):
             mode = "translate"
         elif arg in ("--podcast-trans", "-pt"):
@@ -228,11 +249,14 @@ def main() -> None:
             save_flag = True
         elif arg in ("--podcast", "-p"):
             podcast_flag = True
+        elif arg == "--html-file" and i + 1 < len(args):
+            html_file_path = args[i + 1]
+            skip = True
         else:
             url_args.append(arg)
             
     if len(url_args) < 1:
-        print("用法: python read_url_cli.py [URL] [模式参数] [--save / -s] [--podcast / -p]")
+        print("用法: python read_url_cli.py [URL] [模式参数] [--save / -s] [--podcast / -p] [--html-file PATH]")
         print("模式参数:")
         print("  --original / -o           - 原始正文 (不作Gemini转换)")
         print("  --translate / -t          - 翻译正文")
@@ -245,15 +269,25 @@ def main() -> None:
     # 自动识别并拦截 YouTube 视频链接提取字幕
     video_id: Optional[str] = extract_youtube_video_id(target_url)
     is_youtube: bool = video_id is not None
-    if is_youtube and video_id:
+    
+    markdown_content = ""
+    if html_file_path and os.path.exists(html_file_path):
+        print(f"[CLI] 正在从上传的浏览器 HTML 页面提取正文... ({html_file_path})")
         try:
-            markdown_content: str = get_youtube_transcript(video_id)
+            markdown_content = run_defuddle_with_local_file(html_file_path)
         except Exception as e:
-            print(f"[Error] {e}")
-            sys.exit(1)
-    else:
-        # 普通网页正文提取
-        markdown_content = run_defuddle(target_url)
+            print(f"[Warning] 本地 HTML 提取失败: {e}")
+            
+    if not markdown_content:
+        if is_youtube and video_id:
+            try:
+                markdown_content = get_youtube_transcript(video_id)
+            except Exception as e:
+                print(f"[Error] {e}")
+                sys.exit(1)
+        else:
+            # 普通网页正文提取
+            markdown_content = run_defuddle(target_url)
     
     if not markdown_content.strip():
         print("[Warning] 抓取到的内容为空！")

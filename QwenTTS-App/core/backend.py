@@ -684,6 +684,7 @@ def run_podcast_generation_thread(filename: str, text: str, config: dict, pause_
 async def read_url(payload: dict = Body(...)) -> dict:
     global ACTIVE_URL_TASKS
     url = payload.get("url", "").strip()
+    html = payload.get("html", "").strip()
     translate = payload.get("translate", False)
     mode = payload.get("mode", "original")
     
@@ -705,6 +706,20 @@ async def read_url(payload: dict = Body(...)) -> dict:
     cli_path = os.path.join(os.path.dirname(BASE_DIR), "URL-Reader", "read_url_cli.py")
     cmd = [sys.executable, cli_path, url]
     
+    # Save uploaded HTML to temporary file if available
+    temp_html_path = None
+    if html:
+        try:
+            import tempfile
+            import uuid
+            temp_dir = tempfile.gettempdir()
+            temp_html_path = os.path.join(temp_dir, f"qwentts_upload_{uuid.uuid4().hex}.html")
+            with open(temp_html_path, "w", encoding="utf-8") as f:
+                f.write(html)
+            cmd.extend(["--html-file", temp_html_path])
+        except Exception as e:
+            print(f"[Backend] Failed to save uploaded HTML: {e}")
+            
     if mode == "translate":
         cmd.append("-t")
     elif mode == "podcast-trans":
@@ -721,6 +736,9 @@ async def read_url(payload: dict = Body(...)) -> dict:
             await proc.wait()
         finally:
             ACTIVE_URL_TASKS.pop(url, None)
+            if temp_html_path and os.path.exists(temp_html_path):
+                try: os.remove(temp_html_path)
+                except: pass
             
     asyncio.create_task(run_cli_task())
     return {"status": "ok", "message": "Read URL task dispatched"}
