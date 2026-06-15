@@ -104,8 +104,11 @@ class PCMPlayer:
                 except Exception as init_err:
                     print(f"[PCMPlayer] 重置 PortAudio 失败: {init_err}")
 
-                print(f"[PCMPlayer] 正在启动音频流 (采样率: {self.sample_rate}Hz)...")
+                # 获取具体的默认输出设备索引，防止 CoreAudio 默认设备自动切换导致的音频泄漏
+                default_device_idx = sd.default.device[1]
+                print(f"[PCMPlayer] 正在启动音频流 (采样率: {self.sample_rate}Hz, 设备索引: {default_device_idx})...")
                 self.stream = sd.OutputStream(
+                    device=default_device_idx,
                     samplerate=self.sample_rate,
                     channels=2,
                     dtype='float32',
@@ -162,7 +165,9 @@ class PCMPlayer:
                 print(f"[PCMPlayer] 重置 PortAudio 失败: {init_err}")
 
             try:
+                default_device_idx = sd.default.device[1]
                 self.stream = sd.OutputStream(
+                    device=default_device_idx,
                     samplerate=self.sample_rate,
                     channels=2,
                     dtype='float32',
