@@ -145,12 +145,21 @@ class PCMPlayer:
                                 self.stream.stop()
                             except:
                                 pass
-                    self._recreate_stream()
+                    
+                    # 启动延迟任务来开辟新流，给 macOS CoreAudio 充足的时间完成设备切换并应用系统音量衰减
+                    threading.Thread(target=self._delayed_recreate, daemon=True).start()
             except Exception as e:
                 pass
 
+    def _delayed_recreate(self) -> None:
+        time.sleep(0.5)
+        self._recreate_stream()
+
     def _recreate_stream(self) -> None:
         with self._lock:
+            # 如果在延迟等待期间播放器已被停止，则不再重建流
+            if not self.is_active:
+                return
             if self.stream:
                 try:
                     self.stream.close()
