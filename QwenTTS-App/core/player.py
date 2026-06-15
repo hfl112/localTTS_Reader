@@ -113,7 +113,7 @@ class PCMPlayer:
                     channels=2,
                     dtype='float32',
                     callback=self._callback,
-                    blocksize=8192 
+                    blocksize=2048 
                 )
                 self.stream.start()
                 self.current_device_id = get_default_output_device_id()
@@ -181,7 +181,7 @@ class PCMPlayer:
                     channels=2,
                     dtype='float32',
                     callback=self._callback,
-                    blocksize=8192
+                    blocksize=2048
                 )
                 self.stream.start()
                 self.current_device_id = get_default_output_device_id()
@@ -201,6 +201,15 @@ class PCMPlayer:
                 print(f"[PCMPlayer] Stream status: {status}")
         
         with self._lock:
+            # 高频实时检测系统默认设备变化，一旦在切换的 100ms 内出现 CoreAudio 强制音频倒流外放，立即物理静音
+            try:
+                default_id = get_default_output_device_id()
+                if default_id != 0 and self.current_device_id != 0 and default_id != self.current_device_id:
+                    outdata.fill(0)
+                    return
+            except:
+                pass
+
             # If not active OR paused, output silence without consuming queue
             if not self.is_active or self.is_paused:
                 outdata.fill(0)
