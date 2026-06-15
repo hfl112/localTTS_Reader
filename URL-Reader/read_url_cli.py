@@ -7,6 +7,7 @@ import urllib.error
 import re
 import requests
 from youtube_transcript_api import YouTubeTranscriptApi
+from typing import Optional, List, Dict, Any
 
 def cleanup_temp_file(path: str) -> None:
     if os.path.exists(path):
@@ -15,12 +16,12 @@ def cleanup_temp_file(path: str) -> None:
         except:
             pass
 
-def extract_youtube_video_id(url: str) -> str | None:
+def extract_youtube_video_id(url: str) -> Optional[str]:
     """
     使用正则表达式提取 YouTube 视频中的 11 位唯一视频 ID。
     支持格式包括: watch?v=, youtu.be/, /embed/, /v/, /shorts/ 等。
     """
-    pattern = r'(?:v=|\/embed\/|\/v\/|youtu\.be\/|\/shorts\/)([a-zA-Z0-9_-]{11})'
+    pattern: str = r'(?:v=|\/embed\/|\/v\/|youtu\.be\/|\/shorts\/)([a-zA-Z0-9_-]{11})'
     match = re.search(pattern, url)
     return match.group(1) if match else None
 
@@ -31,26 +32,24 @@ def get_youtube_transcript(video_id: str) -> str:
     """
     print(f"[CLI] 正在请求 YouTube 视频字幕 (Video ID: {video_id}) ...")
     try:
-        # 实例化类并调用 fetch 方法，以符合 v1.2+ 新版 SDK 规范
         api = YouTubeTranscriptApi()
         transcript_list = api.fetch(
             video_id, 
             languages=['zh', 'zh-CN', 'zh-TW', 'zh-Hans', 'zh-Hant', 'en']
         )
-        # 拼接字幕，新版 SDK 的 snippet 必须使用属性点语法访问 .text
-        full_text = " ".join([item.text for item in transcript_list])
+        full_text: str = " ".join([item.text for item in transcript_list])
         return full_text
     except Exception as e:
         raise Exception(f"未能获取该视频的有效字幕 (支持 zh/en): {e}")
 
-def fetch_html_with_proxy_fallback(url: str, headers: dict) -> str:
+def fetch_html_with_proxy_fallback(url: str, headers: Dict[str, str]) -> str:
     """
     尝试直连抓取网页。如果因 WAF 阻拦或 429 报错，
     则自动检测本地 Clash 7890，V2Ray 1087 代理进行请求重试。
     若全部失败，或获取到了 SPA 动态空壳，则从 Google Chrome 当前 activity 标签页直接拉取已渲染的 DOM。
     """
-    direct_err_msg = ""
-    html_content = ""
+    direct_err_msg: str = ""
+    html_content: str = ""
     
     # 1. 尝试直连
     try:
@@ -63,7 +62,7 @@ def fetch_html_with_proxy_fallback(url: str, headers: dict) -> str:
         
     # 2. 本地代理检测重试
     if not html_content or len(html_content) < 3000:
-        proxies = [
+        proxies: List[str] = [
             "http://127.0.0.1:7890",
             "http://127.0.0.1:1087",
             "http://127.0.0.1:10809",
@@ -81,11 +80,11 @@ def fetch_html_with_proxy_fallback(url: str, headers: dict) -> str:
                         html_content = temp_html
                         print(f"[CLI] 成功通过本地代理 ({proxy}) 抓取网页！")
                         break
-            except Exception as proxy_err:
+            except Exception:
                 continue
 
     # 3. 终极 Fallback：Chrome 浏览器已渲染缓存抓取
-    is_empty_shell = html_content is not None and len(html_content) < 3000
+    is_empty_shell: bool = html_content is not None and len(html_content) < 3000
     if not html_content or is_empty_shell:
         if is_empty_shell:
             print("[CLI] 直连/代理抓取的源码内容过短 (可能是 JS 动态渲染的空壳)，正在尝试从 Chrome 浏览器缓存直接提取...")
@@ -93,22 +92,22 @@ def fetch_html_with_proxy_fallback(url: str, headers: dict) -> str:
             print("[CLI] 网络抓取彻底失败，正在尝试从 Chrome 浏览器缓存直接提取...")
             
         try:
-            chrome_url_cmd = "osascript -e 'tell application \"Google Chrome\" to return URL of active tab of front window'"
-            chrome_url = subprocess.check_output(chrome_url_cmd, shell=True, text=True).strip()
+            chrome_url_cmd: str = "osascript -e 'tell application \"Google Chrome\" to return URL of active tab of front window'"
+            chrome_url: str = subprocess.check_output(chrome_url_cmd, shell=True, text=True).strip()
             
             def clean_url(u: str) -> str:
                 return u.lower().replace("https://", "").replace("http://", "").rstrip("/")
                 
             if clean_url(chrome_url) == clean_url(url):
                 print(f"[CLI] 检测到当前 Chrome 浏览器已打开此网页，正在提取浏览器已渲染的 DOM...")
-                chrome_html_cmd = "osascript -e 'tell application \"Google Chrome\" to return execute active tab of front window javascript \"document.documentElement.outerHTML\"'"
-                chrome_html = subprocess.check_output(chrome_html_cmd, shell=True, text=True).strip()
+                chrome_html_cmd: str = "osascript -e 'tell application \"Google Chrome\" to return execute active tab of front window javascript \"document.documentElement.outerHTML\"'"
+                chrome_html: str = subprocess.check_output(chrome_html_cmd, shell=True, text=True).strip()
                 if chrome_html and "<html>" in chrome_html.lower():
                     print("[CLI] 成功提取当前浏览器页面已渲染源码！")
                     return chrome_html
             else:
                 print(f"[Warning] 浏览器当前活动标签页与目标 URL 不匹配，跳过浏览器缓存抓取。")
-        except Exception as osascript_err:
+        except Exception:
             print(f"[Warning] 浏览器缓存提取受阻。")
             print("\n💡 [提示] 检测到目标网页为 JS 动态渲染或处于学术登录贴/墙内。")
             print("💡 如果您已在 Google Chrome 浏览器中打开了该网页，请在 Chrome 菜单中勾选：")
@@ -124,7 +123,7 @@ def run_defuddle(url: str) -> str:
     """
     使用 urllib 配合详细 Headers 抓取 HTML 源码，并喂给 defuddle 进行 Markdown 正文净化。
     """
-    headers = {
+    headers: Dict[str, str] = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -132,10 +131,10 @@ def run_defuddle(url: str) -> str:
         "Upgrade-Insecure-Requests": "1"
     }
     
-    html_content = fetch_html_with_proxy_fallback(url, headers)
+    html_content: str = fetch_html_with_proxy_fallback(url, headers)
         
-    temp_dir = tempfile.gettempdir()
-    temp_file_path = os.path.join(temp_dir, f"defuddle_{os.getpid()}.html")
+    temp_dir: str = tempfile.gettempdir()
+    temp_file_path: str = os.path.join(temp_dir, f"defuddle_{os.getpid()}.html")
     
     try:
         with open(temp_file_path, "w", encoding="utf-8") as f:
@@ -144,7 +143,7 @@ def run_defuddle(url: str) -> str:
         print(f"[Error] 写入临时文件失败: {e}")
         sys.exit(1)
         
-    markdown_result = ""
+    markdown_result: str = ""
     try:
         result = subprocess.run(
             ["defuddle", "parse", temp_file_path, "--md"],
@@ -160,14 +159,14 @@ def run_defuddle(url: str) -> str:
         
     return markdown_result
 
-def send_to_qwentts(text: str, voice: str = None, source: str = "web") -> None:
+def send_to_qwentts(text: str, voice: Optional[str] = None, source: str = "web") -> None:
     """
     将文本投喂给本地正在运行的 QwenTTS-App 接口进行朗读。
     """
     url: str = "http://127.0.0.1:8001/read"
     print("[CLI] 正在将净化后的文本投喂给 QwenTTS-App 进行播放...")
     
-    payload = {"text": text, "source": source}
+    payload: Dict[str, Any] = {"text": text, "source": source}
     if voice:
         payload["voice"] = voice
         
@@ -177,14 +176,16 @@ def send_to_qwentts(text: str, voice: str = None, source: str = "web") -> None:
             print("[Success] 投喂成功！QwenTTS-App 已经开始朗读。")
         else:
             print(f"[Error] 接口返回错误: {response.status_code} - {response.text}")
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         print(f"[Error] 无法连接到 QwenTTS-App 服务 (请确认 python app.py 是否在运行): {e}")
 
-def save_to_qwentts(text: str, source: str = "web", do_save: bool = True, do_podcast: bool = False, voice: str = None) -> None:
+def save_to_qwentts(text: str, source: str = "web", do_save: bool = True, do_podcast: bool = False, voice: Optional[str] = None, title: Optional[str] = None) -> None:
     if do_save:
         url: str = "http://127.0.0.1:8001/save_for_later"
         print(f"[CLI] 正在将净化后的文本保存到 QwenTTS-App 稍后朗读列表中...")
-        payload = {"text": text, "source": source}
+        payload: Dict[str, Any] = {"text": text, "source": source}
+        if title:
+            payload["title"] = title
         try:
             response = requests.post(url, json=payload, timeout=10)
             if response.status_code == 200:
@@ -198,6 +199,8 @@ def save_to_qwentts(text: str, source: str = "web", do_save: bool = True, do_pod
         podcast_url: str = "http://127.0.0.1:8001/generate_single_podcast"
         payload = {"text": text, "source": source}
         if voice: payload["voice"] = voice
+        if title:
+            payload["title"] = title
         try:
             res = requests.post(podcast_url, json=payload, timeout=10)
             if res.status_code == 200:
@@ -206,15 +209,21 @@ def save_to_qwentts(text: str, source: str = "web", do_save: bool = True, do_pod
             print(f"[Error] 无法连接播客生成接口: {e}")
 
 def main() -> None:
-    # 支持命令行参数中夹带 --translate/-t, --save/-s, 或 --podcast/-p
-    translate_flag: bool = False
+    # 支持命令行参数中夹带模式及动作：--translate/-t, --podcast-trans/-pt, --podcast-discuss/-pd, --save/-s, --podcast/-p
+    mode: str = "podcast-discuss"
     save_flag: bool = False
     podcast_flag: bool = False
-    url_args: list[str] = []
+    url_args: List[str] = []
     
     for arg in sys.argv[1:]:
         if arg in ("--translate", "-t"):
-            translate_flag = True
+            mode = "translate"
+        elif arg in ("--podcast-trans", "-pt"):
+            mode = "podcast-trans"
+        elif arg in ("--podcast-discuss", "-pd"):
+            mode = "podcast-discuss"
+        elif arg in ("--original", "-o"):
+            mode = "original"
         elif arg in ("--save", "-s"):
             save_flag = True
         elif arg in ("--podcast", "-p"):
@@ -223,17 +232,22 @@ def main() -> None:
             url_args.append(arg)
             
     if len(url_args) < 1:
-        print("用法: python read_url_cli.py [URL] [--translate / -t] [--save / -s] [--podcast / -p]")
+        print("用法: python read_url_cli.py [URL] [模式参数] [--save / -s] [--podcast / -p]")
+        print("模式参数:")
+        print("  --original / -o           - 原始正文 (不作Gemini转换)")
+        print("  --translate / -t          - 翻译正文")
+        print("  --podcast-trans / -pt     - 双人-翻译")
+        print("  --podcast-discuss / -pd   - 双人-总结 (默认)")
         sys.exit(1)
         
     target_url: str = url_args[0]
     
     # 自动识别并拦截 YouTube 视频链接提取字幕
-    video_id = extract_youtube_video_id(target_url)
-    is_youtube = video_id is not None
-    if is_youtube:
+    video_id: Optional[str] = extract_youtube_video_id(target_url)
+    is_youtube: bool = video_id is not None
+    if is_youtube and video_id:
         try:
-            markdown_content = get_youtube_transcript(video_id)
+            markdown_content: str = get_youtube_transcript(video_id)
         except Exception as e:
             print(f"[Error] {e}")
             sys.exit(1)
@@ -254,39 +268,72 @@ def main() -> None:
         print(f"[CLI] 原始网页内容已保存至临时文件: {temp_source_path}")
     except Exception as e:
         print(f"[Warning] 写入临时源文件失败: {e}")
-
-    # 翻译流程
-    if translate_flag:
-        print("[CLI] 检测到翻译请求，正在调用 Gemini 进行翻译...")
+ 
+    # 处理各种生成/翻译/对谈模式
+    if mode != "original":
+        print(f"[CLI] 检测到生成模式 [{mode}]，正在调用 Gemini 处理...")
         try:
-            # 引入 gemini_engine.py 的翻译方法
-            from gemini_engine import translate_to_chinese
-            translated_content = translate_to_chinese(markdown_content)
+            sys.path.append(base_dir)
+            from gemini_engine import translate_to_chinese, generate_podcast_discussion, generate_podcast_translation
             
-            # 保存翻译后的译文临时文件
+            processed_content: str = ""
+            if mode == "translate":
+                processed_content = translate_to_chinese(markdown_content)
+            elif mode == "podcast-trans":
+                processed_content = generate_podcast_translation(markdown_content)
+            elif mode == "podcast-discuss":
+                processed_content = generate_podcast_discussion(markdown_content)
+            else:
+                processed_content = markdown_content
+                
+            # 保存处理后的译文临时文件
             temp_translated_path: str = os.path.join(base_dir, "temp_translated.md")
             with open(temp_translated_path, "w", encoding="utf-8") as f:
-                f.write(translated_content)
-            print(f"[CLI] 翻译后内容已保存至临时文件: {temp_translated_path}")
+                f.write(processed_content)
+            print(f"[CLI] 处理后内容已保存至临时文件: {temp_translated_path}")
             
-            # 将要朗读的文本替换为翻译后的中文
-            markdown_content = translated_content
+            # 将要朗读的文本替换为处理后的内容
+            markdown_content = processed_content
         except Exception as e:
-            print(f"[Error] 翻译失败，退避为原始文本朗读: {e}")
+            print(f"[Error] Gemini 处理失败，退避为原始文本朗读: {e}")
     
     print("\n--- [ 投喂的正文预览 ] ---")
     print(markdown_content[:400] + "\n...")
     print("----------------------------\n")
     
-    # 如果是 YouTube 视频，默认使用男声 Ryan 朗读以进行声音区分
-    voice = None
-    if is_youtube:
+    # 提取网页中的原始标题
+    extracted_title = ""
+    for line in markdown_content.split("\n"):
+        line = line.strip()
+        if line.startswith("# "):
+            extracted_title = line[2:].strip()
+            break
+        elif line.startswith("## "):
+            extracted_title = line[3:].strip()
+            break
+            
+    # 根据模式添加标题前缀
+    mode_label = ""
+    if mode == "podcast-discuss":
+        mode_label = "[双人总结]"
+    elif mode == "podcast-trans":
+        mode_label = "[双人翻译]"
+    elif mode == "translate":
+        mode_label = "[中文翻译]"
+        
+    full_title = f"{mode_label}{extracted_title}" if extracted_title else ""
+    
+    # 确定朗读的 voice
+    voice: Optional[str] = None
+    # 只有在非播客模式且为 YouTube 时，才默认为单人男声 Ryan
+    if is_youtube and mode not in ("podcast-trans", "podcast-discuss"):
         voice = "Ryan"
         
-    source_type = "video" if is_youtube else "web"
+    source_type: str = "video" if is_youtube else "web"
     if save_flag or podcast_flag:
-        save_to_qwentts(markdown_content, source=source_type, do_save=save_flag, do_podcast=podcast_flag, voice=voice)
+        save_to_qwentts(markdown_content, source=source_type, do_save=save_flag, do_podcast=podcast_flag, voice=voice, title=full_title)
     else:
+        # 同时通过命令行朗读时也可以带上标题
         send_to_qwentts(markdown_content, voice=voice, source=source_type)
 
 if __name__ == "__main__":

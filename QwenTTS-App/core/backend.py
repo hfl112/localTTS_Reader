@@ -19,6 +19,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
+# 统一的播客目录（指向根目录下的 podcasts/ 目录）
+PODCASTS_DIR = os.path.abspath(os.path.join(os.path.dirname(BASE_DIR), "podcasts"))
+os.makedirs(PODCASTS_DIR, exist_ok=True)
+
 from core.tts_engine import TTSEngine
 from core.player import PCMPlayer
 from core.processor import TextProcessor
@@ -38,12 +42,25 @@ def manage_cache_limit(max_items=10):
         files = [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR) if f.endswith('.npy')]
         if len(files) <= max_items: return
         files.sort(key=os.path.getmtime)
-        for f in files[:-max_items]: os.remove(f)
+        for f in files[:-max_items]:
+            os.remove(f)
+            md5_val = os.path.basename(f).replace('.npy', '')
+            try:
+                storage.delete_cache_by_md5(md5_val)
+            except: pass
     except: pass
 
 def clear_all_cache():
     try:
         for f in os.listdir(CACHE_DIR): os.remove(os.path.join(CACHE_DIR, f))
+        import sqlite3
+        try:
+            conn = sqlite3.connect(storage.db_path)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM cache_metadata")
+            conn.commit()
+            conn.close()
+        except: pass
     except: pass
 
 # ==========================================
@@ -159,9 +176,23 @@ def inference_worker(shared_state):
             
             if not shared_state.stop_event.is_set() and task_id == shared_state.current_task_id.value and cache_file and full_audio:
                 try:
-                    np.save(cache_file, np.concatenate(full_audio))
+                    concat_audio = np.concatenate(full_audio)
+                    np.save(cache_file, concat_audio)
+                    duration = len(concat_audio) / 24000.0
+                    try:
+                        storage.add_cache_metadata(
+                            md5=text_hash,
+                            text=text,
+                            model=target_model_name,
+                            voice=config.get("voice", "Serena"),
+                            duration=duration,
+                            file_path=cache_file
+                        )
+                    except Exception as db_err:
+                        print(f"[InferenceProcess] Failed to save cache metadata: {db_err}")
                     manage_cache_limit(10)
-                except: pass
+                except Exception as save_err:
+                    print(f"[InferenceProcess] Save cache failed: {save_err}")
             
             shared_state.audio_q.put("CHUNK_DONE")
             # 注意：子进程不再随意 set_status("IDLE")，防止监控误报
@@ -188,6 +219,35 @@ podcast_buffer_lock = threading.Lock()
 PODCAST_FILE = None
 PODCAST_BUFFER = []
 
+def do_save_for_later(text: str, source: str = "web", voice: str | None = None, title: str | None = None) -> int:
+    text = text.strip()
+    if not text: return 0
+    save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
+    saved_items = []
+    md5_val = hashlib.md5(text.encode("utf-8")).hexdigest()
+    
+    with save_file_lock:
+        if os.path.exists(save_file):
+            try:
+                with open(save_file, "r", encoding="utf-8") as f: saved_items = json.load(f)
+            except: pass
+            
+        if not any(item.get("md5") == md5_val for item in saved_items):
+            display_title = title if title else (text[:20].replace("\n", " ") + "...")
+            saved_items.append({
+                "timestamp": time.time(),
+                "text": text,
+                "title": display_title,
+                "source": source,
+                "voice": voice,
+                "is_exported": False,
+                "md5": md5_val
+            })
+            if len(saved_items) > 5: saved_items = saved_items[-5:]
+            with open(save_file, "w", encoding="utf-8") as f: json.dump(saved_items, f, ensure_ascii=False, indent=2)
+            
+    return len(saved_items)
+
 def shared_task_loop(tid, start_idx, chunks, config, state, is_podcast=False):
     global MAIN_IS_PLAYING, MAIN_PROGRESS
     try:
@@ -198,7 +258,17 @@ def shared_task_loop(tid, start_idx, chunks, config, state, is_podcast=False):
             if S.stop_event.is_set() or tid != S.current_task_id.value: break
             MAIN_PROGRESS = f"{i+1}/{len(chunks)}"
             chunk_text = chunks[i]
-            S.text_q.put({'task_id': tid, 'text': chunk_text, 'config': config, 'hash': get_text_hash(chunk_text)})
+            if isinstance(chunk_text, dict):
+                chunk_config = config.copy()
+                chunk_config.update(chunk_text.get('config', {}))
+                actual_text = chunk_text['text']
+                text_hash = get_text_hash(actual_text + "_" + chunk_config.get("voice", ""))
+            else:
+                chunk_config = config
+                actual_text = chunk_text
+                text_hash = get_text_hash(actual_text)
+            
+            S.text_q.put({'task_id': tid, 'text': actual_text, 'config': chunk_config, 'hash': text_hash})
             if not is_podcast:
                 state["current_article"]["current_index"] = i
                 storage.save_state(state)
@@ -307,6 +377,7 @@ async def read_text(data: dict = Body(...)):
     global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS, PODCAST_FILE, PODCAST_BUFFER
     text = data.get('text', "")
     voice = data.get("voice", None)
+    source = data.get("source", None)
     
     PODCAST_FILE = None
     with podcast_buffer_lock:
@@ -330,7 +401,13 @@ async def read_text(data: dict = Body(...)):
         chunks = current_art.get("chunks", [])
         curr_idx = current_art.get("current_index", 0)
     else:
-        chunks = processor.smart_split(text)
+        if source == "clipboard" and text:
+            try:
+                do_save_for_later(text, source="clipboard", voice=voice)
+            except Exception as e:
+                print(f"[Backend] Auto-saving clipboard text failed: {e}")
+                
+        chunks = processor.parse_dialogue_or_text(text)
         state["current_article"] = {"title": text[:15].replace("\n", " ") + "...", "chunks": chunks, "current_index": 0}
         storage.save_state(state)
         curr_idx = 0
@@ -343,7 +420,7 @@ async def read_text(data: dict = Body(...)):
 
 @app.post("/stop")
 async def stop_read():
-    global MAIN_IS_PLAYING, PODCAST_FILE, PODCAST_BUFFER, ACTIVE_PODCAST_PROCS
+    global MAIN_IS_PLAYING, PODCAST_FILE, PODCAST_BUFFER, ACTIVE_PODCAST_PROCS, ACTIVE_PODCAST_TASKS
     
     PODCAST_FILE = None
     with podcast_buffer_lock:
@@ -362,13 +439,13 @@ async def stop_read():
             try: p.terminate()
             except: pass
     ACTIVE_PODCAST_PROCS.clear()
+    ACTIVE_PODCAST_TASKS.clear()
     
     # Cleanup pending podcast files
-    podcasts_dir = os.path.join(BASE_DIR, "data", "podcasts")
-    if os.path.exists(podcasts_dir):
-        for f in os.listdir(podcasts_dir):
+    if os.path.exists(PODCASTS_DIR):
+        for f in os.listdir(PODCASTS_DIR):
             if ".pending_" in f:
-                try: os.remove(os.path.join(podcasts_dir, f))
+                try: os.remove(os.path.join(PODCASTS_DIR, f))
                 except: pass
                 
     return {"status": "ok"}
@@ -376,13 +453,33 @@ async def stop_read():
 @app.get("/status")
 async def get_status():
     global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS
-    # is_playing should be True if MAIN_IS_PLAYING and the player is not paused
+    
+    generating_title = ""
+    if os.path.exists(PODCASTS_DIR):
+        try:
+            for f in os.listdir(PODCASTS_DIR):
+                if f.startswith(".pending_单篇_"):
+                    parts = f.split("_")
+                    if len(parts) >= 4:
+                        generating_title = parts[3]
+                        break
+                elif f.startswith(".pending_合集_"):
+                    generating_title = "大合集播客"
+                    break
+        except:
+            pass
+            
+    status_code = S.get_status()
+    if generating_title and status_code == "IDLE":
+        status_code = "BUSY"
+        
     return {
         "is_playing": MAIN_IS_PLAYING and not player.is_paused,
         "title": MAIN_TITLE,
         "progress": MAIN_PROGRESS,
         "buffer_sec": player.get_queue_duration(),
-        "status_code": S.get_status()
+        "status_code": status_code,
+        "generating_title": generating_title
     }
 
 @app.post("/pause")
@@ -442,6 +539,7 @@ import subprocess
 
 ACTIVE_URL_TASKS: dict[str, dict] = {}
 ACTIVE_PODCAST_PROCS = []
+ACTIVE_PODCAST_TASKS = {}
 
 GLOBAL_PAUSE_EVENT = mp.Event()
 GLOBAL_PODCAST_GPU_LOCK = mp.Lock()
@@ -464,34 +562,58 @@ def podcast_manager_loop():
 
 threading.Thread(target=podcast_manager_loop, daemon=True).start()
 
-def run_single_podcast_generation_thread(text: str, config: dict, md5: str, source: str, pause_event, gpu_lock) -> None:
+def run_single_podcast_generation_thread(text: str, config: dict, md5: str, source: str, pause_event, gpu_lock, title: str = None) -> None:
     import traceback
-    safe_title = "".join(c for c in text[:20] if c.isalnum() or '\u4e00' <= c <= '\u9fff')
+    try:
+        os.nice(19)
+        print("[PodcastProcess] Nice level set to 19 (lowest priority)")
+    except Exception as e:
+        print(f"[PodcastProcess] Failed to set nice level: {e}")
+        
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+    if title:
+        safe_title = "".join(c for c in title if c.isalnum() or '\u4e00' <= c <= '\u9fff' or c in '[]_-')
+    else:
+        safe_title = "".join(c for c in text[:20] if c.isalnum() or '\u4e00' <= c <= '\u9fff' or c in '[]_-')
     if not safe_title: safe_title = "无标题"
     
-    pending_file = os.path.join(BASE_DIR, "data", "podcasts", f".pending_单篇_{source}_{safe_title}_{md5[:8]}")
+    pending_file = os.path.join(PODCASTS_DIR, f".pending_单篇_{source}_{safe_title}_{md5[:8]}")
     os.makedirs(os.path.dirname(pending_file), exist_ok=True)
     with open(pending_file, "w") as f: f.write(text[:20])
     try:
         with gpu_lock:
             engine = TTSEngine(model_path=f"models/{config.get('model', 'Qwen3-TTS-1.7B-8bit')}", mlx_audio_path="../../mlx_audio")
             engine.ensure_model_loaded()
-            chunks = TextProcessor().smart_split(text)
+            chunks = TextProcessor().parse_dialogue_or_text(text)
             audio_data = []
             for chunk in chunks:
                 # Wait if paused by the manager
                 while pause_event.is_set():
                     time.sleep(2)
+                
+                if isinstance(chunk, dict):
+                    chunk_config = config.copy()
+                    chunk_config.update(chunk.get('config', {}))
+                    actual_text = chunk['text']
+                else:
+                    chunk_config = config
+                    actual_text = chunk
                     
-                for samples in engine.generate_stream(chunk, config):
+                for samples in engine.generate_stream(actual_text, chunk_config):
                     audio_data.append(samples)
+                    time.sleep(0.5) # 增加延迟，降低 GPU/CPU 占空比，防电脑风扇狂转
                 # Let the GPU cool down between sentences
-                time.sleep(1.5)
+                time.sleep(3.0)
             if audio_data:
                 full_wav = np.concatenate(audio_data)
                 wav_data = (np.clip(full_wav, -1.0, 1.0) * 32767).astype(np.int16)
                 out_name = f"podcast_单篇_{source}_{safe_title}_{md5[:8]}_{int(time.time())}.wav"
-                scipy.io.wavfile.write(os.path.join(BASE_DIR, "data", "podcasts", out_name), 24000, wav_data)
+                scipy.io.wavfile.write(os.path.join(PODCASTS_DIR, out_name), 24000, wav_data)
     except Exception as e:
         print(f"[PodcastProcess] Error: {e}")
         traceback.print_exc()
@@ -500,6 +622,18 @@ def run_single_podcast_generation_thread(text: str, config: dict, md5: str, sour
 
 def run_podcast_generation_thread(filename: str, text: str, config: dict, pause_event, gpu_lock) -> None:
     import traceback
+    try:
+        os.nice(19)
+        print("[PodcastProcess] Nice level set to 19 (lowest priority)")
+    except Exception as e:
+        print(f"[PodcastProcess] Failed to set nice level: {e}")
+        
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
     pending_file = filename.replace(".wav", "") + ".pending_合集"
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     with open(pending_file, "w") as f: f.write("pending")
@@ -507,16 +641,25 @@ def run_podcast_generation_thread(filename: str, text: str, config: dict, pause_
         with gpu_lock:
             engine = TTSEngine(model_path=f"models/{config.get('model', 'Qwen3-TTS-1.7B-8bit')}", mlx_audio_path="../../mlx_audio")
             engine.ensure_model_loaded()
-            chunks = TextProcessor().smart_split(text)
+            chunks = TextProcessor().parse_dialogue_or_text(text)
             audio_data = []
             for chunk in chunks:
                 while pause_event.is_set():
                     time.sleep(2)
                     
-                for samples in engine.generate_stream(chunk, config):
+                if isinstance(chunk, dict):
+                    chunk_config = config.copy()
+                    chunk_config.update(chunk.get('config', {}))
+                    actual_text = chunk['text']
+                else:
+                    chunk_config = config
+                    actual_text = chunk
+                    
+                for samples in engine.generate_stream(actual_text, chunk_config):
                     audio_data.append(samples)
+                    time.sleep(0.5) # 增加延迟，降低 GPU/CPU 占空比，防电脑风扇狂转
                 # Let the GPU cool down between sentences
-                time.sleep(1.5)
+                time.sleep(3.0)
             if audio_data:
                 full_wav = np.concatenate(audio_data)
                 wav_data = (np.clip(full_wav, -1.0, 1.0) * 32767).astype(np.int16)
@@ -531,6 +674,12 @@ async def read_url(payload: dict = Body(...)) -> dict:
     global ACTIVE_URL_TASKS
     url = payload.get("url", "").strip()
     translate = payload.get("translate", False)
+    mode = payload.get("mode", "original")
+    
+    # Fallback compatibility for older client payloads
+    if mode == "original" and translate:
+        mode = "translate"
+        
     save = payload.get("save", False)
     podcast = payload.get("podcast", False)
     if not url: return {"error": "Empty URL"}
@@ -544,7 +693,14 @@ async def read_url(payload: dict = Body(...)) -> dict:
     
     cli_path = os.path.join(os.path.dirname(BASE_DIR), "URL-Reader", "read_url_cli.py")
     cmd = [sys.executable, cli_path, url]
-    if translate: cmd.append("-t")
+    
+    if mode == "translate":
+        cmd.append("-t")
+    elif mode == "podcast-trans":
+        cmd.append("-pt")
+    elif mode == "podcast-discuss":
+        cmd.append("-pd")
+        
     if save: cmd.append("--save")
     if podcast: cmd.append("--podcast")
     
@@ -560,20 +716,33 @@ async def read_url(payload: dict = Body(...)) -> dict:
 
 @app.post("/delete_saved")
 async def delete_saved(data: dict = Body(...)):
-    index = data.get("index")
+    md5 = data.get("md5")
     save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
+    
     with save_file_lock:
         if os.path.exists(save_file):
-            with open(save_file, "r", encoding="utf-8") as f: items = json.load(f)
-            if 0 <= index < len(items):
-                items.pop(index)
-                with open(save_file, "w", encoding="utf-8") as f: json.dump(items, f, ensure_ascii=False, indent=2)
-                return {"status": "ok"}
+            try:
+                with open(save_file, "r", encoding="utf-8") as f: items = json.load(f)
+            except:
+                items = []
+                
+            if md5:
+                new_items = [item for item in items if item.get("md5") != md5]
+                if len(new_items) < len(items):
+                    with open(save_file, "w", encoding="utf-8") as f: json.dump(new_items, f, ensure_ascii=False, indent=2)
+                    return {"status": "ok"}
+            else:
+                index = data.get("index")
+                if index is not None and 0 <= index < len(items):
+                    items.pop(index)
+                    with open(save_file, "w", encoding="utf-8") as f: json.dump(items, f, ensure_ascii=False, indent=2)
+                    return {"status": "ok"}
+                    
     return {"error": "Item not found"}
 
 @app.get("/podcasts/list")
 async def list_podcasts():
-    podcasts_dir = os.path.join(BASE_DIR, "data", "podcasts")
+    podcasts_dir = PODCASTS_DIR
     if not os.path.exists(podcasts_dir): return []
     files = []
     for f in os.listdir(podcasts_dir):
@@ -623,43 +792,155 @@ async def list_podcasts():
 @app.post("/podcasts/toggle_pin")
 async def toggle_pin(data: dict = Body(...)):
     filename = data.get("filename", "")
-    filepath = os.path.join(BASE_DIR, "data", "podcasts", filename)
-    if not os.path.exists(filepath): return {"error": "File not found"}
     
-    if "pinned_" in filename:
+    search_dirs = [
+        PODCASTS_DIR,
+        os.path.join(BASE_DIR, "data", "podcasts"),
+        os.path.join(os.path.dirname(BASE_DIR), "podcasts"),
+        os.path.join(BASE_DIR, "data", "exported")
+    ]
+    
+    filepath = None
+    for d in search_dirs:
+        candidate = os.path.join(d, filename)
+        if os.path.exists(candidate):
+            filepath = candidate
+            break
+            
+    if not filepath:
+        return {"error": "File not found"}
+        
+    dir_name = os.path.dirname(filepath)
+    is_pinned = "pinned_" in filename
+    if is_pinned:
         new_name = filename.replace("pinned_", "")
     else:
         new_name = "pinned_" + filename
         
-    new_path = os.path.join(BASE_DIR, "data", "podcasts", new_name)
-    os.rename(filepath, new_path)
-    return {"status": "ok"}
+    new_path = os.path.join(dir_name, new_name)
+    try:
+        os.rename(filepath, new_path)
+        return {"status": "ok", "new_name": new_name}
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.post("/podcasts/clear")
 async def clear_podcasts():
-    podcasts_dir = os.path.join(BASE_DIR, "data", "podcasts")
-    if not os.path.exists(podcasts_dir): return {"status": "ok"}
-    
+    # 同时清理统一播客文件夹和其它备份文件夹下的未置顶播客
     deleted_count = 0
-    for f in os.listdir(podcasts_dir):
-        if f.endswith(".wav") and "pinned_" not in f:
-            try:
-                os.remove(os.path.join(podcasts_dir, f))
-                deleted_count += 1
-            except: pass
+    for podcasts_dir in [PODCASTS_DIR, os.path.join(BASE_DIR, "data", "podcasts")]:
+        if os.path.exists(podcasts_dir):
+            for f in os.listdir(podcasts_dir):
+                if f.endswith(".wav") and "pinned_" not in f:
+                    try:
+                        os.remove(os.path.join(podcasts_dir, f))
+                        deleted_count += 1
+                    except: pass
     return {"status": "ok", "deleted_count": deleted_count}
+
+@app.post("/podcasts/delete")
+async def delete_podcast(data: dict = Body(...)):
+    filename = data.get("filename", "")
+    if not filename: return {"error": "Empty filename"}
+    
+    safe_filename = os.path.basename(filename)
+    search_dirs = [
+        PODCASTS_DIR,
+        os.path.join(BASE_DIR, "data", "podcasts"),
+        os.path.join(os.path.exported_dir if hasattr(os, "exported_dir") else os.path.join(BASE_DIR, "data", "exported"), "exported") # keep fallback
+    ]
+    # Simple direct search list
+    search_dirs = [
+        PODCASTS_DIR,
+        os.path.join(BASE_DIR, "data", "podcasts"),
+        os.path.join(BASE_DIR, "data", "exported")
+    ]
+    
+    filepath = None
+    for d in search_dirs:
+        candidate = os.path.join(d, safe_filename)
+        if os.path.exists(candidate):
+            filepath = candidate
+            break
+            
+    if filepath and os.path.exists(filepath):
+        try:
+            os.remove(filepath)
+            return {"status": "ok"}
+        except Exception as e:
+            return {"error": f"Failed to delete file: {e}"}
+    return {"error": "File not found"}
 
 @app.post("/podcasts/play")
 async def play_podcast(data: dict = Body(...)):
     filename = data.get("filename", "")
-    filepath = os.path.join(BASE_DIR, "data", "podcasts", filename)
-    if not os.path.exists(filepath): return {"error": "File not found"}
     
-    import subprocess
-    try:
-        subprocess.Popen(["open", filepath])
-    except Exception as e:
-        return {"error": str(e)}
+    search_dirs = [
+        PODCASTS_DIR,
+        os.path.join(BASE_DIR, "data", "podcasts"),
+        os.path.join(BASE_DIR, "data", "exported")
+    ]
+    
+    filepath = None
+    for d in search_dirs:
+        candidate = os.path.join(d, filename)
+        if os.path.exists(candidate):
+            filepath = candidate
+            break
+            
+    if not filepath:
+        return {"error": "File not found"}
+    
+    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS, PODCAST_BUFFER, PODCAST_FILE
+    MAIN_TITLE = "🎙️ " + filename.replace(".wav", "").replace("podcast_", "")
+    MAIN_PROGRESS = ""
+    MAIN_IS_PLAYING = True
+    
+    player.stop()
+    S.stop_event.clear()
+    
+    with podcast_buffer_lock:
+        PODCAST_BUFFER = []
+        PODCAST_FILE = None
+
+    def play_wav_thread(path):
+        global MAIN_IS_PLAYING
+        try:
+            import scipy.io.wavfile as wavfile
+            import numpy as np
+            sr, wav_data = wavfile.read(path)
+            
+            # handle mono to stereo
+            if len(wav_data.shape) == 1:
+                wav_data = np.stack([wav_data, wav_data], axis=1)
+                
+            float_data = wav_data.astype(np.float32) / 32767.0
+            chunk_size = sr * 2 # 2 seconds chunks
+            
+            player.start()
+            for i in range(0, len(float_data), chunk_size):
+                if S.stop_event.is_set():
+                    break
+                
+                # Keep audio queue small to avoid memory bloat and allow quick stop
+                while player.audio_queue.qsize() > 5 and not S.stop_event.is_set():
+                    time.sleep(0.5)
+                    
+                if S.stop_event.is_set():
+                    break
+                    
+                chunk = float_data[i:i+chunk_size]
+                player.play_chunk(chunk)
+                
+            player.signal_end_of_article()
+        except Exception as e:
+            print(f"[WavPlayer] Error: {e}")
+        finally:
+            # Only set to False if we weren't interrupted by another play task
+            if not S.stop_event.is_set():
+                MAIN_IS_PLAYING = False
+            
+    threading.Thread(target=play_wav_thread, args=(filepath,), daemon=True).start()
     return {"status": "ok"}
 
 @app.post("/save_for_later")
@@ -669,55 +950,49 @@ async def save_for_later(data: dict = Body(...)):
     text = data.get("text", "").strip()
     source = data.get("source", "web")
     voice = data.get("voice", None)
+    title = data.get("title", None)
     if not text: return {"error": "Empty text"}
     
-    save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
-    saved_items = []
-    md5_val = hashlib.md5(text.encode("utf-8")).hexdigest()
-    
-    with save_file_lock:
-        if os.path.exists(save_file):
-            try:
-                with open(save_file, "r", encoding="utf-8") as f: saved_items = json.load(f)
-            except: pass
-            
-        saved_items.append({
-            "timestamp": time.time(),
-            "text": text,
-            "title": text[:20].replace("\n", " ") + "...",
-            "source": source,
-            "voice": voice,
-            "is_exported": False,
-            "md5": md5_val
-        })
-        if len(saved_items) > 5: saved_items = saved_items[-5:]
-        with open(save_file, "w", encoding="utf-8") as f: json.dump(saved_items, f, ensure_ascii=False, indent=2)
-            
-    return {"status": "saved", "count": len(saved_items)}
+    count = do_save_for_later(text, source, voice, title)
+    return {"status": "saved", "count": count}
 
 @app.post("/generate_single_podcast")
 async def generate_single_podcast(data: dict = Body(...)):
-    global ACTIVE_PODCAST_PROCS, LAST_ACTIVE_TIME
+    global ACTIVE_PODCAST_PROCS, ACTIVE_PODCAST_TASKS, LAST_ACTIVE_TIME
     LAST_ACTIVE_TIME = time.time()
+    
     text = data.get("text", "").strip()
     source = data.get("source", "web")
     voice = data.get("voice", None)
+    title = data.get("title", None)
     if not text: return {"error": "Empty text"}
     
     md5_val = hashlib.md5(text.encode("utf-8")).hexdigest()
+    
+    # 过滤并清理已结束的任务进程
+    for m, proc in list(ACTIVE_PODCAST_TASKS.items()):
+        if not proc.is_alive():
+            ACTIVE_PODCAST_TASKS.pop(m, None)
+            
+    # 如果检测到相同内容的任务已在生成中，直接返回成功状态（不需要重复排队）
+    if md5_val in ACTIVE_PODCAST_TASKS:
+        return {"status": "generating", "md5": md5_val, "message": "该内容已在后台生成中，无需重复提交！"}
+        
     config = storage.load_config()
     if voice:
         config["voice"] = voice
-    p = mp.Process(target=run_single_podcast_generation_thread, args=(text, config, md5_val, source, GLOBAL_PAUSE_EVENT, GLOBAL_PODCAST_GPU_LOCK), daemon=True)
+    p = mp.Process(target=run_single_podcast_generation_thread, args=(text, config, md5_val, source, GLOBAL_PAUSE_EVENT, GLOBAL_PODCAST_GPU_LOCK, title), daemon=True)
     p.start()
     
     ACTIVE_PODCAST_PROCS = [proc for proc in ACTIVE_PODCAST_PROCS if proc.is_alive()]
     ACTIVE_PODCAST_PROCS.append(p)
+    ACTIVE_PODCAST_TASKS[md5_val] = p
     
-    async def cleanup(proc):
+    async def cleanup(proc, m):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, proc.join)
-    asyncio.create_task(cleanup(p))
+        ACTIVE_PODCAST_TASKS.pop(m, None)
+    asyncio.create_task(cleanup(p, md5_val))
     
     return {"status": "generating", "md5": md5_val}
 
@@ -731,6 +1006,8 @@ async def clear_saved_items():
 
 @app.post("/generate_podcast")
 async def generate_podcast_api():
+    global ACTIVE_PODCAST_PROCS, ACTIVE_PODCAST_TASKS
+    
     save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
     saved_items = []
     with save_file_lock:
@@ -741,8 +1018,21 @@ async def generate_podcast_api():
     if not saved_items: return {"error": "No saved items"}
     
     text = "\n\n".join(item.get("text", "") for item in saved_items)
-    os.makedirs(os.path.join(BASE_DIR, "data", "podcasts"), exist_ok=True)
-    filename = os.path.join(BASE_DIR, "data", "podcasts", f"podcast_合集_web_大合集播客_{int(time.time())}.wav")
+    md5_val = hashlib.md5(text.encode("utf-8")).hexdigest()
+    
+    # 过滤并清理已结束的任务进程
+    for m, proc in list(ACTIVE_PODCAST_TASKS.items()):
+        if not proc.is_alive():
+            ACTIVE_PODCAST_TASKS.pop(m, None)
+            
+    # 如果检测到相同内容的任务已在生成中，直接返回成功并清空原列表
+    if md5_val in ACTIVE_PODCAST_TASKS:
+        with save_file_lock:
+            with open(save_file, "w", encoding="utf-8") as f: json.dump([], f)
+        return {"status": "generating", "message": "该合集内容已在后台生成中，无需重复提交！"}
+        
+    os.makedirs(PODCASTS_DIR, exist_ok=True)
+    filename = os.path.join(PODCASTS_DIR, f"podcast_合集_web_大合集播客_{int(time.time())}.wav")
     
     config = storage.load_config()
     first_voice = saved_items[0].get("voice") if saved_items else None
@@ -752,14 +1042,15 @@ async def generate_podcast_api():
     p = mp.Process(target=run_podcast_generation_thread, args=(filename, text, config, GLOBAL_PAUSE_EVENT, GLOBAL_PODCAST_GPU_LOCK), daemon=True)
     p.start()
     
-    global ACTIVE_PODCAST_PROCS
     ACTIVE_PODCAST_PROCS = [proc for proc in ACTIVE_PODCAST_PROCS if proc.is_alive()]
     ACTIVE_PODCAST_PROCS.append(p)
+    ACTIVE_PODCAST_TASKS[md5_val] = p
     
-    async def cleanup(proc):
+    async def cleanup(proc, m):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, proc.join)
-    asyncio.create_task(cleanup(p))
+        ACTIVE_PODCAST_TASKS.pop(m, None)
+    asyncio.create_task(cleanup(p, md5_val))
     
     with save_file_lock:
         with open(save_file, "w", encoding="utf-8") as f: json.dump([], f)
@@ -819,7 +1110,7 @@ async def play_saved(data: dict = Body(...)):
 @app.get("/cache/items")
 async def get_cache_items():
     items = storage.get_all_cache()
-    podcast_dir = os.path.join(BASE_DIR, "data", "podcasts")
+    podcast_dir = PODCASTS_DIR
     for item in items:
         md5 = item.get("md5")
         is_exported = False

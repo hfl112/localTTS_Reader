@@ -39,6 +39,7 @@ class QwenTTSApp(rumps.App):
         self.start_backend_service()
 
         # 构造 UI
+        self.item_status = rumps.MenuItem("💤 空闲中", callback=None)
         self.item_read_clip = rumps.MenuItem(
             "📋 朗读剪贴板", callback=self.on_read_clipboard
         )
@@ -48,13 +49,10 @@ class QwenTTSApp(rumps.App):
         self.item_prev = rumps.MenuItem("⏮ 上一段", callback=self.on_prev_click)
         self.item_next = rumps.MenuItem("⏭ 下一段", callback=self.on_next_click)
         self.item_stop = rumps.MenuItem("⏹ 停止播放", callback=self.on_stop_click)
-        self.item_save = rumps.MenuItem(
-            "💾 保存当前朗读", callback=self.on_save_current
-        )
-        self.item_podcast = rumps.MenuItem(
-            "🎙️ 生成收藏播客", callback=self.on_generate_podcast
-        )
         self.item_restart_audio = rumps.MenuItem("🎧 重启音频设备", callback=self.on_restart_audio)
+
+        # 偏好设置二级子菜单
+        self.menu_settings = rumps.MenuItem("⚙️ 偏好设置")
 
         self.menu_speed = rumps.MenuItem("语速")
         self.speed_items = {}
@@ -88,9 +86,16 @@ class QwenTTSApp(rumps.App):
             self.menu_model.add(item)
             self.model_items[val] = item
 
+        # 将配置项收纳进“偏好设置”
+        self.menu_settings.add(self.menu_voice)
+        self.menu_settings.add(self.menu_speed)
+        self.menu_settings.add(self.menu_model)
+
         self.menu_podcasts = rumps.MenuItem("🎙️ 最近播客")
 
         self.menu = [
+            self.item_status,
+            rumps.separator,
             self.item_read_clip,
             rumps.separator,
             self.item_play_pause,
@@ -98,14 +103,9 @@ class QwenTTSApp(rumps.App):
             self.item_next,
             self.item_stop,
             rumps.separator,
-            self.item_save,
-            self.item_podcast,
             self.menu_podcasts,
             rumps.separator,
-            self.menu_model,
-            self.menu_speed,
-            self.menu_voice,
-            rumps.separator,
+            self.menu_settings,
             self.item_restart_audio,
             rumps.separator,
             rumps.MenuItem("退出", callback=self.on_quit),
@@ -168,21 +168,44 @@ class QwenTTSApp(rumps.App):
                 if response.status_code == 200:
                     data = response.json()
                     is_playing = data.get("is_playing", False)
+                    title = data.get("title", "")
+                    progress = data.get("progress", "")
+                    status_code = data.get("status_code", "IDLE")
+                    
                     self.item_play_pause.title = "⏸ 暂停" if is_playing else "▶ 继续"
+                    
+                    if is_playing:
+                        if progress and progress != "0/0":
+                            self.item_status.title = f"📖 正在播放: {title} ({progress})"
+                        else:
+                            self.item_status.title = f"🎙️ 正在播放: {title}"
+                    else:
+                        if status_code == "COOLING":
+                            self.item_status.title = "⏳ 降温冷却中..."
+                        elif status_code == "BUSY":
+                            gen_title = data.get("generating_title", "")
+                            if gen_title:
+                                if len(gen_title) > 20:
+                                    gen_title = gen_title[:18] + "..."
+                                self.item_status.title = f"⏳ 正在生成: {gen_title}"
+                            else:
+                                self.item_status.title = "⏳ 正在生成中..."
+                        else:
+                            self.item_status.title = "💤 空闲中"
             except:
                 pass
         threading.Thread(target=check, daemon=True).start()
 
     def scan_and_update_podcasts_menu(self) -> None:
         """扫描本地导出的播客音频并在发生变化时动态更新菜单栏"""
-        podcasts_dir = os.path.join(BASE_DIR, "..", "podcasts")
+        root_podcasts_dir = os.path.join(BASE_DIR, "..", "podcasts")
         exported_dir = os.path.join(BASE_DIR, "data", "exported")
         
         wav_files = []
-        for dir_path in [podcasts_dir, exported_dir]:
+        for dir_path in [root_podcasts_dir, exported_dir]:
             if os.path.exists(dir_path):
                 for f in os.listdir(dir_path):
-                    if f.endswith(".wav"):
+                    if f.endswith(".wav") and not f.startswith("."):
                         full_path = os.path.join(dir_path, f)
                         try:
                             mtime = os.path.getmtime(full_path)
@@ -209,6 +232,8 @@ class QwenTTSApp(rumps.App):
                 pass
         if not recent_files:
             self.menu_podcasts.add(rumps.MenuItem("暂无生成的播客"))
+            self.menu_podcasts.add(rumps.separator)
+            self.menu_podcasts.add(rumps.MenuItem("📂 打开播客文件夹", callback=self.on_open_podcasts_dir))
             return
             
         for f, mtime in recent_files:
@@ -224,13 +249,28 @@ class QwenTTSApp(rumps.App):
                         cache_item = self.storage.get_cache_by_md5(md5_val)
                         if cache_item and cache_item.get("text"):
                             raw_text = cache_item["text"].strip().replace("\n", " ")
-                            if len(raw_text) > 12:
-                                text_preview = ": " + raw_text[:10] + "..."
+                            if len(raw_text) > 24:
+                                text_preview = raw_text[:22] + "..."
                             else:
-                                text_preview = ": " + raw_text
+                                text_preview = raw_text
                 except Exception as e:
                     print(f"[App] 获取播客文本前缀失败: {e}")
-                display_title = f"🎙️ 导出 {time_str}{text_preview}"
+                display_title = text_preview if text_preview else f"🎙️ 导出 {time_str}"
+            elif f.startswith("podcast_"):
+                text_preview = ""
+                try:
+                    parts = f.replace(".wav", "").split("_")
+                    if len(parts) >= 4 and parts[1] == "单篇":
+                        title_part = parts[3]
+                        if len(title_part) > 24:
+                            text_preview = title_part[:22] + "..."
+                        else:
+                            text_preview = title_part
+                    elif len(parts) >= 3 and parts[1] == "合集":
+                        text_preview = "大合集播客"
+                except:
+                    pass
+                display_title = text_preview if text_preview else f"🎙️ 播客 {time_str}"
             else:
                 display_title = f"📻 播客 {time_str}"
                 
@@ -248,6 +288,9 @@ class QwenTTSApp(rumps.App):
                 
             item = rumps.MenuItem(display_title, callback=make_callback(f))
             self.menu_podcasts.add(item)
+            
+        self.menu_podcasts.add(rumps.separator)
+        self.menu_podcasts.add(rumps.MenuItem("📂 打开播客文件夹", callback=self.on_open_podcasts_dir))
 
     def on_read_clipboard(self, _):
         """朗读剪贴板"""
@@ -257,7 +300,7 @@ class QwenTTSApp(rumps.App):
             if not text:
                 rumps.notification("Qwen TTS", "警告", "剪贴板为空")
                 return
-            self._safe_post_async("/read", {"text": text, "index": 0})
+            self._safe_post_async("/read", {"text": text, "index": 0, "source": "clipboard"})
         except Exception as e:
             print(f"[App] 读取剪贴板错误: {e}")
 
@@ -382,23 +425,23 @@ class QwenTTSApp(rumps.App):
                         pass
 
         # 4. 限制 podcasts 目录下的 wav 文件仅保留最新的 3 个，其他的删掉
-        try:
-            podcasts_dir = os.path.join(BASE_DIR, "..", "podcasts")
-            if os.path.exists(podcasts_dir):
-                files = [
-                    os.path.join(podcasts_dir, f)
-                    for f in os.listdir(podcasts_dir)
-                    if f.endswith(".wav")
-                ]
-                if len(files) > 3:
-                    files.sort(key=os.path.getmtime)
-                    for f in files[:-3]:
-                        try:
-                            os.remove(f)
-                        except:
-                            pass
-        except Exception as e:
-            print(f"[App] 限制 podcasts 失败: {e}")
+        for p_dir in [os.path.join(BASE_DIR, "..", "podcasts")]:
+            try:
+                if os.path.exists(p_dir):
+                    files = [
+                        os.path.join(p_dir, f)
+                        for f in os.listdir(p_dir)
+                        if f.endswith(".wav")
+                    ]
+                    if len(files) > 3:
+                        files.sort(key=os.path.getmtime)
+                        for f in files[:-3]:
+                            try:
+                                os.remove(f)
+                            except:
+                                pass
+            except Exception as e:
+                print(f"[App] 限制 {p_dir} 失败: {e}")
 
     def on_quit(self, _):
         if self.backend_process:
@@ -416,6 +459,11 @@ class QwenTTSApp(rumps.App):
             rumps.notification("QwenTTS", "音频设备已重启", "已尝试重新绑定默认输出设备")
         except Exception as e:
             rumps.notification("QwenTTS", "重启设备失败", str(e))
+
+    def on_open_podcasts_dir(self, _):
+        podcasts_dir = os.path.abspath(os.path.join(BASE_DIR, "..", "podcasts"))
+        os.makedirs(podcasts_dir, exist_ok=True)
+        subprocess.run(["open", podcasts_dir])
 
 if __name__ == "__main__":
     QwenTTSApp().run()

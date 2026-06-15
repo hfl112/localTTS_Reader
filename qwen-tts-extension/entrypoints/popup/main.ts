@@ -43,6 +43,33 @@ const fetchSavedItems = async () => {
   }
 };
 
+const estimateReadingTime = (text: string): string => {
+  if (!text) return "0秒";
+  
+  // Count Chinese characters
+  const chineseChars = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
+  
+  // Count English words
+  const englishText = text.replace(/[\u4e00-\u9fa5]/g, ' ');
+  const englishWords = englishText.split(/\s+/).filter(w => w.trim().length > 0).length;
+  
+  // Estimate total seconds:
+  // Chinese: ~250 chars / minute
+  // English: ~150 words / minute
+  const totalSeconds = Math.ceil((chineseChars / 250 + englishWords / 150) * 60);
+  if (totalSeconds < 60) {
+    return `~${totalSeconds}s`;
+  }
+  
+  const minutes = Math.round(totalSeconds / 60);
+  if (minutes < 60) {
+    return `~${minutes}min`;
+  }
+  
+  const hours = Math.round(totalSeconds / 3600);
+  return `~${hours}hr`;
+};
+
 const renderSavedList = (items: any[]) => {
   if (items.length === 0) {
     savedList.innerHTML = '<div class="empty-state">暂无收藏内容</div>';
@@ -72,7 +99,7 @@ const renderSavedList = (items: any[]) => {
 
     // Snip text to fit
     let displayTitle = item.title || item.text.trim();
-    if (displayTitle.length > 20) displayTitle = displayTitle.slice(0, 18) + '...';
+    if (displayTitle.length > 28) displayTitle = displayTitle.slice(0, 26) + '...';
 
     let actionsHtml = '';
     if (item.is_pending) {
@@ -96,6 +123,7 @@ const renderSavedList = (items: any[]) => {
         <div class="cache-text" title="${item.text}">${sourceTag}${displayTitle}</div>
         <div class="cache-meta">
           <span>${item.is_pending ? '等待完成' : new Date(item.timestamp * 1000).toLocaleString()}</span>
+          ${item.is_pending ? '' : `<span>·</span><span>${estimateReadingTime(item.text)}</span>`}
         </div>
       </div>
       <div class="cache-actions" style="display: flex; gap: 4px;">
@@ -162,7 +190,7 @@ const renderSavedList = (items: any[]) => {
       if (btnDelete) {
         btnDelete.onclick = async () => {
           try {
-            const res = await callBackend("/delete_saved", "POST", { index });
+            const res = await callBackend("/delete_saved", "POST", { md5: item.md5, index });
             if (res && !res.error) {
               fetchSavedItems();
             }
@@ -258,7 +286,7 @@ const renderPodcastList = (items: any[]) => {
     let displayTitle = "";
     if (item.title && item.title !== (item.filename || item.title)) {
       displayTitle = item.title.trim();
-      if (displayTitle.length > 20) displayTitle = displayTitle.slice(0, 18) + '...';
+      if (displayTitle.length > 28) displayTitle = displayTitle.slice(0, 26) + '...';
     } else {
       const filename = item.filename || item.title;
       const tsMatch = filename.match(/_(\d+)\.wav/);
@@ -286,7 +314,7 @@ const renderPodcastList = (items: any[]) => {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3" /></svg>
         </button>
         <button class="btn-delete action-icon-btn" title="删除文件">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+          <svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6" fill="none" stroke="currentColor" stroke-width="2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" fill="none" stroke="currentColor" stroke-width="2"/></svg>
         </button>
       `;
     }
@@ -608,11 +636,12 @@ btnPlayToggle.onclick = async () => {
         return;
       }
 
-      const translate = selLangMode.value === "translate";
+      const mode = selLangMode.value;
+      const translate = mode !== "original";
       const originalPlaceholder = txtTargetUrl.placeholder;
       txtTargetUrl.placeholder = "⏳ 正在推送网页朗读任务...";
 
-      const res = await callBackend("/read_url", "POST", { url, translate });
+      const res = await callBackend("/read_url", "POST", { url, translate, mode });
       if (res && (res.error || res.status === "error")) {
         alert(`❌ 朗读推送失败: ${res.error || res.message}`);
         txtTargetUrl.placeholder = originalPlaceholder;
@@ -689,7 +718,8 @@ btnSaveForLater.onclick = async () => {
     return;
   }
 
-  const translate = selLangMode.value === "translate";
+  const mode = selLangMode.value;
+  const translate = mode !== "original";
 
   btnSaveForLater.disabled = true;
   btnSaveForLater.style.opacity = '0.5';
@@ -698,7 +728,7 @@ btnSaveForLater.onclick = async () => {
   txtTargetUrl.placeholder = "⏳ 正在抓取并保存至稍后朗读...";
 
   try {
-    const res = await callBackend("/read_url", "POST", { url, translate, save: true });
+    const res = await callBackend("/read_url", "POST", { url, translate, mode, save: true });
     if (res && (res.error || res.status === "error")) {
       alert(`❌ 保存失败: ${res.error || res.message}`);
       txtTargetUrl.placeholder = originalPlaceholder;
@@ -732,7 +762,8 @@ if (btnSaveAndPodcast) {
       return;
     }
 
-    const translate = selLangMode.value === "translate";
+    const mode = selLangMode.value;
+    const translate = mode !== "original";
 
     btnSaveAndPodcast.disabled = true;
     btnSaveAndPodcast.style.opacity = '0.5';
@@ -741,7 +772,7 @@ if (btnSaveAndPodcast) {
     txtTargetUrl.placeholder = "⏳ 正在保存并生成播客...";
 
     try {
-      const res = await callBackend("/read_url", "POST", { url, translate, podcast: true });
+      const res = await callBackend("/read_url", "POST", { url, translate, mode, podcast: true });
       if (res && (res.error || res.status === "error")) {
         alert(`❌ 保存并生成失败: ${res.error || res.message}`);
         txtTargetUrl.placeholder = originalPlaceholder;
