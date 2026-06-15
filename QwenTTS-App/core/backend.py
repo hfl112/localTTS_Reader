@@ -218,6 +218,7 @@ save_file_lock = threading.Lock()
 podcast_buffer_lock = threading.Lock()
 PODCAST_FILE = None
 PODCAST_BUFFER = []
+CURRENT_PLAYING_PODCAST = None
 
 def do_save_for_later(text: str, source: str = "web", voice: str | None = None, title: str | None = None) -> int:
     text = text.strip()
@@ -475,6 +476,8 @@ async def get_status():
         
     return {
         "is_playing": MAIN_IS_PLAYING and not player.is_paused,
+        "is_paused": player.is_paused,
+        "current_podcast_file": CURRENT_PLAYING_PODCAST if MAIN_IS_PLAYING else None,
         "title": MAIN_TITLE,
         "progress": MAIN_PROGRESS,
         "buffer_sec": player.get_queue_duration(),
@@ -891,10 +894,11 @@ async def play_podcast(data: dict = Body(...)):
     if not filepath:
         return {"error": "File not found"}
     
-    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS, PODCAST_BUFFER, PODCAST_FILE
+    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS, PODCAST_BUFFER, PODCAST_FILE, CURRENT_PLAYING_PODCAST
     MAIN_TITLE = "🎙️ " + filename.replace(".wav", "").replace("podcast_", "")
     MAIN_PROGRESS = ""
     MAIN_IS_PLAYING = True
+    CURRENT_PLAYING_PODCAST = filename
     
     player.stop()
     S.stop_event.clear()

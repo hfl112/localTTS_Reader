@@ -269,6 +269,7 @@ const renderPodcastList = (items: any[]) => {
   items.forEach((item) => {
     const itemEl = document.createElement('div');
     itemEl.className = 'cache-item';
+    itemEl.setAttribute('data-filename', item.filename);
     
     // 根据来源 source 生成指示标签
     let sourceTag = "";
@@ -352,10 +353,30 @@ const renderPodcastList = (items: any[]) => {
           btnPlay.style.opacity = '0.5';
           btnPlay.disabled = true;
           try {
-            const res = await callBackend("/podcasts/play", "POST", { filename: item.filename });
-            if (res && res.error) alert(`❌ 播放失败: ${res.error}`);
+            if (currentPlayingPodcastFile === item.filename) {
+              if (localIsPlaying && !localIsPaused) {
+                await callBackend("/pause", "POST");
+                localIsPaused = true;
+              } else {
+                await callBackend("/resume", "POST");
+                localIsPaused = false;
+              }
+              updatePlayToggleUI();
+              updatePodcastListUI();
+            } else {
+              const res = await callBackend("/podcasts/play", "POST", { filename: item.filename });
+              if (res && res.error) {
+                alert(`❌ 播放失败: ${res.error}`);
+              } else {
+                currentPlayingPodcastFile = item.filename;
+                localIsPlaying = true;
+                localIsPaused = false;
+                updatePlayToggleUI();
+                updatePodcastListUI();
+              }
+            }
           } catch {
-            alert('❌ 播放失败');
+            alert('❌ 操作失败');
           } finally {
             btnPlay.style.opacity = '1';
             btnPlay.disabled = false;
@@ -386,6 +407,7 @@ const renderPodcastList = (items: any[]) => {
 
     podcastList.appendChild(itemEl);
   });
+  updatePodcastListUI();
 };
 
 btnRefreshPodcasts.onclick = fetchPodcasts;
@@ -588,6 +610,7 @@ const autoFillCurrentUrl = async () => {
 // 状态缓存变量 (提升到前面)
 let localIsPaused = false;
 let localIsPlaying = false;
+let currentPlayingPodcastFile: string | null = null;
 
 // 动态更新播放/暂停按钮的 SVG 图标与 title
 const updatePlayToggleUI = () => {
@@ -605,6 +628,33 @@ const updatePlayToggleUI = () => {
     btnPlayToggle.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>`;
     btnPlayToggle.title = "直接朗读当前 URL";
   }
+};
+
+// 动态更新播客列表中每一项的播放/暂停按钮图标
+const updatePodcastListUI = () => {
+  if (!podcastList) return;
+  const items = podcastList.querySelectorAll('.cache-item');
+  items.forEach((itemEl) => {
+    const filename = itemEl.getAttribute('data-filename');
+    const btnPlay = itemEl.querySelector('.btn-play') as HTMLButtonElement;
+    if (!btnPlay) return;
+    
+    if (currentPlayingPodcastFile && currentPlayingPodcastFile === filename) {
+      if (localIsPlaying && !localIsPaused) {
+        // 正在播放中，显示为暂停图标
+        btnPlay.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>`;
+        btnPlay.title = "暂停播放";
+      } else {
+        // 已暂停，显示为播放（恢复）图标
+        btnPlay.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3" /></svg>`;
+        btnPlay.title = "恢复播放";
+      }
+    } else {
+      // 其他播客，全部显示为播放图标
+      btnPlay.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3" /></svg>`;
+      btnPlay.title = "本地系统播放";
+    }
+  });
 };
 
 // 绑定一键朗读当前网页 / 暂停 / 恢复事件
@@ -826,8 +876,13 @@ const startStatusPolling = () => {
           localIsPlaying = res.is_playing;
           changed = true;
         }
+        if (currentPlayingPodcastFile !== (res.current_podcast_file || null)) {
+          currentPlayingPodcastFile = res.current_podcast_file || null;
+          changed = true;
+        }
         if (changed) {
           updatePlayToggleUI();
+          updatePodcastListUI();
         }
       }
     } catch {}
