@@ -3,24 +3,52 @@ import numpy as np
 import threading
 import queue
 import time
-import subprocess
+import ctypes
+from ctypes import c_uint32, byref, Structure
 from typing import Optional, Any
 
-def get_macos_default_audio_device() -> Optional[str]:
+# CoreAudio ctypes helpers for macOS default device query
+class AudioObjectPropertyAddress(Structure):
+    _fields_ = [
+        ('mSelector', c_uint32),
+        ('mScope', c_uint32),
+        ('mElement', c_uint32),
+    ]
+
+try:
+    _coreaudio = ctypes.CDLL('/System/Library/Frameworks/CoreAudio.framework/CoreAudio')
+except Exception as e:
+    _coreaudio = None
+    print(f"[PCMPlayer] 载入 CoreAudio 失败: {e}")
+
+def get_default_output_device_id() -> int:
+    if not _coreaudio:
+        return 0
     try:
-        # 使用 macOS 内置的 system_profiler 查询真实的系统默认输出音频设备名（不受 PortAudio 缓存限制）
-        out = subprocess.check_output(["system_profiler", "SPAudioDataType"], text=True, timeout=2.0)
-        lines = out.splitlines()
-        current_device = None
-        for line in lines:
-            if line.startswith("        ") and not line.startswith("         ") and line.endswith(":"):
-                current_device = line.strip().rstrip(":")
-            elif "Default Output Device: Yes" in line or "Default System Output Device: Yes" in line:
-                if current_device:
-                    return current_device
+        # kAudioHardwarePropertyDefaultOutputDevice = 'dOut' = 1684370979
+        # kAudioObjectSystemObject = 1
+        # kAudioObjectPropertyScopeGlobal = 'glob' = 1735159650
+        # kAudioObjectPropertyElementMaster = 0
+        address = AudioObjectPropertyAddress(
+            mSelector=1684370979,
+            mScope=1735159650,
+            mElement=0
+        )
+        device_id = c_uint32(0)
+        data_size = c_uint32(ctypes.sizeof(device_id))
+        status = _coreaudio.AudioObjectGetPropertyData(
+            1, # kAudioObjectSystemObject
+            byref(address),
+            0,
+            None,
+            byref(data_size),
+            byref(device_id)
+        )
+        if status == 0:
+            return device_id.value
     except Exception as e:
-        print(f"[PCMPlayer] 探测 macOS 默认音频设备失败: {e}")
-    return None
+        print(f"[PCMPlayer] 获取默认输出设备 ID 失败: {e}")
+    return 0
 
 class PCMPlayer:
     SENTINEL: str = "PIPELINE_END_STRICT_V1"
@@ -38,7 +66,7 @@ class PCMPlayer:
         self.volume_scale: float = 1.0 
         self.playback_finished_event: threading.Event = threading.Event()
         self.playback_finished_event.set()
-        self.current_device_name: Optional[str] = None
+        self.current_device_id: int = 0
 
         # 锁保护多线程共享的播放器状态
         self._lock: threading.Lock = threading.Lock()
@@ -54,8 +82,8 @@ class PCMPlayer:
             need_reopen = True
         else:
             try:
-                default_device_name = get_macos_default_audio_device()
-                if default_device_name and self.current_device_name != default_device_name:
+                default_device_id = get_default_output_device_id()
+                if default_device_id != 0 and self.current_device_id != default_device_id:
                     need_reopen = True
             except:
                 pass
@@ -85,26 +113,35 @@ class PCMPlayer:
                     blocksize=8192 
                 )
                 self.stream.start()
+                self.current_device_id = get_default_output_device_id()
                 try:
                     device_info = sd.query_devices(self.stream.device, 'output')
-                    self.current_device_name = device_info.get('name')
-                    print(f"[PCMPlayer] 音频流启动成功，当前绑定设备: {self.current_device_name}")
+                    print(f"[PCMPlayer] 音频流启动成功，当前绑定设备: {device_info.get('name')}")
                 except Exception as e:
-                    self.current_device_name = None
                     print(f"[PCMPlayer] 查询音频设备名称失败: {e}")
             except Exception as e:
                 print(f"[PCMPlayer] 启动失败: {e}")
 
     def _device_monitor_loop(self) -> None:
         while True:
-            time.sleep(2.0)
+            time.sleep(0.1)  # 高频检测（100ms 延迟，极速切歌切设备）
             # 只有在播放器处于 active 状态时才进行检测 and 切换，避免空闲时频繁查询
             if not self.is_active:
                 continue
             try:
-                default_device_name = get_macos_default_audio_device()
-                if self.current_device_name and default_device_name and self.current_device_name != default_device_name:
-                    print(f"[PCMPlayer] 检测到 macOS 默认输出设备变更: {self.current_device_name} -> {default_device_name}，正在自动切换流...")
+                default_device_id = get_default_output_device_id()
+                if default_device_id != 0 and self.current_device_id != 0 and self.current_device_id != default_device_id:
+                    print(f"[PCMPlayer] 检测到 macOS 默认输出设备 ID 变更: {self.current_device_id} -> {default_device_id}，正在自动切换流...")
+                    # 立即更新 ID 锁，防止重入
+                    self.current_device_id = default_device_id
+                    
+                    # 在锁保护下立即停止当前流以切断扬声器输出，防止音量调节过渡时的爆音或音量暴增
+                    with self._lock:
+                        if self.stream:
+                            try:
+                                self.stream.stop()
+                            except:
+                                pass
                     self._recreate_stream()
             except Exception as e:
                 pass
@@ -113,10 +150,9 @@ class PCMPlayer:
         with self._lock:
             if self.stream:
                 try:
-                    self.stream.stop()
                     self.stream.close()
                 except Exception as e:
-                    print(f"[PCMPlayer] 停止旧音频流失败: {e}")
+                    print(f"[PCMPlayer] 关闭旧音频流失败: {e}")
             
             # 重新初始化 PortAudio 以强制刷新 CoreAudio 的硬件设备列表
             try:
@@ -134,9 +170,12 @@ class PCMPlayer:
                     blocksize=8192
                 )
                 self.stream.start()
-                device_info = sd.query_devices(self.stream.device, 'output')
-                self.current_device_name = device_info.get('name')
-                print(f"[PCMPlayer] 音频流切换成功，当前绑定设备: {self.current_device_name}")
+                self.current_device_id = get_default_output_device_id()
+                try:
+                    device_info = sd.query_devices(self.stream.device, 'output')
+                    print(f"[PCMPlayer] 音频流切换成功，当前绑定设备: {device_info.get('name')}")
+                except Exception as e:
+                    print(f"[PCMPlayer] 查询音频设备名称失败: {e}")
             except Exception as e:
                 print(f"[PCMPlayer] 音频流重建失败: {e}")
 
