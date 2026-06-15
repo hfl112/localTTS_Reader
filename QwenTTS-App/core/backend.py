@@ -219,6 +219,7 @@ podcast_buffer_lock = threading.Lock()
 PODCAST_FILE = None
 PODCAST_BUFFER = []
 CURRENT_PLAYING_PODCAST = None
+CURRENT_PLAYING_MD5 = None
 
 def do_save_for_later(text: str, source: str = "web", voice: str | None = None, title: str | None = None) -> int:
     text = text.strip()
@@ -375,10 +376,14 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/read")
 async def read_text(data: dict = Body(...)):
-    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS, PODCAST_FILE, PODCAST_BUFFER
+    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS, PODCAST_FILE, PODCAST_BUFFER, CURRENT_PLAYING_MD5, CURRENT_PLAYING_PODCAST
     text = data.get('text', "")
     voice = data.get("voice", None)
     source = data.get("source", None)
+    
+    if not data.get("from_saved", False):
+        CURRENT_PLAYING_MD5 = None
+    CURRENT_PLAYING_PODCAST = None
     
     PODCAST_FILE = None
     with podcast_buffer_lock:
@@ -421,8 +426,10 @@ async def read_text(data: dict = Body(...)):
 
 @app.post("/stop")
 async def stop_read():
-    global MAIN_IS_PLAYING, PODCAST_FILE, PODCAST_BUFFER, ACTIVE_PODCAST_PROCS, ACTIVE_PODCAST_TASKS
+    global MAIN_IS_PLAYING, PODCAST_FILE, PODCAST_BUFFER, ACTIVE_PODCAST_PROCS, ACTIVE_PODCAST_TASKS, CURRENT_PLAYING_MD5, CURRENT_PLAYING_PODCAST
     
+    CURRENT_PLAYING_MD5 = None
+    CURRENT_PLAYING_PODCAST = None
     PODCAST_FILE = None
     with podcast_buffer_lock:
         PODCAST_BUFFER = []
@@ -478,6 +485,7 @@ async def get_status():
         "is_playing": MAIN_IS_PLAYING and not player.is_paused,
         "is_paused": player.is_paused,
         "current_podcast_file": CURRENT_PLAYING_PODCAST if MAIN_IS_PLAYING else None,
+        "current_playing_md5": CURRENT_PLAYING_MD5 if MAIN_IS_PLAYING else None,
         "title": MAIN_TITLE,
         "progress": MAIN_PROGRESS,
         "buffer_sec": player.get_queue_duration(),
@@ -894,11 +902,12 @@ async def play_podcast(data: dict = Body(...)):
     if not filepath:
         return {"error": "File not found"}
     
-    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS, PODCAST_BUFFER, PODCAST_FILE, CURRENT_PLAYING_PODCAST
+    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS, PODCAST_BUFFER, PODCAST_FILE, CURRENT_PLAYING_PODCAST, CURRENT_PLAYING_MD5
     MAIN_TITLE = "🎙️ " + filename.replace(".wav", "").replace("podcast_", "")
     MAIN_PROGRESS = ""
     MAIN_IS_PLAYING = True
     CURRENT_PLAYING_PODCAST = filename
+    CURRENT_PLAYING_MD5 = None
     
     player.stop()
     S.stop_event.clear()
@@ -1104,7 +1113,13 @@ async def play_saved(data: dict = Body(...)):
     if 0 <= first_idx < len(saved_items):
         voice = saved_items[first_idx].get("voice")
     
-    payload = {"text": text_to_play}
+    global CURRENT_PLAYING_MD5
+    if indices and 0 <= indices[0] < len(saved_items):
+        CURRENT_PLAYING_MD5 = saved_items[indices[0]].get("md5")
+    else:
+        CURRENT_PLAYING_MD5 = None
+
+    payload = {"text": text_to_play, "from_saved": True}
     if voice: payload["voice"] = voice
     
     return await read_text(payload)

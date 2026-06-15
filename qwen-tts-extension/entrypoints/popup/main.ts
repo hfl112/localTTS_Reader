@@ -79,6 +79,7 @@ const renderSavedList = (items: any[]) => {
   items.forEach((item, index) => {
     const itemEl = document.createElement('div');
     itemEl.className = 'cache-item';
+    itemEl.setAttribute('data-md5', item.md5);
     
     // 根据来源 source 生成指示标签
     let sourceTag = "";
@@ -151,9 +152,31 @@ const renderSavedList = (items: any[]) => {
           btnPlay.style.opacity = '0.5';
           btnPlay.disabled = true;
           try {
-            const indicesToPlay = Array.from({ length: items.length - index }, (_, i) => index + i);
-            const res = await callBackend("/play_saved", "POST", { indices: indicesToPlay });
-            if (res && res.error) alert(`❌ 播放失败: ${res.error}`);
+            if (currentPlayingMd5 === item.md5) {
+              if (localIsPlaying && !localIsPaused) {
+                await callBackend("/pause", "POST");
+                localIsPaused = true;
+              } else {
+                await callBackend("/resume", "POST");
+                localIsPaused = false;
+              }
+              updatePlayToggleUI();
+              updateSavedListUI();
+            } else {
+              const indicesToPlay = Array.from({ length: items.length - index }, (_, i) => index + i);
+              const res = await callBackend("/play_saved", "POST", { indices: indicesToPlay });
+              if (res && res.error) {
+                alert(`❌ 播放失败: ${res.error}`);
+              } else {
+                currentPlayingMd5 = item.md5;
+                currentPlayingPodcastFile = null;
+                localIsPlaying = true;
+                localIsPaused = false;
+                updatePlayToggleUI();
+                updateSavedListUI();
+                updatePodcastListUI();
+              }
+            }
           } catch {
             alert('❌ 连接失败');
           } finally {
@@ -203,6 +226,7 @@ const renderSavedList = (items: any[]) => {
 
     savedList.appendChild(itemEl);
   });
+  updateSavedListUI();
 };
 
 
@@ -611,8 +635,9 @@ const autoFillCurrentUrl = async () => {
 let localIsPaused = false;
 let localIsPlaying = false;
 let currentPlayingPodcastFile: string | null = null;
+let currentPlayingMd5: string | null = null;
 
-// 动态更新播放/暂停按钮的 SVG 图标与 title
+// 动态更新播放/暂停按钮 of status bar / header
 const updatePlayToggleUI = () => {
   if (!btnPlayToggle) return;
   if (localIsPlaying && !localIsPaused) {
@@ -653,6 +678,33 @@ const updatePodcastListUI = () => {
       // 其他播客，全部显示为播放图标
       btnPlay.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3" /></svg>`;
       btnPlay.title = "本地系统播放";
+    }
+  });
+};
+
+// 动态更新已保存（稍后朗读）列表中每一项的播放/暂停按钮图标
+const updateSavedListUI = () => {
+  if (!savedList) return;
+  const items = savedList.querySelectorAll('.cache-item');
+  items.forEach((itemEl) => {
+    const md5 = itemEl.getAttribute('data-md5');
+    const btnPlay = itemEl.querySelector('.btn-play') as HTMLButtonElement;
+    if (!btnPlay) return;
+    
+    if (currentPlayingMd5 && currentPlayingMd5 === md5) {
+      if (localIsPlaying && !localIsPaused) {
+        // 正在播放中，显示为暂停图标
+        btnPlay.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round"><rect x="5" y="4" width="4" height="16" rx="1"/><rect x="15" y="4" width="4" height="16" rx="1"/></svg>`;
+        btnPlay.title = "暂停播放";
+      } else {
+        // 已暂停，显示为小喇叭恢复图标
+        btnPlay.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>`;
+        btnPlay.title = "恢复播放";
+      }
+    } else {
+      // 其他，全部显示为普通小喇叭朗读图标
+      btnPlay.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>`;
+      btnPlay.title = "朗读";
     }
   });
 };
@@ -880,9 +932,14 @@ const startStatusPolling = () => {
           currentPlayingPodcastFile = res.current_podcast_file || null;
           changed = true;
         }
+        if (currentPlayingMd5 !== (res.current_playing_md5 || null)) {
+          currentPlayingMd5 = res.current_playing_md5 || null;
+          changed = true;
+        }
         if (changed) {
           updatePlayToggleUI();
           updatePodcastListUI();
+          updateSavedListUI();
         }
       }
     } catch {}
