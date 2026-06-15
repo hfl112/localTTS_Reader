@@ -4,7 +4,7 @@ import threading
 import queue
 import time
 import ctypes
-from ctypes import c_uint32, byref, Structure
+from ctypes import c_uint32, byref, Structure, CFUNCTYPE, c_void_p, c_int
 from typing import Optional, Any
 
 # CoreAudio ctypes helpers for macOS default device query
@@ -14,6 +14,14 @@ class AudioObjectPropertyAddress(Structure):
         ('mScope', c_uint32),
         ('mElement', c_uint32),
     ]
+
+AudioObjectPropertyListenerProc = CFUNCTYPE(
+    c_int,
+    c_uint32, # AudioObjectID
+    c_uint32, # inNumberAddresses
+    c_void_p, # const AudioObjectPropertyAddress*
+    c_void_p  # void* inClientData
+)
 
 try:
     _coreaudio = ctypes.CDLL('/System/Library/Frameworks/CoreAudio.framework/CoreAudio')
@@ -68,13 +76,46 @@ class PCMPlayer:
         self.playback_finished_event.set()
         self.current_device_id: int = 0
 
-        # 锁保护多线程共享的播放器状态
+        # 设备变更事件和锁保护
+        self.device_changed_event: threading.Event = threading.Event()
         self._lock: threading.Lock = threading.Lock()
 
         self._ensure_stream_started()
 
-        # 启动后台设备检测线程，动态支持耳机等音频输出设备的切换
+        # 注册 CoreAudio 默认设备变更监听器，取代轮询
+        self._register_device_change_listener()
+
+        # 启动后台设备检测线程，挂起等待事件通知，0% CPU 损耗
         threading.Thread(target=self._device_monitor_loop, daemon=True).start()
+
+    def _register_device_change_listener(self) -> None:
+        if not _coreaudio:
+            return
+        try:
+            # 必须保持对 callback 实例的持久引用，防止其被垃圾回收
+            self._c_listener = AudioObjectPropertyListenerProc(self._on_device_changed)
+            address = AudioObjectPropertyAddress(
+                mSelector=1684370979, # kAudioHardwarePropertyDefaultOutputDevice = 'dOut'
+                mScope=1735159650,    # kAudioObjectPropertyScopeGlobal = 'glob'
+                mElement=0
+            )
+            status = _coreaudio.AudioObjectAddPropertyListener(
+                1, # kAudioObjectSystemObject
+                byref(address),
+                self._c_listener,
+                None
+            )
+            if status == 0:
+                print("[PCMPlayer] 成功注册 CoreAudio 默认输出设备监听器")
+            else:
+                print(f"[PCMPlayer] 注册 CoreAudio 监听器失败，错误码: {status}")
+        except Exception as e:
+            print(f"[PCMPlayer] 注册 CoreAudio 监听器异常: {e}")
+
+    def _on_device_changed(self, obj_id: int, n_addresses: int, addresses: c_void_p, client_data: c_void_p) -> int:
+        # 唤醒后台处理线程，实现事件驱动
+        self.device_changed_event.set()
+        return 0
 
     def _ensure_stream_started(self) -> None:
         need_reopen = False
@@ -127,10 +168,11 @@ class PCMPlayer:
 
     def _device_monitor_loop(self) -> None:
         while True:
-            time.sleep(0.1)  # 高频检测（100ms 延迟，极速切歌切设备）
-            # 只有在播放器处于 active 状态时才进行检测 and 切换，避免空闲时频繁查询
-            if not self.is_active:
-                continue
+            # 挂起等待 CoreAudio 的通知，达到完全的事件驱动 (0% CPU 轮询)
+            self.device_changed_event.wait()
+            self.device_changed_event.clear()
+
+            # 双重检验是否真的是当前设备的 ID 发生了变化
             try:
                 default_device_id = get_default_output_device_id()
                 if default_device_id != 0 and self.current_device_id != 0 and self.current_device_id != default_device_id:
@@ -138,7 +180,7 @@ class PCMPlayer:
                     # 立即更新 ID 锁，防止重入
                     self.current_device_id = default_device_id
                     
-                    # 在锁保护下立即停止当前流以切断扬声器输出，防止音量调节过渡时的爆音或音量暴增
+                    # 在锁保护下立即停止当前流以切断音频物理输出通道，防止音量切换过程中的爆音
                     with self._lock:
                         if self.stream:
                             try:
@@ -146,8 +188,9 @@ class PCMPlayer:
                             except:
                                 pass
                     
-                    # 启动延迟任务来开辟新流，给 macOS CoreAudio 充足的时间完成设备切换并应用系统音量衰减
-                    threading.Thread(target=self._delayed_recreate, daemon=True).start()
+                    if self.is_active:
+                        # 启动延迟任务来开辟新流，给 macOS CoreAudio 充足的时间完成设备切换并应用系统音量衰减
+                        threading.Thread(target=self._delayed_recreate, daemon=True).start()
             except Exception as e:
                 pass
 
@@ -312,3 +355,24 @@ class PCMPlayer:
 
     def is_running(self) -> bool:
         return not self.playback_finished_event.is_set()
+
+    def __del__(self) -> None:
+        self.remove_listener()
+
+    def remove_listener(self) -> None:
+        if hasattr(self, '_c_listener') and _coreaudio:
+            try:
+                address = AudioObjectPropertyAddress(
+                    mSelector=1684370979, # kAudioHardwarePropertyDefaultOutputDevice
+                    mScope=1735159650,    # kAudioObjectPropertyScopeGlobal
+                    mElement=0
+                )
+                _coreaudio.AudioObjectRemovePropertyListener(
+                    1, # kAudioObjectSystemObject
+                    byref(address),
+                    self._c_listener,
+                    None
+                )
+                print("[PCMPlayer] CoreAudio 监听器已成功卸载")
+            except:
+                pass
