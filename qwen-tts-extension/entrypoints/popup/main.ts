@@ -139,7 +139,18 @@ const renderSavedList = (items: any[]) => {
       textDiv.onclick = async () => {
         try {
           const res = await callBackend("/play_saved", "POST", { indices: [index] });
-          if (res && res.error) alert(`❌ 播放失败: ${res.error}`);
+          if (res && res.error) {
+            alert(`❌ 播放失败: ${res.error}`);
+          } else {
+            currentPlayingMd5 = item.md5;
+            currentPlayingPodcastFile = null;
+            localIsPlaying = true;
+            localIsPaused = false;
+            lastActionTime = Date.now();
+            updatePlayToggleUI();
+            updateSavedListUI();
+            updatePodcastListUI();
+          }
         } catch {
           alert('❌ 连接失败');
         }
@@ -160,6 +171,7 @@ const renderSavedList = (items: any[]) => {
                 await callBackend("/resume", "POST");
                 localIsPaused = false;
               }
+              lastActionTime = Date.now();
               updatePlayToggleUI();
               updateSavedListUI();
             } else {
@@ -172,6 +184,7 @@ const renderSavedList = (items: any[]) => {
                 currentPlayingPodcastFile = null;
                 localIsPlaying = true;
                 localIsPaused = false;
+                lastActionTime = Date.now();
                 updatePlayToggleUI();
                 updateSavedListUI();
                 updatePodcastListUI();
@@ -385,6 +398,7 @@ const renderPodcastList = (items: any[]) => {
                 await callBackend("/resume", "POST");
                 localIsPaused = false;
               }
+              lastActionTime = Date.now();
               updatePlayToggleUI();
               updatePodcastListUI();
             } else {
@@ -395,6 +409,7 @@ const renderPodcastList = (items: any[]) => {
                 currentPlayingPodcastFile = item.filename;
                 localIsPlaying = true;
                 localIsPaused = false;
+                lastActionTime = Date.now();
                 updatePlayToggleUI();
                 updatePodcastListUI();
               }
@@ -523,6 +538,8 @@ const renderCacheList = (items: any[]) => {
           const res = await callBackend("/cache/play", "POST", { md5: md5 });
           if (res && res.error) {
             alert(`❌ 播放失败: ${res.error}`);
+          } else {
+            lastActionTime = Date.now();
           }
         } catch {
           alert('❌ 播放连接失败');
@@ -659,6 +676,7 @@ let localIsPaused = false;
 let localIsPlaying = false;
 let currentPlayingPodcastFile: string | null = null;
 let currentPlayingMd5: string | null = null;
+let lastActionTime = 0;
 
 // 动态更新播放/暂停按钮 of status bar / header
 const updatePlayToggleUI = () => {
@@ -742,11 +760,13 @@ btnPlayToggle.onclick = async () => {
       // 当前正在播放，执行暂停
       await callBackend("/pause", "POST");
       localIsPaused = true;
+      lastActionTime = Date.now();
       updatePlayToggleUI();
     } else if (localIsPlaying && localIsPaused) {
       // 当前已暂停，执行恢复
       await callBackend("/resume", "POST");
       localIsPaused = false;
+      lastActionTime = Date.now();
       updatePlayToggleUI();
     } else {
       // 空闲状态，执行原本的朗读当前 URL 逻辑
@@ -772,6 +792,14 @@ btnPlayToggle.onclick = async () => {
         alert(`❌ 朗读推送失败: ${res.error || res.message}`);
         txtTargetUrl.placeholder = originalPlaceholder;
       } else {
+        localIsPlaying = true;
+        localIsPaused = false;
+        currentPlayingMd5 = null;
+        currentPlayingPodcastFile = null;
+        lastActionTime = Date.now();
+        updatePlayToggleUI();
+        updateSavedListUI();
+        updatePodcastListUI();
         txtTargetUrl.placeholder = "✔ 已成功推送朗读任务！";
         setTimeout(() => {
           txtTargetUrl.placeholder = originalPlaceholder;
@@ -807,6 +835,14 @@ btnReadClipboard.onclick = async () => {
       alert(`❌ 朗读推送失败: ${res.error}`);
       txtTargetUrl.placeholder = originalPlaceholder;
     } else {
+      localIsPlaying = true;
+      localIsPaused = false;
+      currentPlayingMd5 = null;
+      currentPlayingPodcastFile = null;
+      lastActionTime = Date.now();
+      updatePlayToggleUI();
+      updateSavedListUI();
+      updatePodcastListUI();
       txtTargetUrl.placeholder = "✔ 剪贴板文本推送并备份成功！";
       
       // 异步在后台保存备份，自动触发播客生成
@@ -930,7 +966,12 @@ btnStop.onclick = async () => {
     await callBackend("/stop", "POST");
     localIsPlaying = false;
     localIsPaused = false;
+    currentPlayingMd5 = null;
+    currentPlayingPodcastFile = null;
+    lastActionTime = Date.now();
     updatePlayToggleUI();
+    updateSavedListUI();
+    updatePodcastListUI();
   } catch (err) {
     console.error("Stop failed", err);
   } finally {
@@ -943,6 +984,10 @@ btnStop.onclick = async () => {
 const startStatusPolling = () => {
   setInterval(async () => {
     try {
+      // 如果最近 1.5 秒内有用户操作，则跳过这轮的状态更新，防止过渡期的状态闪烁覆盖
+      if (Date.now() - lastActionTime < 1500) {
+        return;
+      }
       const res = await callBackend("/status");
       if (res && !res.error) {
         let changed = false;
@@ -954,14 +999,25 @@ const startStatusPolling = () => {
           localIsPlaying = res.is_playing;
           changed = true;
         }
-        if (currentPlayingPodcastFile !== (res.current_podcast_file || null)) {
-          currentPlayingPodcastFile = res.current_podcast_file || null;
+        
+        let targetPodcastFile = res.current_podcast_file || null;
+        if (res.is_playing && !targetPodcastFile && currentPlayingPodcastFile) {
+          targetPodcastFile = currentPlayingPodcastFile;
+        }
+        if (currentPlayingPodcastFile !== targetPodcastFile) {
+          currentPlayingPodcastFile = targetPodcastFile;
           changed = true;
         }
-        if (currentPlayingMd5 !== (res.current_playing_md5 || null)) {
-          currentPlayingMd5 = res.current_playing_md5 || null;
+        
+        let targetMd5 = res.current_playing_md5 || null;
+        if (res.is_playing && !targetMd5 && currentPlayingMd5) {
+          targetMd5 = currentPlayingMd5;
+        }
+        if (currentPlayingMd5 !== targetMd5) {
+          currentPlayingMd5 = targetMd5;
           changed = true;
         }
+        
         if (changed) {
           updatePlayToggleUI();
           updatePodcastListUI();

@@ -484,8 +484,8 @@ async def get_status():
     return {
         "is_playing": MAIN_IS_PLAYING and not player.is_paused,
         "is_paused": player.is_paused,
-        "current_podcast_file": CURRENT_PLAYING_PODCAST if MAIN_IS_PLAYING else None,
-        "current_playing_md5": CURRENT_PLAYING_MD5 if MAIN_IS_PLAYING else None,
+        "current_podcast_file": CURRENT_PLAYING_PODCAST,
+        "current_playing_md5": CURRENT_PLAYING_MD5,
         "title": MAIN_TITLE,
         "progress": MAIN_PROGRESS,
         "buffer_sec": player.get_queue_duration(),
