@@ -3,7 +3,24 @@ import numpy as np
 import threading
 import queue
 import time
+import subprocess
 from typing import Optional, Any
+
+def get_macos_default_audio_device() -> Optional[str]:
+    try:
+        # 使用 macOS 内置的 system_profiler 查询真实的系统默认输出音频设备名（不受 PortAudio 缓存限制）
+        out = subprocess.check_output(["system_profiler", "SPAudioDataType"], text=True, timeout=2.0)
+        lines = out.splitlines()
+        current_device = None
+        for line in lines:
+            if line.startswith("        ") and not line.startswith("         ") and line.endswith(":"):
+                current_device = line.strip().rstrip(":")
+            elif "Default Output Device: Yes" in line or "Default System Output Device: Yes" in line:
+                if current_device:
+                    return current_device
+    except Exception as e:
+        print(f"[PCMPlayer] 探测 macOS 默认音频设备失败: {e}")
+    return None
 
 class PCMPlayer:
     SENTINEL: str = "PIPELINE_END_STRICT_V1"
@@ -37,9 +54,8 @@ class PCMPlayer:
             need_reopen = True
         else:
             try:
-                default_device_info = sd.query_devices(kind='output')
-                default_device_name = default_device_info.get('name')
-                if self.current_device_name != default_device_name:
+                default_device_name = get_macos_default_audio_device()
+                if default_device_name and self.current_device_name != default_device_name:
                     need_reopen = True
             except:
                 pass
@@ -52,6 +68,14 @@ class PCMPlayer:
                         self.stream.close()
                     except:
                         pass
+                
+                # 重新初始化 PortAudio 以强制刷新 CoreAudio 的硬件设备列表
+                try:
+                    sd._terminate()
+                    sd._initialize()
+                except Exception as init_err:
+                    print(f"[PCMPlayer] 重置 PortAudio 失败: {init_err}")
+
                 print(f"[PCMPlayer] 正在启动音频流 (采样率: {self.sample_rate}Hz)...")
                 self.stream = sd.OutputStream(
                     samplerate=self.sample_rate,
@@ -73,13 +97,12 @@ class PCMPlayer:
 
     def _device_monitor_loop(self) -> None:
         while True:
-            time.sleep(1.5)
+            time.sleep(2.0)
             # 只有在播放器处于 active 状态时才进行检测 and 切换，避免空闲时频繁查询
             if not self.is_active:
                 continue
             try:
-                default_device_info = sd.query_devices(kind='output')
-                default_device_name = default_device_info.get('name')
+                default_device_name = get_macos_default_audio_device()
                 if self.current_device_name and default_device_name and self.current_device_name != default_device_name:
                     print(f"[PCMPlayer] 检测到 macOS 默认输出设备变更: {self.current_device_name} -> {default_device_name}，正在自动切换流...")
                     self._recreate_stream()
@@ -94,6 +117,14 @@ class PCMPlayer:
                     self.stream.close()
                 except Exception as e:
                     print(f"[PCMPlayer] 停止旧音频流失败: {e}")
+            
+            # 重新初始化 PortAudio 以强制刷新 CoreAudio 的硬件设备列表
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception as init_err:
+                print(f"[PCMPlayer] 重置 PortAudio 失败: {init_err}")
+
             try:
                 self.stream = sd.OutputStream(
                     samplerate=self.sample_rate,
