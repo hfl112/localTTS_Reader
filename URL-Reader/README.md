@@ -2,6 +2,8 @@
 
 本模块是 QwenTTS 生态中专门用于 **“输入网页 URL，自动抓取、净化正文并一键朗读”** 的核心控制与测试工具。它将重型的网页提取、WAF 绕过、正文去噪逻辑留在本地 Python 侧，直接利用正在运行的 macOS 状态栏应用进行语音播放。
 
+当前 CLI 已经不仅是网页朗读器，也承担网页转中文、双人播客脚本生成、稍后朗读保存、单篇播客后台生成和浏览器上传 HTML 解析等入口职责。
+
 ---
 
 ## 🛠️ 1. 核心架构与技术方案
@@ -17,7 +19,9 @@
       ↓
  调用 defuddle 净化 ──> 提取干净的 Markdown 格式文章正文 (去除广告、边栏、导航栏)
       ↓
- 投喂给 QwenTTS-App (8001端口) ──> 分片推理并使用原生声卡硬件 (sounddevice) 朗读
+ Gemini 处理模式 (可选：翻译 / 双人翻译 / 双人总结)
+      ↓
+ 投喂给 QwenTTS-App (8001端口) ──> service 层分发到朗读、稍后朗读或后台播客生成
 ```
 
 1. **多重网络穿透 (urllib.request + 代理退避 + 浏览器联动)**：
@@ -26,6 +30,10 @@
    * **Chrome 缓存联动**：若前两层均受阻，只要您的 Chrome 浏览器正开着该网页，脚本会直接通过 AppleScript 强行抓取当前活动页面中的 HTML 源码，实现 0网络请求穿透。
 2. **正文去噪净化 (Defuddle CLI)**：
    * 抓取下来的 HTML 喂给全局的 `defuddle parse --md` 净化器，完美滤除广告、弹窗及无关的脚本，只提取纯净的 Markdown 格式正文。
+3. **本地 TTS 服务分工**：
+   * `POST /read`：直接朗读当前正文。
+   * `POST /save_for_later`：保存到 QwenTTS-App 的“稍后朗读”列表。
+   * `POST /generate_single_podcast`：启动后台单篇 podcast 生成，成品写入项目根目录 `podcasts/`。
 
 ---
 
@@ -52,18 +60,33 @@
    python app.py
    ```
 
-### B. 执行网页朗读
-在项目根目录下，直接在终端中运行 [read_url_cli.py](file:///Users/funanhe/00_MyCode/TTS/URL-Reader/read_url_cli.py) 并传入网页 URL。您还可以加入 `-t` 或 `--translate` 参数让其通过 Gemini 自动翻译为中文再朗读：
+### B. 执行网页朗读 / 生成
+在项目根目录下，直接在终端中运行 [read_url_cli.py](file:///Users/funanhe/00_MyCode/TTS/URL-Reader/read_url_cli.py) 并传入网页 URL。默认模式是 `--podcast-discuss`，会先通过 Gemini 生成双人总结稿，再投喂给 QwenTTS-App。
 
 ```bash
 cd /Users/funanhe/00_MyCode/TTS/URL-Reader
 
-# 1. 直接朗读原文 (如果是 YouTube 视频，将提取原文语种字幕朗读)
+# 1. 双人总结稿朗读（默认）
 # 💡 提示：在 zsh 中，包含问号 '?' 的 URL 建议用单引号包裹，防止 zsh 误认作通配符报错
 python read_url_cli.py '<您要朗读的网页URL>'
 
-# 2. 翻译成中文后朗读 (调用 Gemini 翻译并输出临时文件)
+# 2. 直接朗读原始正文
+python read_url_cli.py '<您要朗读的网页URL>' --original
+
+# 3. 翻译成中文后朗读
 python read_url_cli.py '<您要朗读的网页URL>' --translate
+
+# 4. 生成双人翻译稿后朗读
+python read_url_cli.py '<您要朗读的网页URL>' --podcast-trans
+
+# 5. 保存到稍后朗读，不立刻播放
+python read_url_cli.py '<您要朗读的网页URL>' --translate --save
+
+# 6. 启动后台单篇播客生成
+python read_url_cli.py '<您要朗读的网页URL>' --podcast-discuss --podcast
+
+# 7. 使用浏览器插件上传的本地 HTML 文件解析
+python read_url_cli.py '<原始URL>' --html-file /path/to/page.html --podcast-discuss
 ```
 
 **运行与翻译示例**：
@@ -72,7 +95,21 @@ python read_url_cli.py 'https://aeon.co/essays/why-did-measuring-earths-true-sha
 ```
 
 运行后流程：
-1. **保存临时源码**：脚本将抓取净化的原始网页正文写入到本地临时文件 `temp_source.md` 中。
-2. **AI 智能翻译**：检测到翻译参数，脚本读取 `temp_source.md` 内容并请求 Gemini 翻译（利用 [gemini_engine.py](file:///Users/funanhe/00_MyCode/TTS/URL-Reader/gemini_engine.py) 的 Pool 与降级算法）。
-3. **保存临时译文**：将翻译得到的中文写入到本地临时文件 `temp_translated.md` 中。
-4. **投喂并朗读**：打印翻译后的前 400 字预览，并将译文发送到 `QwenTTS-App` (8001端口)，立刻开始中文语音朗读。
+1. **保存临时源码**：脚本将抓取净化的原始网页正文写入 `temp_source.md`。
+2. **AI 智能处理**：除 `--original` 外，脚本会调用 [gemini_engine.py](file:///Users/funanhe/00_MyCode/TTS/URL-Reader/gemini_engine.py) 执行中文翻译、双人翻译或双人总结。
+3. **保存处理结果**：将处理后的正文写入 `temp_translated.md`。
+4. **投喂本地服务**：根据参数调用 `QwenTTS-App` 的 `/read`、`/save_for_later` 或 `/generate_single_podcast`。
+
+## 4. 模式参数速查
+
+| 参数 | 行为 |
+|---|---|
+| `--original` / `-o` | 保留抓取正文，不调用 Gemini |
+| `--translate` / `-t` | 翻译成中文 |
+| `--podcast-trans` / `-pt` | 生成双人翻译稿 |
+| `--podcast-discuss` / `-pd` | 生成双人总结稿；当前默认模式 |
+| `--save` / `-s` | 保存到 QwenTTS-App 稍后朗读 |
+| `--podcast` / `-p` | 启动后台单篇 podcast 生成 |
+| `--html-file PATH` | 从本地 HTML 文件提取正文，供 extension 上传页面源码时使用 |
+
+YouTube 链接会优先提取字幕；在非双人播客模式下，YouTube 默认使用 Ryan 男声朗读。

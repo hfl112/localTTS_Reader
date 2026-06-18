@@ -217,4 +217,20 @@
 *   **诊断补充**：`/debug/state` 新增 `podcast_generation_paused` 与 `on_battery_power`，便于判断后台生成是被播放、冷却窗口还是电池状态暂停。
 
 ---
-**当前状态**: 🏆 PlaybackController 播放控制层 + 三档性能模式 + quiet 播客生成，降低长文/长播客持续满载、风扇噪音和发热，并保留 `/debug/state` 快速诊断入口 | **负责人**: Codex
+
+## 📅 第十四阶段：Python 服务层重构与测试基线 (2026-06-18)
+*   **目标**：在不改变菜单栏、Chrome extension、URL-Reader 和 MLX 推理主流程的前提下，降低 `backend.py` 的全局状态复杂度，把播放、播客、缓存和稍后朗读拆到明确的服务边界里。
+*   **Phase 1-5 实施结果**：
+    1.  **RuntimeState 容器**：新增 `core/state/runtime_state.py`，集中管理当前标题、进度、播放状态、当前播客、当前 md5、播客 buffer 与最近活跃时间。
+    2.  **PlaybackService**：新增 `core/services/playback_service.py`，把 `PlaybackController` 从路由层抽离出来，统一处理播放 session 换代、`current_task_id` 递增、旧队列清空、TTS 朗读线程和 WAV 播放线程。
+    3.  **PodcastService**：新增 `core/services/podcast_service.py`，接管单篇/合集播客后台进程、GPU 独占锁、暂停事件、chunk checkpoint、播客文件列表、置顶、删除与清理。
+    4.  **SavedItemsService / CacheService**：把 `saved_for_later.json` 操作和 cache metadata/file 操作从 `backend.py` 中拆出，路由只负责参数转换和响应。
+    5.  **backend.py 变薄**：后端保留 FastAPI endpoint、推理 worker、音频 feeder、Bonjour 和 lifespan wiring；业务状态与文件操作交给 service。
+    6.  **Smoke tests**：新增 `QwenTTS-App/core/tests/test_services_smoke.py`，覆盖 runtime state、播放 session 失效、播客文件列表与 saved-items FIFO 行为。
+*   **验证结果**：
+    *   `python -m py_compile QwenTTS-App/core/backend.py QwenTTS-App/core/player.py QwenTTS-App/core/processor.py QwenTTS-App/core/tts_engine.py QwenTTS-App/core/services/*.py QwenTTS-App/core/state/runtime_state.py QwenTTS-App/core/tests/test_services_smoke.py`
+    *   `python -m pytest -q QwenTTS-App/core/tests/test_services_smoke.py` → `4 passed`
+*   **维护约束更新**：新增播放入口必须走 `PlaybackService`；新增播客生成/文件管理必须走 `PodcastService`；不要把新的长期状态重新堆回 `backend.py`。
+
+---
+**当前状态**: 🏆 服务层架构 + PlaybackService 播放隔离 + PodcastService 后台生成 + 三档性能模式 + smoke tests，长文/长播客的串台、发热和维护复杂度都已进入可控状态 | **负责人**: Codex

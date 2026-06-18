@@ -56,7 +56,13 @@ python -m mlx_audio.server                # Web UI + API (port 8000)
 | File | Role |
 |---|---|
 | `app.py` | `rumps` UI; spawns backend on :8001; 1Hz `/status` poll; menu items trigger `/read`/`/stop`/`/seek`/`/pause` |
-| `core/backend.py` | FastAPI on :8001; spawns inference worker as `mp.Process`; Bonjour (`_qwentts._tcp`); auto VRAM unload after 10min idle |
+| `core/backend.py` | FastAPI route layer on :8001; spawns inference worker as `mp.Process`; owns audio feeder, Bonjour (`_qwentts._tcp`), lifespan wiring, and 10min idle model unload |
+| `core/state/runtime_state.py` | Main runtime state container for current title/progress, current podcast/md5, podcast buffer, and last activity |
+| `core/services/playback_service.py` | `PlaybackController` + `PlaybackService`; playback session invalidation, `current_task_id` bumping, stale queue cleanup, TTS playback, WAV playback |
+| `core/services/podcast_service.py` | Background podcast generation processes, pause manager, GPU lock, chunk checkpoints, and podcast file list/delete/pin/clear |
+| `core/services/performance.py` | `fast`/`balanced`/`quiet` profiles plus reading-time estimation |
+| `core/services/saved_items_service.py` | Saved-for-later JSON queue backed by `data/saved_for_later.json` |
+| `core/services/cache_service.py` | Cache metadata/list/play/export/delete/clear helpers for `data/cache/*.npy` and exported WAVs |
 | `core/tts_engine.py` | MLX inference wrapper; **24kHz stereo float32** native output; dynamic timeout `max(30, min(len*1, 120))s`; streams with `streaming_interval=0.5`, `response_format="pcm"` |
 | `core/player.py` | `sounddevice.OutputStream` 24kHz/2ch/float32/blocksize=8192; zero-copy in-memory callback |
 | `core/processor.py` | `smart_split`: Chinese ≤250 chars, English ≤600; strips Obsidian-flavored markdown (YAML frontmatter, `![[wikilinks]]`, headings, lists) |
@@ -64,12 +70,12 @@ python -m mlx_audio.server                # Web UI + API (port 8000)
 | `core/worker.py` | Standalone CLI (`python core/worker.py --text "..."`). **Not used by `app.py` / `backend.py`**. |
 
 **IPC**: `mp.Queue` for text/audio, `mp.Event` for stop, `mp.Value` for status (IDLE/BUSY/COOLING).
-**Playback controller**: `backend.py` uses `PlaybackController` plus `S.current_task_id` to invalidate stale TTS and WAV playback threads. Any new playback entrypoint must go through `playback_controller.start_new_session()` or `stop_current_session()`, then only feed audio while `can_feed_audio(session_id, task_id)` remains true.
-**Performance profiles**: `fast`, `balanced`, and `quiet` live in `backend.py`. Realtime reading defaults to `balanced`; podcast generation defaults to `quiet`; long single podcasts and all batch podcasts should prefer `Qwen3-TTS-0.6B`.
+**Playback controller**: `PlaybackService` owns `PlaybackController` plus `S.current_task_id` to invalidate stale TTS and WAV playback threads. Any new playback entrypoint must go through `playback_service.start_new_session()` or `stop_current_session()`, then only feed audio while `playback_service.controller.can_feed_audio(session_id, task_id)` remains true.
+**Performance profiles**: `fast`, `balanced`, and `quiet` live in `core/services/performance.py`. Realtime reading defaults to `balanced`; podcast generation defaults to `quiet`; long single podcasts and all batch podcasts should prefer `Qwen3-TTS-0.6B`.
 **Audio cache**: 10 `.npy` files in `QwenTTS-App/data/cache/`, MD5-keyed, LRU by mtime.
 **Sentinel**: string `"PIPELINE_END_STRICT_V1"` shared by inference worker and player (must remain a `str` to survive `mp.Queue` pickling).
 **Cruise mode**: realtime inference uses profile-specific buffer high/low watermarks (`balanced`: 20s/8s, `quiet`: 10s/4s, `fast`: 30s/12s) to cool the GPU.
-**Runtime files** under `QwenTTS-App/data/`: `config.json`, `state.json`, `cache/*.npy`, `podcast_chunks/*.npy`, `saved_for_later.json` (max 3 items), `podcasts/*.wav`.
+**Runtime files** under `QwenTTS-App/data/`: `config.json`, `state.json`, `cache/*.npy`, `podcast_chunks/*/chunk_*.npy`, `saved_for_later.json` (max 5 items). Finished podcast WAVs live in the repo-level `podcasts/` directory.
 
 ## Default TTS config
 
@@ -86,10 +92,13 @@ performance_profile: balanced           (alts: fast, quiet; podcast defaults to 
 
 ## Endpoints worth knowing
 
-Standard playback endpoints (`/read`, `/status`, `/stop`, `/pause`, `/resume`, `/seek`) are obvious from the menu callbacks in `app.py`. The non-obvious ones:
+Standard playback endpoints (`/read`, `/status`, `/stop`, `/pause`, `/resume`, `/seek`, `/restart_audio`) are obvious from the menu callbacks in `app.py`. The non-obvious ones:
 
-- `POST /save_current` / `GET /saved_items` / `POST /play_saved` / `POST /delete_saved` — saved-items queue backed by `data/saved_for_later.json` (max 3, FIFO).
-- `POST /generate_podcast` — concatenates all saved items → `data/podcasts/podcast_{ts}.wav` (24kHz int16).
+- `POST /save_for_later` / `GET /saved_items` / `POST /play_saved` / `POST /delete_saved` / `POST /saved_items/clear` — saved-items queue backed by `data/saved_for_later.json` (max 5, FIFO).
+- `POST /generate_single_podcast` — starts one background podcast process for a single text item → repo-level `podcasts/podcast_单篇_{source}_{title}_{hash}_{ts}.wav` (24kHz int16).
+- `POST /generate_podcast` — concatenates all saved items → repo-level `podcasts/podcast_合集_web_大合集播客_{ts}.wav` (24kHz int16).
+- `GET /podcasts/list` / `POST /podcasts/play` / `POST /podcasts/delete` / `POST /podcasts/toggle_pin` / `POST /podcasts/clear` — finished podcast file operations owned by `PodcastService`.
+- `GET /cache/items` / `POST /cache/play` / `POST /cache/export` / `POST /cache/delete` / `POST /cache/clear` — temp cache operations owned by `CacheService`.
 - `GET /debug/state` — local diagnostics for playback session id, task id, queues, stop event, current title, active URL tasks, and active podcast worker count.
 
 ## Constraints
@@ -106,3 +115,4 @@ Standard playback endpoints (`/read`, `/status`, `/stop`, `/pause`, `/resume`, `
 - No mypy, no ruff — only Black + isort
 - CI order: `pre-commit run --all-files` → core tests → modular tests
 - Core tests under `mlx_audio/tests/` may require model weights on disk
+- QwenTTS-App service smoke tests: `python -m pytest -q QwenTTS-App/core/tests/test_services_smoke.py`
