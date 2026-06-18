@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-import json
 import threading
 import multiprocessing as mp
 import mlx.core as mx
@@ -31,6 +30,8 @@ from core.state.runtime_state import RuntimeState
 from core.services.playback_service import PlaybackService
 from core.services.podcast_service import PodcastService
 from core.services.performance import get_performance_profile
+from core.services.saved_items_service import SavedItemsService
+from core.services.cache_service import CacheService
 
 CACHE_DIR = os.path.join(BASE_DIR, "data", "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -57,17 +58,7 @@ def manage_cache_limit(max_items=10):
     except: pass
 
 def clear_all_cache():
-    try:
-        for f in os.listdir(CACHE_DIR): os.remove(os.path.join(CACHE_DIR, f))
-        import sqlite3
-        try:
-            conn = sqlite3.connect(storage.db_path)
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM cache_metadata")
-            conn.commit()
-            conn.close()
-        except: pass
-    except: pass
+    cache_service.clear()
 
 # ==========================================
 # 1. 跨进程共享状态
@@ -219,8 +210,9 @@ else:
     player = None
 
 processor = TextProcessor()
-save_file_lock = threading.Lock()
 runtime_state = RuntimeState()
+saved_items_service = SavedItemsService(BASE_DIR)
+cache_service = CacheService(storage, CACHE_DIR, PODCASTS_DIR)
 
 playback_service = PlaybackService(
     shared_state=S,
@@ -231,35 +223,6 @@ playback_service = PlaybackService(
     get_text_hash=get_text_hash,
     get_performance_profile=get_performance_profile,
 )
-
-def do_save_for_later(text: str, source: str = "web", voice: str | None = None, title: str | None = None) -> int:
-    text = text.strip()
-    if not text: return 0
-    save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
-    saved_items = []
-    md5_val = hashlib.md5(text.encode("utf-8")).hexdigest()
-    
-    with save_file_lock:
-        if os.path.exists(save_file):
-            try:
-                with open(save_file, "r", encoding="utf-8") as f: saved_items = json.load(f)
-            except: pass
-            
-        if not any(item.get("md5") == md5_val for item in saved_items):
-            display_title = title if title else (text[:20].replace("\n", " ") + "...")
-            saved_items.append({
-                "timestamp": time.time(),
-                "text": text,
-                "title": display_title,
-                "source": source,
-                "voice": voice,
-                "is_exported": False,
-                "md5": md5_val
-            })
-            if len(saved_items) > 5: saved_items = saved_items[-5:]
-            with open(save_file, "w", encoding="utf-8") as f: json.dump(saved_items, f, ensure_ascii=False, indent=2)
-            
-    return len(saved_items)
 
 def performance_monitor_thread():
     import psutil
@@ -307,10 +270,7 @@ def audio_feeder_thread():
                             scipy.io.wavfile.write(podcast_file, 24000, wav_data)
                             print(f"[Podcast] Saved to {podcast_file}")
                             
-                            save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
-                            with save_file_lock:
-                                with open(save_file, "w", encoding="utf-8") as f:
-                                    json.dump([], f)
+                            saved_items_service.clear()
                     except Exception as e:
                         print(f"[Podcast] Error saving: {e}")
                 else:
@@ -371,7 +331,7 @@ async def read_text(data: dict = Body(...)):
     else:
         if source == "clipboard" and text:
             try:
-                do_save_for_later(text, source="clipboard", voice=voice)
+                saved_items_service.save(text, source="clipboard", voice=voice)
             except Exception as e:
                 print(f"[Backend] Auto-saving clipboard text failed: {e}")
                 
@@ -588,177 +548,34 @@ async def read_url(payload: dict = Body(...)) -> dict:
 @app.post("/delete_saved")
 async def delete_saved(data: dict = Body(...)):
     md5 = data.get("md5")
-    save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
-    
-    with save_file_lock:
-        if os.path.exists(save_file):
-            try:
-                with open(save_file, "r", encoding="utf-8") as f: items = json.load(f)
-            except:
-                items = []
-                
-            if md5:
-                new_items = [item for item in items if item.get("md5") != md5]
-                if len(new_items) < len(items):
-                    with open(save_file, "w", encoding="utf-8") as f: json.dump(new_items, f, ensure_ascii=False, indent=2)
-                    return {"status": "ok"}
-            else:
-                index = data.get("index")
-                if index is not None and 0 <= index < len(items):
-                    items.pop(index)
-                    with open(save_file, "w", encoding="utf-8") as f: json.dump(items, f, ensure_ascii=False, indent=2)
-                    return {"status": "ok"}
-                    
+    index = data.get("index")
+    if saved_items_service.delete(md5=md5, index=index):
+        return {"status": "ok"}
     return {"error": "Item not found"}
 
 @app.get("/podcasts/list")
 async def list_podcasts():
-    podcasts_dir = PODCASTS_DIR
-    if not os.path.exists(podcasts_dir): return []
-    files = []
-    for f in os.listdir(podcasts_dir):
-        path = os.path.join(podcasts_dir, f)
-        is_pinned = "pinned_" in f
-        
-        clean_f = f.replace("pinned_", "")
-        parts = clean_f.split("_")
-        
-        title = clean_f
-        source = "web"
-        is_pending = ".pending_" in f
-        
-        if len(parts) >= 5 and (parts[0] == "podcast" or parts[0] == ".pending"):
-            # Format: podcast_单篇_source_title_hash_timestamp.wav
-            if parts[1] == "单篇":
-                source = parts[2]
-                title = parts[3]
-            elif parts[1] == "合集":
-                source = "web"
-                title = "大合集播客"
-                
-        if f.endswith(".wav"):
-            try: size_mb = os.path.getsize(path) / (1024 * 1024)
-            except: size_mb = 0
-            files.append({"title": title, "filename": f, "timestamp": os.path.getmtime(path), "is_pending": False, "source": source, "is_pinned": is_pinned, "size_mb": size_mb})
-        elif is_pending:
-            files.append({"title": title + " (正在生成中...)", "filename": f, "timestamp": os.path.getmtime(path), "is_pending": True, "source": source, "is_pinned": False})
-    
-    current_time = time.time()
-    for url, info in list(ACTIVE_URL_TASKS.items()):
-        if info.get("is_podcast", False) and current_time - info["timestamp"] < 60:
-            files.insert(0, {
-                "title": "⏳ 正在抓取网页正文...",
-                "filename": url,
-                "timestamp": info["timestamp"],
-                "is_pending": True,
-                "source": "web",
-                "is_pinned": False,
-                "size_mb": 0
-            })
-            
-    # Sort by pinned (True first), then timestamp descending
-    files.sort(key=lambda x: (not x["is_pinned"], -x["timestamp"]))
-    return files
+    return podcast_service.list_files()
 
 @app.post("/podcasts/toggle_pin")
 async def toggle_pin(data: dict = Body(...)):
     filename = data.get("filename", "")
-    
-    search_dirs = [
-        PODCASTS_DIR,
-        os.path.join(BASE_DIR, "data", "podcasts"),
-        os.path.join(os.path.dirname(BASE_DIR), "podcasts"),
-        os.path.join(BASE_DIR, "data", "exported")
-    ]
-    
-    filepath = None
-    for d in search_dirs:
-        candidate = os.path.join(d, filename)
-        if os.path.exists(candidate):
-            filepath = candidate
-            break
-            
-    if not filepath:
-        return {"error": "File not found"}
-        
-    dir_name = os.path.dirname(filepath)
-    is_pinned = "pinned_" in filename
-    if is_pinned:
-        new_name = filename.replace("pinned_", "")
-    else:
-        new_name = "pinned_" + filename
-        
-    new_path = os.path.join(dir_name, new_name)
-    try:
-        os.rename(filepath, new_path)
-        return {"status": "ok", "new_name": new_name}
-    except Exception as e:
-        return {"error": str(e)}
+    return podcast_service.toggle_pin(filename)
 
 @app.post("/podcasts/clear")
 async def clear_podcasts():
-    # 同时清理统一播客文件夹和其它备份文件夹下的未置顶播客
-    deleted_count = 0
-    for podcasts_dir in [PODCASTS_DIR, os.path.join(BASE_DIR, "data", "podcasts")]:
-        if os.path.exists(podcasts_dir):
-            for f in os.listdir(podcasts_dir):
-                if f.endswith(".wav") and "pinned_" not in f:
-                    try:
-                        os.remove(os.path.join(podcasts_dir, f))
-                        deleted_count += 1
-                    except: pass
+    deleted_count = podcast_service.clear_unpinned()
     return {"status": "ok", "deleted_count": deleted_count}
 
 @app.post("/podcasts/delete")
 async def delete_podcast(data: dict = Body(...)):
     filename = data.get("filename", "")
-    if not filename: return {"error": "Empty filename"}
-    
-    safe_filename = os.path.basename(filename)
-    search_dirs = [
-        PODCASTS_DIR,
-        os.path.join(BASE_DIR, "data", "podcasts"),
-        os.path.join(os.path.exported_dir if hasattr(os, "exported_dir") else os.path.join(BASE_DIR, "data", "exported"), "exported") # keep fallback
-    ]
-    # Simple direct search list
-    search_dirs = [
-        PODCASTS_DIR,
-        os.path.join(BASE_DIR, "data", "podcasts"),
-        os.path.join(BASE_DIR, "data", "exported")
-    ]
-    
-    filepath = None
-    for d in search_dirs:
-        candidate = os.path.join(d, safe_filename)
-        if os.path.exists(candidate):
-            filepath = candidate
-            break
-            
-    if filepath and os.path.exists(filepath):
-        try:
-            os.remove(filepath)
-            return {"status": "ok"}
-        except Exception as e:
-            return {"error": f"Failed to delete file: {e}"}
-    return {"error": "File not found"}
+    return podcast_service.delete(filename)
 
 @app.post("/podcasts/play")
 async def play_podcast(data: dict = Body(...)):
     filename = data.get("filename", "")
-    
-    search_dirs = [
-        PODCASTS_DIR,
-        os.path.join(BASE_DIR, "data", "podcasts"),
-        os.path.join(BASE_DIR, "data", "exported")
-    ]
-    
-    filepath = None
-    for d in search_dirs:
-        candidate = os.path.join(d, filename)
-        if os.path.exists(candidate):
-            filepath = candidate
-            break
-            
+    filepath = podcast_service.find_file(filename)
     if not filepath:
         return {"error": "File not found"}
     
@@ -774,7 +591,7 @@ async def save_for_later(data: dict = Body(...)):
     title = data.get("title", None)
     if not text: return {"error": "Empty text"}
     
-    count = do_save_for_later(text, source, voice, title)
+    count = saved_items_service.save(text, source, voice, title)
     return {"status": "saved", "count": count}
 
 @app.post("/generate_single_podcast")
@@ -809,21 +626,12 @@ async def generate_single_podcast(data: dict = Body(...)):
 
 @app.post("/saved_items/clear")
 async def clear_saved_items():
-    save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
-    with save_file_lock:
-        with open(save_file, "w", encoding="utf-8") as f:
-            json.dump([], f)
+    saved_items_service.clear()
     return {"status": "ok"}
 
 @app.post("/generate_podcast")
 async def generate_podcast_api():
-    save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
-    saved_items = []
-    with save_file_lock:
-        if os.path.exists(save_file):
-            try:
-                with open(save_file, "r", encoding="utf-8") as f: saved_items = json.load(f)
-            except: pass
+    saved_items = saved_items_service.load()
     if not saved_items: return {"error": "No saved items"}
     
     text = "\n\n".join(item.get("text", "") for item in saved_items)
@@ -831,8 +639,7 @@ async def generate_podcast_api():
     
     # 如果检测到相同内容的任务已在生成中，直接返回成功并清空原列表
     if podcast_service.is_generating(md5_val):
-        with save_file_lock:
-            with open(save_file, "w", encoding="utf-8") as f: json.dump([], f)
+        saved_items_service.clear()
         return {"status": "generating", "message": "该合集内容已在后台生成中，无需重复提交！"}
         
     os.makedirs(PODCASTS_DIR, exist_ok=True)
@@ -851,19 +658,12 @@ async def generate_podcast_api():
         md5=md5_val,
     )
     
-    with save_file_lock:
-        with open(save_file, "w", encoding="utf-8") as f: json.dump([], f)
+    saved_items_service.clear()
     return {"status": "generating", "filename": filename}
 
 @app.get("/saved_items")
 async def get_saved_items():
-    save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
-    saved_items = []
-    with save_file_lock:
-        if os.path.exists(save_file):
-            try:
-                with open(save_file, "r", encoding="utf-8") as f: saved_items = json.load(f)
-            except: pass
+    saved_items = saved_items_service.load()
     
     current_time = time.time()
     for url, info in list(ACTIVE_URL_TASKS.items()):
@@ -882,27 +682,11 @@ async def get_saved_items():
 async def play_saved(data: dict = Body(...)):
     indices = data.get("indices", [])
     if not indices: return {"error": "No items selected"}
-    save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
-    saved_items = []
-    with save_file_lock:
-        if os.path.exists(save_file):
-            try:
-                with open(save_file, "r", encoding="utf-8") as f: saved_items = json.load(f)
-            except: pass
+    saved_items = saved_items_service.load()
     if not saved_items: return {"error": "Queue empty"}
-    text_to_play = "\n\n".join(saved_items[idx].get("text", "") for idx in indices if 0 <= idx < len(saved_items))
+    text_to_play, voice, selected_md5 = saved_items_service.selected_text(indices)
     if not text_to_play.strip(): return {"error": "Selected items are empty"}
-    
-    # Extract voice from the first selected item, if any
-    first_idx = indices[0] if indices else 0
-    voice = None
-    if 0 <= first_idx < len(saved_items):
-        voice = saved_items[first_idx].get("voice")
-    
-    if indices and 0 <= indices[0] < len(saved_items):
-        runtime_state.set_current_media(podcast=None, md5=saved_items[indices[0]].get("md5"))
-    else:
-        runtime_state.set_current_media(podcast=None, md5=None)
+    runtime_state.set_current_media(podcast=None, md5=selected_md5)
 
     payload = {"text": text_to_play, "from_saved": True}
     if voice: payload["voice"] = voice
@@ -913,52 +697,31 @@ async def play_saved(data: dict = Body(...)):
 
 @app.get("/cache/items")
 async def get_cache_items():
-    items = storage.get_all_cache()
-    podcast_dir = PODCASTS_DIR
-    for item in items:
-        md5 = item.get("md5")
-        is_exported = False
-        if md5 and os.path.exists(podcast_dir):
-            for f in os.listdir(podcast_dir):
-                if f.startswith(f"podcast_") and f.endswith(".wav") and md5[:8] in f:
-                    is_exported = True
-                    break
-        item["is_exported"] = is_exported
-    return items
+    return cache_service.list_items()
 
 @app.post("/cache/play")
 async def play_cache(data: dict = Body(...)):
     md5 = data.get("md5")
-    item = storage.get_cache_by_md5(md5)
-    if not item: return {"error": "Cache not found"}
-    text = item.get("text", "")
+    text = cache_service.get_text(md5)
+    if text is None: return {"error": "Cache not found"}
     return await read_text({"text": text})
 
 @app.post("/cache/export")
 async def export_cache(data: dict = Body(...)):
     md5 = data.get("md5")
-    item = storage.get_cache_by_md5(md5)
-    if not item: return {"error": "Cache not found"}
-    text = item.get("text", "")
+    text = cache_service.get_text(md5)
+    if text is None: return {"error": "Cache not found"}
     return await generate_single_podcast({"text": text, "source": "cache"})
 
 @app.post("/cache/delete")
 async def delete_cache(data: dict = Body(...)):
     md5 = data.get("md5")
-    storage.delete_cache_by_md5(md5)
+    cache_service.delete(md5)
     return {"status": "ok"}
 
 @app.post("/cache/clear")
 async def clear_cache_endpoint():
-    clear_all_cache()
-    import sqlite3
-    try:
-        conn = sqlite3.connect(storage.db_path)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM cache_metadata")
-        conn.commit()
-        conn.close()
-    except: pass
+    cache_service.clear()
     return {"status": "ok"}
 
 if __name__ == "__main__":

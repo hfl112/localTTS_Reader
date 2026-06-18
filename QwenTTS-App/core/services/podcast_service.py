@@ -330,3 +330,132 @@ class PodcastService:
             "on_battery_power": is_on_battery_power(),
             "active_podcast_processes": sum(1 for p in self.active_procs if p.is_alive()),
         }
+
+    def search_dirs(self) -> list[str]:
+        base_dir = os.path.dirname(self.podcasts_dir)
+        app_dir = os.path.join(base_dir, "QwenTTS-App")
+        return [
+            self.podcasts_dir,
+            os.path.join(app_dir, "data", "podcasts"),
+            os.path.join(app_dir, "data", "exported"),
+        ]
+
+    def find_file(self, filename: str) -> str | None:
+        safe_filename = os.path.basename(filename)
+        for directory in self.search_dirs():
+            candidate = os.path.join(directory, safe_filename)
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    def list_files(self) -> list[dict[str, Any]]:
+        if not os.path.exists(self.podcasts_dir):
+            return []
+        files: list[dict[str, Any]] = []
+        for filename in os.listdir(self.podcasts_dir):
+            path = os.path.join(self.podcasts_dir, filename)
+            is_pinned = "pinned_" in filename
+            clean_filename = filename.replace("pinned_", "")
+            parts = clean_filename.split("_")
+
+            title = clean_filename
+            source = "web"
+            is_pending = ".pending_" in filename
+
+            if len(parts) >= 5 and (parts[0] == "podcast" or parts[0] == ".pending"):
+                if parts[1] == "单篇":
+                    source = parts[2]
+                    title = parts[3]
+                elif parts[1] == "合集":
+                    source = "web"
+                    title = "大合集播客"
+
+            if filename.endswith(".wav"):
+                try:
+                    size_mb = os.path.getsize(path) / (1024 * 1024)
+                except Exception:
+                    size_mb = 0
+                files.append(
+                    {
+                        "title": title,
+                        "filename": filename,
+                        "timestamp": os.path.getmtime(path),
+                        "is_pending": False,
+                        "source": source,
+                        "is_pinned": is_pinned,
+                        "size_mb": size_mb,
+                    }
+                )
+            elif is_pending:
+                files.append(
+                    {
+                        "title": title + " (正在生成中...)",
+                        "filename": filename,
+                        "timestamp": os.path.getmtime(path),
+                        "is_pending": True,
+                        "source": source,
+                        "is_pinned": False,
+                    }
+                )
+
+        current_time = time.time()
+        for url, info in list(self.active_url_tasks.items()):
+            if info.get("is_podcast", False) and current_time - info["timestamp"] < 60:
+                files.insert(
+                    0,
+                    {
+                        "title": "⏳ 正在抓取网页正文...",
+                        "filename": url,
+                        "timestamp": info["timestamp"],
+                        "is_pending": True,
+                        "source": "web",
+                        "is_pinned": False,
+                        "size_mb": 0,
+                    },
+                )
+
+        files.sort(key=lambda x: (not x["is_pinned"], -x["timestamp"]))
+        return files
+
+    def toggle_pin(self, filename: str) -> dict[str, Any]:
+        filepath = self.find_file(filename)
+        if not filepath:
+            return {"error": "File not found"}
+
+        dir_name = os.path.dirname(filepath)
+        safe_filename = os.path.basename(filename)
+        if "pinned_" in safe_filename:
+            new_name = safe_filename.replace("pinned_", "")
+        else:
+            new_name = "pinned_" + safe_filename
+
+        try:
+            os.rename(filepath, os.path.join(dir_name, new_name))
+            return {"status": "ok", "new_name": new_name}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def clear_unpinned(self) -> int:
+        deleted_count = 0
+        for directory in [self.podcasts_dir, os.path.join(os.path.dirname(self.podcasts_dir), "QwenTTS-App", "data", "podcasts")]:
+            if os.path.exists(directory):
+                for filename in os.listdir(directory):
+                    if filename.endswith(".wav") and "pinned_" not in filename:
+                        try:
+                            os.remove(os.path.join(directory, filename))
+                            deleted_count += 1
+                        except Exception:
+                            pass
+        return deleted_count
+
+    def delete(self, filename: str) -> dict[str, Any]:
+        if not filename:
+            return {"error": "Empty filename"}
+        filepath = self.find_file(filename)
+        if filepath and os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+                return {"status": "ok"}
+            except Exception as e:
+                return {"error": f"Failed to delete file: {e}"}
+        return {"error": "File not found"}
