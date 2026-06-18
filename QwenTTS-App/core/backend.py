@@ -7,7 +7,7 @@ import mlx.core as mx
 import numpy as np
 import scipy.io.wavfile
 import hashlib
-from fastapi import FastAPI, Body
+from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import uvicorn
 import traceback
@@ -23,6 +23,17 @@ PODCASTS_DIR = os.path.abspath(os.path.join(os.path.dirname(BASE_DIR), "podcasts
 os.makedirs(PODCASTS_DIR, exist_ok=True)
 
 from core.tts_engine import TTSEngine
+from core.api_models import (
+    DeleteSavedRequest,
+    FilenameRequest,
+    GenerateSinglePodcastRequest,
+    Md5Request,
+    PlaySavedRequest,
+    ReadRequest,
+    ReadUrlRequest,
+    SaveForLaterRequest,
+    SeekRequest,
+)
 from core.player import PCMPlayer
 from core.processor import TextProcessor
 from core.storage import Storage
@@ -315,12 +326,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/read")
-async def read_text(data: dict = Body(...)):
-    text = data.get('text', "")
-    voice = data.get("voice", None)
-    source = data.get("source", None)
-    
-    runtime_state.clear_current_media(keep_md5=data.get("from_saved", False))
+async def read_text(data: ReadRequest):
+    text = data.text
+    voice = data.voice
+    source = data.source
+
+    runtime_state.clear_current_media(keep_md5=data.from_saved)
     runtime_state.reset_podcast_generation()
     
     playback_session_id, new_task_id = playback_service.start_new_session()
@@ -335,7 +346,9 @@ async def read_text(data: dict = Body(...)):
     
     state = storage.load_state()
     config = storage.load_config()
-    config["performance_profile"] = data.get("performance_profile", config.get("performance_profile", "balanced"))
+    config["performance_profile"] = data.performance_profile or config.get(
+        "performance_profile", "balanced"
+    )
     if voice:
         config["voice"] = voice
         
@@ -452,8 +465,8 @@ async def restart_audio():
     return {"error": "Player not initialized"}
 
 @app.post("/seek")
-async def seek_playback(data: dict = Body(...)):
-    direction = data.get("direction", 1) # 1 for next, -1 for prev
+async def seek_playback(data: SeekRequest):
+    direction = data.direction  # 1 for next, -1 for prev
     event_log.record("seek_requested", direction=direction)
     
     runtime_state.reset_podcast_generation()
@@ -506,19 +519,13 @@ podcast_service = PodcastService(
 )
 
 @app.post("/read_url")
-async def read_url(payload: dict = Body(...)) -> dict:
+async def read_url(payload: ReadUrlRequest) -> dict:
     global ACTIVE_URL_TASKS
-    url = payload.get("url", "").strip()
-    html = payload.get("html", "").strip()
-    translate = payload.get("translate", False)
-    mode = payload.get("mode", "original")
-    
-    # Fallback compatibility for older client payloads
-    if mode == "original" and translate:
-        mode = "translate"
-        
-    save = payload.get("save", False)
-    podcast = payload.get("podcast", False)
+    url = payload.url.strip()
+    html = payload.html.strip()
+    mode = payload.effective_mode()
+    save = payload.save
+    podcast = payload.podcast
     if not url: return {"error": "Empty URL"}
         
     current_time = time.time()
@@ -580,9 +587,9 @@ async def read_url(payload: dict = Body(...)) -> dict:
     return {"status": "ok", "message": "Read URL task dispatched"}
 
 @app.post("/delete_saved")
-async def delete_saved(data: dict = Body(...)):
-    md5 = data.get("md5")
-    index = data.get("index")
+async def delete_saved(data: DeleteSavedRequest):
+    md5 = data.md5
+    index = data.index
     if saved_items_service.delete(md5=md5, index=index):
         return {"status": "ok"}
     return {"error": "Item not found"}
@@ -596,9 +603,8 @@ async def list_podcast_jobs():
     return podcast_service.list_jobs()
 
 @app.post("/podcasts/toggle_pin")
-async def toggle_pin(data: dict = Body(...)):
-    filename = data.get("filename", "")
-    return podcast_service.toggle_pin(filename)
+async def toggle_pin(data: FilenameRequest):
+    return podcast_service.toggle_pin(data.filename)
 
 @app.post("/podcasts/clear")
 async def clear_podcasts():
@@ -606,13 +612,12 @@ async def clear_podcasts():
     return {"status": "ok", "deleted_count": deleted_count}
 
 @app.post("/podcasts/delete")
-async def delete_podcast(data: dict = Body(...)):
-    filename = data.get("filename", "")
-    return podcast_service.delete(filename)
+async def delete_podcast(data: FilenameRequest):
+    return podcast_service.delete(data.filename)
 
 @app.post("/podcasts/play")
-async def play_podcast(data: dict = Body(...)):
-    filename = data.get("filename", "")
+async def play_podcast(data: FilenameRequest):
+    filename = data.filename
     filepath = podcast_service.find_file(filename)
     if not filepath:
         return {"error": "File not found"}
@@ -622,12 +627,12 @@ async def play_podcast(data: dict = Body(...)):
     return {"status": "ok"}
 
 @app.post("/save_for_later")
-async def save_for_later(data: dict = Body(...)):
+async def save_for_later(data: SaveForLaterRequest):
     runtime_state.touch_activity()
-    text = data.get("text", "").strip()
-    source = data.get("source", "web")
-    voice = data.get("voice", None)
-    title = data.get("title", None)
+    text = data.text.strip()
+    source = data.source
+    voice = data.voice
+    title = data.title
     if not text: return {"error": "Empty text"}
     
     count = saved_items_service.save(text, source, voice, title)
@@ -635,13 +640,13 @@ async def save_for_later(data: dict = Body(...)):
     return {"status": "saved", "count": count}
 
 @app.post("/generate_single_podcast")
-async def generate_single_podcast(data: dict = Body(...)):
+async def generate_single_podcast(data: GenerateSinglePodcastRequest):
     runtime_state.touch_activity()
-    
-    text = data.get("text", "").strip()
-    source = data.get("source", "web")
-    voice = data.get("voice", None)
-    title = data.get("title", None)
+
+    text = data.text.strip()
+    source = data.source
+    voice = data.voice
+    title = data.title
     if not text: return {"error": "Empty text"}
     
     md5_val = hashlib.md5(text.encode("utf-8")).hexdigest()
@@ -651,7 +656,7 @@ async def generate_single_podcast(data: dict = Body(...)):
         return {"status": "generating", "md5": md5_val, "message": "该内容已在后台生成中，无需重复提交！"}
         
     config = storage.load_config()
-    config["performance_profile"] = data.get("performance_profile", "quiet")
+    config["performance_profile"] = data.performance_profile
     if voice:
         config["voice"] = voice
     podcast_service.start_single(
@@ -734,8 +739,8 @@ async def get_saved_items():
     return saved_items
 
 @app.post("/play_saved")
-async def play_saved(data: dict = Body(...)):
-    indices = data.get("indices", [])
+async def play_saved(data: PlaySavedRequest):
+    indices = data.indices
     if not indices: return {"error": "No items selected"}
     saved_items = saved_items_service.load()
     if not saved_items: return {"error": "Queue empty"}
@@ -743,9 +748,8 @@ async def play_saved(data: dict = Body(...)):
     if not text_to_play.strip(): return {"error": "Selected items are empty"}
     runtime_state.set_current_media(podcast=None, md5=selected_md5)
 
-    payload = {"text": text_to_play, "from_saved": True}
-    if voice: payload["voice"] = voice
-    
+    payload = ReadRequest(text=text_to_play, from_saved=True, voice=voice)
+
     return await read_text(payload)
 
 
@@ -755,23 +759,24 @@ async def get_cache_items():
     return cache_service.list_items()
 
 @app.post("/cache/play")
-async def play_cache(data: dict = Body(...)):
-    md5 = data.get("md5")
+async def play_cache(data: Md5Request):
+    md5 = data.md5
     text = cache_service.get_text(md5)
     if text is None: return {"error": "Cache not found"}
-    return await read_text({"text": text})
+    return await read_text(ReadRequest(text=text))
 
 @app.post("/cache/export")
-async def export_cache(data: dict = Body(...)):
-    md5 = data.get("md5")
+async def export_cache(data: Md5Request):
+    md5 = data.md5
     text = cache_service.get_text(md5)
     if text is None: return {"error": "Cache not found"}
-    return await generate_single_podcast({"text": text, "source": "cache"})
+    return await generate_single_podcast(
+        GenerateSinglePodcastRequest(text=text, source="cache")
+    )
 
 @app.post("/cache/delete")
-async def delete_cache(data: dict = Body(...)):
-    md5 = data.get("md5")
-    cache_service.delete(md5)
+async def delete_cache(data: Md5Request):
+    cache_service.delete(data.md5)
     return {"status": "ok"}
 
 @app.post("/cache/clear")

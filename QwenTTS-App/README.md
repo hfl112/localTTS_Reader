@@ -39,6 +39,7 @@ PCMPlayer(sounddevice/CoreAudio)
 | File | Role |
 |---|---|
 | `app.py` | macOS `rumps` 菜单栏 UI；启动后端；1Hz 轮询 `/status`；触发朗读、暂停、停止、seek、播客播放 |
+| `core/api_models.py` | FastAPI 请求模型；定义 `/read`、`/read_url`、podcast、cache、saved-items 等 endpoint 的请求字段和默认值 |
 | `core/backend.py` | FastAPI 路由、推理子进程、音频 feeder、Bonjour、生命周期管理 |
 | `core/state/runtime_state.py` | 当前标题、进度、播放状态、当前播客、播客 buffer 等运行态 |
 | `core/services/playback_service.py` | `PlaybackController` + `PlaybackService`；统一管理播放 session、task id、队列清理、TTS/WAV 播放 |
@@ -57,6 +58,7 @@ PCMPlayer(sounddevice/CoreAudio)
 ## 关键约束
 
 - 播放入口必须通过 `PlaybackService.start_new_session()` 或 `stop_current_session()` 换代 session，不能只清 `stop_event`。这是修复 TTS 和 podcast “串台”的核心机制。
+- endpoint 请求参数必须优先在 `core/api_models.py` 中定义 Pydantic model，避免 route 内继续手写松散 `dict.get()` 解析。
 - `GLOBAL_SENTINEL = "PIPELINE_END_STRICT_V1"` 必须保持字符串，保证 `mp.Queue` 跨进程序列化稳定。
 - 实时朗读默认 `balanced`；后台 podcast 默认 `quiet`；长单篇和合集 podcast 优先使用 `Qwen3-TTS-0.6B` 降温。
 - `PodcastService` 是后台 podcast 进程、暂停事件、GPU 锁和 chunk checkpoint 的唯一 owner。

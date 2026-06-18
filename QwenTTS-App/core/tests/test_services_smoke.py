@@ -1,16 +1,24 @@
 import os
 import sys
 import tempfile
+import multiprocessing as mp
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from core.api_models import (
+    GenerateSinglePodcastRequest,
+    PlaySavedRequest,
+    ReadRequest,
+    ReadUrlRequest,
+)
 from core.services.performance import get_performance_profile
 from core.services.saved_items_service import SavedItemsService
 from core.services.podcast_service import PodcastService
 from core.services.podcast_jobs import PodcastJobStore
 from core.services.runtime_log import RuntimeEventLog
+from core.services.playback_service import PlaybackController
 from core.state.runtime_state import RuntimeState
 
 
@@ -119,3 +127,56 @@ def test_podcast_job_store_round_trip():
         store.mark_unfinished_failed("restart")
         assert store.list()[0]["status"] == "failed"
         assert store.list()[0]["error"] == "restart"
+
+
+def test_api_models_keep_backward_compatible_defaults():
+    read = ReadRequest(text="hello")
+    assert read.voice is None
+    assert read.from_saved is False
+    assert read.performance_profile is None
+
+    read_url = ReadUrlRequest(url="https://example.com", translate=True)
+    assert read_url.effective_mode() == "translate"
+
+    podcast = GenerateSinglePodcastRequest(text="hello")
+    assert podcast.source == "web"
+    assert podcast.performance_profile == "quiet"
+
+    first = PlaySavedRequest()
+    second = PlaySavedRequest()
+    first.indices.append(1)
+    assert second.indices == []
+
+
+class DummySharedState:
+    def __init__(self):
+        self.audio_q = mp.Queue()
+        self.stop_event = mp.Event()
+        self.current_task_id = mp.Value("i", 0)
+
+
+class DummyPlayer:
+    def __init__(self):
+        self.audio_queue = mp.Queue()
+        self.stop_count = 0
+
+    def stop(self):
+        self.stop_count += 1
+
+
+def test_playback_controller_invalidates_old_sessions():
+    shared_state = DummySharedState()
+    player = DummyPlayer()
+    controller = PlaybackController(shared_state, player)
+
+    first_session, first_task = controller.start_new_session()
+    assert controller.can_feed_audio(first_session, first_task)
+
+    second_session, second_task = controller.start_new_session()
+    assert not controller.can_feed_audio(first_session, first_task)
+    assert controller.can_feed_audio(second_session, second_task)
+    assert player.stop_count == 2
+
+    controller.stop_current_session()
+    assert not controller.can_feed_audio(second_session, second_task)
+    assert shared_state.stop_event.is_set()

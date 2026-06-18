@@ -244,4 +244,14 @@
     5.  **测试补充**：service smoke tests 从 4 个扩展到 6 个，覆盖 runtime event log 和 podcast job store。
 
 ---
-**当前状态**: 🏆 服务层架构 + PlaybackService 播放隔离 + PodcastService 后台生成 + 三档性能模式 + runtime event log + podcast_jobs.json + smoke tests，长文/长播客的串台、发热、任务残留和排障复杂度都已进入可观测状态 | **负责人**: Codex
+
+## 📅 第十六阶段：FastAPI 请求模型化与 Smoke Test 扩展 (2026-06-18)
+*   **目标**：把后端 endpoint 的请求参数从松散 `dict.get()` 收口到明确 schema，同时扩大轻量测试覆盖面。
+*   **核心改动**：
+    1.  **Pydantic 请求模型**：新增 `core/api_models.py`，为 `/read`、`/read_url`、saved-items、podcast、cache、seek 等 endpoint 定义 request model 和兼容默认值。
+    2.  **backend 路由收口**：`backend.py` endpoint 改为接收明确模型对象；内部复用 endpoint 时也直接构造 request model，减少字段名拼错和默认值漂移。
+    3.  **Smoke tests 扩展**：`test_services_smoke.py` 从 6 个扩展到 8 个，新增 API model 默认值/兼容性测试，以及 `PlaybackController` 旧 session 失效测试。
+*   **验证结果**：`python -m py_compile ...` 通过；`python -m pytest -q QwenTTS-App/core/tests/test_services_smoke.py` → `8 passed`。
+
+---
+**当前状态**: 🏆 服务层架构 + Pydantic 请求模型 + PlaybackService 播放隔离 + PodcastService 后台生成 + runtime event log + podcast_jobs.json + 8 个 smoke tests，长文/长播客的串台、发热、任务残留和接口漂移风险都已进入可控状态 | **负责人**: Codex

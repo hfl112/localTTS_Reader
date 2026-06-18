@@ -56,6 +56,7 @@ python -m mlx_audio.server                # Web UI + API (port 8000)
 | File | Role |
 |---|---|
 | `app.py` | `rumps` UI; spawns backend on :8001; 1Hz `/status` poll; menu items trigger `/read`/`/stop`/`/seek`/`/pause` |
+| `core/api_models.py` | Pydantic request models for FastAPI endpoints; keep route input defaults and compatibility here |
 | `core/backend.py` | FastAPI route layer on :8001; spawns inference worker as `mp.Process`; owns audio feeder, Bonjour (`_qwentts._tcp`), lifespan wiring, and 10min idle model unload |
 | `core/state/runtime_state.py` | Main runtime state container for current title/progress, current podcast/md5, podcast buffer, and last activity |
 | `core/services/playback_service.py` | `PlaybackController` + `PlaybackService`; playback session invalidation, `current_task_id` bumping, stale queue cleanup, TTS playback, WAV playback |
@@ -73,6 +74,7 @@ python -m mlx_audio.server                # Web UI + API (port 8000)
 
 **IPC**: `mp.Queue` for text/audio, `mp.Event` for stop, `mp.Value` for status (IDLE/BUSY/COOLING).
 **Playback controller**: `PlaybackService` owns `PlaybackController` plus `S.current_task_id` to invalidate stale TTS and WAV playback threads. Any new playback entrypoint must go through `playback_service.start_new_session()` or `stop_current_session()`, then only feed audio while `playback_service.controller.can_feed_audio(session_id, task_id)` remains true.
+**API request schemas**: Define new endpoint request bodies in `core/api_models.py` with Pydantic models. Avoid adding new loose `dict = Body(...)` parsing in `backend.py`.
 **Performance profiles**: `fast`, `balanced`, and `quiet` live in `core/services/performance.py`. Realtime reading defaults to `balanced`; podcast generation defaults to `quiet`; long single podcasts and all batch podcasts should prefer `Qwen3-TTS-0.6B`.
 **Audio cache**: 10 `.npy` files in `QwenTTS-App/data/cache/`, MD5-keyed, LRU by mtime.
 **Sentinel**: string `"PIPELINE_END_STRICT_V1"` shared by inference worker and player (must remain a `str` to survive `mp.Queue` pickling).
@@ -118,4 +120,4 @@ Standard playback endpoints (`/read`, `/status`, `/stop`, `/pause`, `/resume`, `
 - No mypy, no ruff — only Black + isort
 - CI order: `pre-commit run --all-files` → core tests → modular tests
 - Core tests under `mlx_audio/tests/` may require model weights on disk
-- QwenTTS-App service smoke tests: `python -m pytest -q QwenTTS-App/core/tests/test_services_smoke.py`
+- QwenTTS-App service smoke tests: `python -m pytest -q QwenTTS-App/core/tests/test_services_smoke.py` (covers service basics, API model defaults, podcast job store, runtime event log, and playback session invalidation)
