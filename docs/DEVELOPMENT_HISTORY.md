@@ -177,4 +177,19 @@
 *   **效果**：即便在 AirPods 等蓝牙设备连接时产生多次抖动事件，系统也能在最多 `3.5s` 内自动完成设备切换并恢复无缝播放，彻底告别静默故障。
 
 ---
-**当前状态**: 🏆 macOS 音频设备切换容灾加固（指数退避重试 + 1.5s 防抖），彻底解决 AirPods/蓝牙切换时 PortAudio -9986 开流失败静默问题 | **负责人**: Antigravity
+
+## 📅 第十一阶段：播客播放会话隔离与串台修复 (2026-06-17)
+*   **目标**：修复播放已生成播客时偶发混入上一段网页朗读音频的问题，例如正在听政治哲学 podcast，却听到之前“李飞飞老师”文章的残留朗读。
+*   **根本原因分析**：
+    *   `/podcasts/play` 只调用了 `player.stop()` 清空播放器队列，但没有递增 `S.current_task_id`，也没有给 WAV 播放线程自己的会话身份。
+    *   旧 TTS 推理线程、`audio_feeder_thread` 或旧 WAV 播放线程可能在新的播客开始后继续向同一个 `PCMPlayer.audio_queue` 投喂音频。
+    *   `stop_event` 是全局事件，新播放入口会很快 `clear()`；旧线程如果只检查 `stop_event`，就可能在事件被清除后“复活”，造成两个来源交叉播放。
+*   **修复方案（见 `core/backend.py`）**：
+    1.  **播放会话换代**：新增 `PLAYBACK_SESSION_ID` 和 `playback_session_lock`。每次 `/read`、`/seek`、`/podcasts/play`、`/stop` 都会创建或作废播放会话，并同步递增 `S.current_task_id`。
+    2.  **旧线程硬失效**：`shared_task_loop` 与 `play_wav_thread` 均捕获自己的 `session_id/task_id`。只要发现不再是当前会话，就立即退出，不能继续 `player.play_chunk()`，也不能发送结束哨兵。
+    3.  **播客入口完整清场**：`/podcasts/play` 开始前先 `stop_event.set()`，调用 `player.stop()` 清空队列与 leftover，再创建新会话并清空主进程侧 `audio_q` 旧消息，避免旧 TTS 与旧播客残留进入新队列。
+    4.  **状态写保护**：过期线程不再允许把新任务的 `MAIN_IS_PLAYING` 改成 `False`，避免菜单栏状态被旧线程覆盖。
+*   **维护约束**：以后新增任何播放入口，都必须先换代 `PLAYBACK_SESSION_ID` 与 `S.current_task_id`，并在后台循环中检查捕获的会话仍然有效；不能只依赖 `stop_event`。
+
+---
+**当前状态**: 🏆 macOS 音频设备切换容灾加固 + 播放会话隔离，解决 AirPods/蓝牙切换静默与播客/TTS 残留串台问题 | **负责人**: Codex

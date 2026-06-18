@@ -64,6 +64,7 @@ python -m mlx_audio.server                # Web UI + API (port 8000)
 | `core/worker.py` | Standalone CLI (`python core/worker.py --text "..."`). **Not used by `app.py` / `backend.py`**. |
 
 **IPC**: `mp.Queue` for text/audio, `mp.Event` for stop, `mp.Value` for status (IDLE/BUSY/COOLING).
+**Playback session lock**: `backend.py` uses `PLAYBACK_SESSION_ID` plus `S.current_task_id` to invalidate stale TTS and WAV playback threads. Any new playback entrypoint must create a new playback session, set `stop_event`, clear `PCMPlayer` and stale `audio_q` messages, then only feed audio while its captured session/task id is still current.
 **Audio cache**: 10 `.npy` files in `QwenTTS-App/data/cache/`, MD5-keyed, LRU by mtime.
 **Sentinel**: string `"PIPELINE_END_STRICT_V1"` shared by inference worker and player (must remain a `str` to survive `mp.Queue` pickling).
 **Cruise mode**: inference pauses when `audio_queue.qsize() * (2048/24000) > 20s` to cool the GPU.
