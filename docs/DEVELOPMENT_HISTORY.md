@@ -233,4 +233,15 @@
 *   **维护约束更新**：新增播放入口必须走 `PlaybackService`；新增播客生成/文件管理必须走 `PodcastService`；不要把新的长期状态重新堆回 `backend.py`。
 
 ---
-**当前状态**: 🏆 服务层架构 + PlaybackService 播放隔离 + PodcastService 后台生成 + 三档性能模式 + smoke tests，长文/长播客的串台、发热和维护复杂度都已进入可控状态 | **负责人**: Codex
+
+## 📅 第十五阶段：运行时可观测性与播客任务持久化 (2026-06-18)
+*   **目标**：让串台、静音、后台任务残留和长播客生成状态可以被追踪，而不是只能靠主观听感判断。
+*   **核心改动**：
+    1.  **结构化事件日志**：新增 `core/services/runtime_log.py`，写入 `QwenTTS-App/data/runtime_events.jsonl`，记录播放 session、TTS/WAV 线程、URL 抓取、播客任务、暂停/恢复和错误事件。
+    2.  **播客任务状态文件**：新增 `core/services/podcast_jobs.py`，写入 `QwenTTS-App/data/podcast_jobs.json`，记录 `queued/running/done/failed/canceled` 状态、PID、标题、md5、输出路径和错误信息。
+    3.  **诊断接口**：新增 `GET /debug/events?limit=50` 和 `GET /podcasts/jobs`；`/debug/state` 也返回最近 podcast jobs。
+    4.  **URL 任务引用修复**：`ACTIVE_URL_TASKS` 改为原地清理，避免 `PodcastService` 持有旧 dict 引用后漏判前台活动。
+    5.  **测试补充**：service smoke tests 从 4 个扩展到 6 个，覆盖 runtime event log 和 podcast job store。
+
+---
+**当前状态**: 🏆 服务层架构 + PlaybackService 播放隔离 + PodcastService 后台生成 + 三档性能模式 + runtime event log + podcast_jobs.json + smoke tests，长文/长播客的串台、发热、任务残留和排障复杂度都已进入可观测状态 | **负责人**: Codex

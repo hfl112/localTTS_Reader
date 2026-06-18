@@ -9,6 +9,8 @@ if ROOT not in sys.path:
 from core.services.performance import get_performance_profile
 from core.services.saved_items_service import SavedItemsService
 from core.services.podcast_service import PodcastService
+from core.services.podcast_jobs import PodcastJobStore
+from core.services.runtime_log import RuntimeEventLog
 from core.state.runtime_state import RuntimeState
 
 
@@ -72,3 +74,48 @@ def test_podcast_service_file_ops():
         assert service.find_file(os.path.basename(path)) == path
         assert service.toggle_pin(os.path.basename(path))["status"] == "ok"
         assert service.delete("pinned_" + os.path.basename(path))["status"] == "ok"
+
+
+def test_runtime_event_log_recent_events():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "runtime_events.jsonl")
+        log = RuntimeEventLog(path, max_events=2)
+
+        log.record("first", value=1)
+        log.record("second", value=2)
+        log.record("third", value=3)
+
+        events = log.recent(limit=10)
+        assert [event["event"] for event in events] == ["second", "third"]
+        assert events[-1]["value"] == 3
+
+
+def test_podcast_job_store_round_trip():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = PodcastJobStore(os.path.join(tmp, "podcast_jobs.json"))
+
+        store.create(
+            job_id="job-1",
+            kind="single",
+            md5="abc",
+            title="Title",
+            source="web",
+        )
+        assert store.active_for_md5("abc")
+
+        store.update("job-1", status="done", output_path="/tmp/out.wav")
+        jobs = store.list()
+        assert jobs[0]["status"] == "done"
+        assert jobs[0]["output_path"] == "/tmp/out.wav"
+        assert not store.active_for_md5("abc")
+
+        store.create(
+            job_id="job-2",
+            kind="batch",
+            md5="def",
+            title="Batch",
+            source="web",
+        )
+        store.mark_unfinished_failed("restart")
+        assert store.list()[0]["status"] == "failed"
+        assert store.list()[0]["error"] == "restart"

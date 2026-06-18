@@ -60,6 +60,8 @@ python -m mlx_audio.server                # Web UI + API (port 8000)
 | `core/state/runtime_state.py` | Main runtime state container for current title/progress, current podcast/md5, podcast buffer, and last activity |
 | `core/services/playback_service.py` | `PlaybackController` + `PlaybackService`; playback session invalidation, `current_task_id` bumping, stale queue cleanup, TTS playback, WAV playback |
 | `core/services/podcast_service.py` | Background podcast generation processes, pause manager, GPU lock, chunk checkpoints, and podcast file list/delete/pin/clear |
+| `core/services/podcast_jobs.py` | File-backed `podcast_jobs.json` store for queued/running/done/failed/canceled podcast jobs |
+| `core/services/runtime_log.py` | Append-only `runtime_events.jsonl` structured event log for playback, URL, podcast, and error diagnostics |
 | `core/services/performance.py` | `fast`/`balanced`/`quiet` profiles plus reading-time estimation |
 | `core/services/saved_items_service.py` | Saved-for-later JSON queue backed by `data/saved_for_later.json` |
 | `core/services/cache_service.py` | Cache metadata/list/play/export/delete/clear helpers for `data/cache/*.npy` and exported WAVs |
@@ -75,7 +77,7 @@ python -m mlx_audio.server                # Web UI + API (port 8000)
 **Audio cache**: 10 `.npy` files in `QwenTTS-App/data/cache/`, MD5-keyed, LRU by mtime.
 **Sentinel**: string `"PIPELINE_END_STRICT_V1"` shared by inference worker and player (must remain a `str` to survive `mp.Queue` pickling).
 **Cruise mode**: realtime inference uses profile-specific buffer high/low watermarks (`balanced`: 20s/8s, `quiet`: 10s/4s, `fast`: 30s/12s) to cool the GPU.
-**Runtime files** under `QwenTTS-App/data/`: `config.json`, `state.json`, `cache/*.npy`, `podcast_chunks/*/chunk_*.npy`, `saved_for_later.json` (max 5 items). Finished podcast WAVs live in the repo-level `podcasts/` directory.
+**Runtime files** under `QwenTTS-App/data/`: `config.json`, `state.json`, `cache/*.npy`, `podcast_chunks/*/chunk_*.npy`, `saved_for_later.json` (max 5 items), `podcast_jobs.json`, `runtime_events.jsonl`. Finished podcast WAVs live in the repo-level `podcasts/` directory.
 
 ## Default TTS config
 
@@ -97,9 +99,10 @@ Standard playback endpoints (`/read`, `/status`, `/stop`, `/pause`, `/resume`, `
 - `POST /save_for_later` / `GET /saved_items` / `POST /play_saved` / `POST /delete_saved` / `POST /saved_items/clear` — saved-items queue backed by `data/saved_for_later.json` (max 5, FIFO).
 - `POST /generate_single_podcast` — starts one background podcast process for a single text item → repo-level `podcasts/podcast_单篇_{source}_{title}_{hash}_{ts}.wav` (24kHz int16).
 - `POST /generate_podcast` — concatenates all saved items → repo-level `podcasts/podcast_合集_web_大合集播客_{ts}.wav` (24kHz int16).
-- `GET /podcasts/list` / `POST /podcasts/play` / `POST /podcasts/delete` / `POST /podcasts/toggle_pin` / `POST /podcasts/clear` — finished podcast file operations owned by `PodcastService`.
+- `GET /podcasts/list` / `GET /podcasts/jobs` / `POST /podcasts/play` / `POST /podcasts/delete` / `POST /podcasts/toggle_pin` / `POST /podcasts/clear` — finished podcast file and job operations owned by `PodcastService`.
 - `GET /cache/items` / `POST /cache/play` / `POST /cache/export` / `POST /cache/delete` / `POST /cache/clear` — temp cache operations owned by `CacheService`.
-- `GET /debug/state` — local diagnostics for playback session id, task id, queues, stop event, current title, active URL tasks, and active podcast worker count.
+- `GET /debug/state` — local diagnostics for playback session id, task id, queues, stop event, current title, active URL tasks, active podcast worker count, and recent podcast jobs.
+- `GET /debug/events?limit=50` — recent structured runtime events from `data/runtime_events.jsonl`.
 
 ## Constraints
 

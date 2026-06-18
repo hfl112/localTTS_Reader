@@ -6,13 +6,16 @@ import subprocess
 import threading
 import time
 import traceback
+import uuid
 from typing import Any
 
 import numpy as np
 import scipy.io.wavfile
 
 from core.processor import TextProcessor
+from core.services.podcast_jobs import PodcastJobStore
 from core.services.performance import estimate_reading_minutes, get_performance_profile
+from core.services.runtime_log import RuntimeEventLog
 
 
 def is_on_battery_power() -> bool:
@@ -130,9 +133,17 @@ def run_single_podcast_generation_thread(
     gpu_lock,
     podcasts_dir: str,
     podcast_chunk_dir: str,
+    jobs_file: str,
+    job_id: str,
+    event_log_path: str | None,
     title: str | None = None,
 ) -> None:
     _configure_low_priority_process()
+    job_store = PodcastJobStore(jobs_file)
+    event_log = RuntimeEventLog(event_log_path) if event_log_path else None
+    job_store.update(job_id, status="running", pid=os.getpid())
+    if event_log:
+        event_log.record("podcast_job_running", job_id=job_id, md5=md5, pid=os.getpid())
 
     if title:
         safe_title = "".join(
@@ -162,8 +173,16 @@ def run_single_podcast_generation_thread(
             chunk_dir = os.path.join(podcast_chunk_dir, f"single_{md5[:12]}")
             chunk_files = generate_podcast_chunks(engine, text, config, chunk_dir, pause_event)
             out_name = f"podcast_单篇_{source}_{safe_title}_{md5[:8]}_{int(time.time())}.wav"
-            write_podcast_wav_from_chunks(chunk_files, os.path.join(podcasts_dir, out_name))
+            output_path = os.path.join(podcasts_dir, out_name)
+            if not write_podcast_wav_from_chunks(chunk_files, output_path):
+                raise RuntimeError("no generated podcast chunks")
+            job_store.update(job_id, status="done", output_path=output_path, error=None)
+            if event_log:
+                event_log.record("podcast_job_done", job_id=job_id, md5=md5, output_path=output_path)
     except Exception as e:
+        job_store.update(job_id, status="failed", error=str(e))
+        if event_log:
+            event_log.record("podcast_job_failed", job_id=job_id, md5=md5, error=str(e))
         print(f"[PodcastProcess] Error: {e}")
         traceback.print_exc()
     finally:
@@ -178,8 +197,16 @@ def run_podcast_generation_thread(
     pause_event,
     gpu_lock,
     podcast_chunk_dir: str,
+    jobs_file: str,
+    job_id: str,
+    event_log_path: str | None,
 ) -> None:
     _configure_low_priority_process()
+    job_store = PodcastJobStore(jobs_file)
+    event_log = RuntimeEventLog(event_log_path) if event_log_path else None
+    job_store.update(job_id, status="running", pid=os.getpid())
+    if event_log:
+        event_log.record("podcast_job_running", job_id=job_id, pid=os.getpid())
 
     pending_file = filename.replace(".wav", "") + ".pending_合集"
     os.makedirs(os.path.dirname(filename), exist_ok=True)
@@ -198,8 +225,15 @@ def run_podcast_generation_thread(
             batch_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
             chunk_dir = os.path.join(podcast_chunk_dir, f"batch_{batch_hash[:12]}")
             chunk_files = generate_podcast_chunks(engine, text, config, chunk_dir, pause_event)
-            write_podcast_wav_from_chunks(chunk_files, filename)
+            if not write_podcast_wav_from_chunks(chunk_files, filename):
+                raise RuntimeError("no generated podcast chunks")
+            job_store.update(job_id, status="done", output_path=filename, error=None)
+            if event_log:
+                event_log.record("podcast_job_done", job_id=job_id, output_path=filename)
     except Exception as e:
+        job_store.update(job_id, status="failed", error=str(e))
+        if event_log:
+            event_log.record("podcast_job_failed", job_id=job_id, error=str(e))
         print(f"[PodcastProcess] Error: {e}")
     finally:
         if os.path.exists(pending_file):
@@ -214,15 +248,24 @@ class PodcastService:
         podcast_chunk_dir: str,
         runtime_state: Any,
         active_url_tasks: dict[str, dict],
+        jobs_file: str | None = None,
+        event_log: RuntimeEventLog | None = None,
     ) -> None:
         self.podcasts_dir = podcasts_dir
         self.podcast_chunk_dir = podcast_chunk_dir
         self.runtime_state = runtime_state
         self.active_url_tasks = active_url_tasks
+        self.job_store = PodcastJobStore(
+            jobs_file
+            or os.path.join(os.path.dirname(self.podcast_chunk_dir), "podcast_jobs.json")
+        )
+        self.job_store.mark_unfinished_failed("backend restarted before job completed")
+        self.event_log = event_log
         self.pause_event = mp.Event()
         self.gpu_lock = mp.Lock()
         self.active_procs: list[mp.Process] = []
         self.active_tasks: dict[str, mp.Process] = {}
+        self.active_job_ids: dict[str, str] = {}
         threading.Thread(target=self._manager_loop, daemon=True).start()
 
     def _manager_loop(self) -> None:
@@ -244,20 +287,35 @@ class PodcastService:
             if should_pause:
                 if not self.pause_event.is_set():
                     self.pause_event.set()
+                    self._record_event("podcast_generation_paused")
             else:
                 if self.pause_event.is_set():
                     self.pause_event.clear()
+                    self._record_event("podcast_generation_resumed")
             time.sleep(2)
 
     def cleanup_finished(self) -> None:
         for md5, proc in list(self.active_tasks.items()):
             if not proc.is_alive():
+                job_id = self.active_job_ids.pop(md5, None)
+                if proc.exitcode not in (0, None):
+                    self.job_store.update(
+                        job_id,
+                        status="failed",
+                        error=f"process exited with code {proc.exitcode}",
+                    )
+                    self._record_event(
+                        "podcast_process_failed",
+                        md5=md5,
+                        job_id=job_id,
+                        exitcode=proc.exitcode,
+                    )
                 self.active_tasks.pop(md5, None)
         self.active_procs = [proc for proc in self.active_procs if proc.is_alive()]
 
     def is_generating(self, md5: str) -> bool:
         self.cleanup_finished()
-        return md5 in self.active_tasks
+        return md5 in self.active_tasks or self.job_store.active_for_md5(md5)
 
     def start_single(
         self,
@@ -269,6 +327,23 @@ class PodcastService:
         title: str | None,
     ) -> None:
         self.cleanup_finished()
+        safe_title = title if title else (text[:20].replace("\n", " ") + "...")
+        job_id = f"single_{md5[:12]}_{uuid.uuid4().hex[:8]}"
+        self.job_store.create(
+            job_id=job_id,
+            kind="single",
+            md5=md5,
+            title=safe_title,
+            source=source,
+        )
+        self._record_event(
+            "podcast_job_queued",
+            job_id=job_id,
+            kind="single",
+            md5=md5,
+            title=safe_title,
+            source=source,
+        )
         p = mp.Process(
             target=run_single_podcast_generation_thread,
             args=(
@@ -280,6 +355,9 @@ class PodcastService:
                 self.gpu_lock,
                 self.podcasts_dir,
                 self.podcast_chunk_dir,
+                self.job_store.path,
+                job_id,
+                self.event_log.path if self.event_log else None,
                 title,
             ),
             daemon=True,
@@ -287,6 +365,7 @@ class PodcastService:
         p.start()
         self.active_procs.append(p)
         self.active_tasks[md5] = p
+        self.active_job_ids[md5] = job_id
 
     def start_batch(
         self,
@@ -297,14 +376,41 @@ class PodcastService:
         md5: str,
     ) -> None:
         self.cleanup_finished()
+        job_id = f"batch_{md5[:12]}_{uuid.uuid4().hex[:8]}"
+        self.job_store.create(
+            job_id=job_id,
+            kind="batch",
+            md5=md5,
+            title="大合集播客",
+            source="web",
+            output_path=filename,
+        )
+        self._record_event(
+            "podcast_job_queued",
+            job_id=job_id,
+            kind="batch",
+            md5=md5,
+            output_path=filename,
+        )
         p = mp.Process(
             target=run_podcast_generation_thread,
-            args=(filename, text, config, self.pause_event, self.gpu_lock, self.podcast_chunk_dir),
+            args=(
+                filename,
+                text,
+                config,
+                self.pause_event,
+                self.gpu_lock,
+                self.podcast_chunk_dir,
+                self.job_store.path,
+                job_id,
+                self.event_log.path if self.event_log else None,
+            ),
             daemon=True,
         )
         p.start()
         self.active_procs.append(p)
         self.active_tasks[md5] = p
+        self.active_job_ids[md5] = job_id
 
     def cancel_all(self) -> None:
         for proc in self.active_procs:
@@ -315,6 +421,9 @@ class PodcastService:
                     pass
         self.active_procs.clear()
         self.active_tasks.clear()
+        self.active_job_ids.clear()
+        self.job_store.cancel_active()
+        self._record_event("podcast_jobs_canceled")
 
     def cleanup_pending_files(self) -> None:
         if not os.path.exists(self.podcasts_dir):
@@ -332,7 +441,12 @@ class PodcastService:
             "podcast_generation_paused": self.pause_event.is_set(),
             "on_battery_power": is_on_battery_power(),
             "active_podcast_processes": sum(1 for p in self.active_procs if p.is_alive()),
+            "podcast_jobs": self.job_store.list()[:20],
         }
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        self.cleanup_finished()
+        return self.job_store.list()
 
     def search_dirs(self) -> list[str]:
         base_dir = os.path.dirname(self.podcasts_dir)
@@ -462,3 +576,7 @@ class PodcastService:
             except Exception as e:
                 return {"error": f"Failed to delete file: {e}"}
         return {"error": "File not found"}
+
+    def _record_event(self, event: str, **fields: Any) -> None:
+        if self.event_log:
+            self.event_log.record(event, **fields)

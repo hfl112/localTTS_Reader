@@ -32,11 +32,14 @@ from core.services.podcast_service import PodcastService
 from core.services.performance import get_performance_profile
 from core.services.saved_items_service import SavedItemsService
 from core.services.cache_service import CacheService
+from core.services.runtime_log import RuntimeEventLog
 
 CACHE_DIR = os.path.join(BASE_DIR, "data", "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 PODCAST_CHUNK_DIR = os.path.join(BASE_DIR, "data", "podcast_chunks")
 os.makedirs(PODCAST_CHUNK_DIR, exist_ok=True)
+RUNTIME_EVENTS_FILE = os.path.join(BASE_DIR, "data", "runtime_events.jsonl")
+PODCAST_JOBS_FILE = os.path.join(BASE_DIR, "data", "podcast_jobs.json")
 
 # 终极同步信号：必须是字符串，确保跨进程一致
 GLOBAL_SENTINEL = "PIPELINE_END_STRICT_V1"
@@ -213,6 +216,7 @@ processor = TextProcessor()
 runtime_state = RuntimeState()
 saved_items_service = SavedItemsService(BASE_DIR)
 cache_service = CacheService(storage, CACHE_DIR, PODCASTS_DIR)
+event_log = RuntimeEventLog(RUNTIME_EVENTS_FILE)
 
 playback_service = PlaybackService(
     shared_state=S,
@@ -222,6 +226,7 @@ playback_service = PlaybackService(
     sentinel=GLOBAL_SENTINEL,
     get_text_hash=get_text_hash,
     get_performance_profile=get_performance_profile,
+    event_log=event_log,
 )
 
 def performance_monitor_thread():
@@ -269,10 +274,12 @@ def audio_feeder_thread():
                             wav_data = (np.clip(wav_data, -1.0, 1.0) * 32767).astype(np.int16)
                             scipy.io.wavfile.write(podcast_file, 24000, wav_data)
                             print(f"[Podcast] Saved to {podcast_file}")
+                            event_log.record("podcast_buffer_saved", output_path=podcast_file)
                             
                             saved_items_service.clear()
                     except Exception as e:
                         print(f"[Podcast] Error saving: {e}")
+                        event_log.record("podcast_buffer_save_failed", error=str(e))
                 else:
                     player.signal_end_of_article()
                 continue
@@ -317,6 +324,14 @@ async def read_text(data: dict = Body(...)):
     runtime_state.reset_podcast_generation()
     
     playback_session_id, new_task_id = playback_service.start_new_session()
+    event_log.record(
+        "read_requested",
+        source=source,
+        voice=voice,
+        text_chars=len(text),
+        session_id=playback_session_id,
+        task_id=new_task_id,
+    )
     
     state = storage.load_state()
     config = storage.load_config()
@@ -354,6 +369,7 @@ async def read_text(data: dict = Body(...)):
 
 @app.post("/stop")
 async def stop_read():
+    event_log.record("stop_requested")
     runtime_state.clear_current_media()
     runtime_state.reset_podcast_generation()
     
@@ -411,6 +427,10 @@ async def debug_state():
         "active_url_tasks": list(ACTIVE_URL_TASKS.keys()),
     }
 
+@app.get("/debug/events")
+async def debug_events(limit: int = 50):
+    return event_log.recent(limit=limit)
+
 @app.post("/pause")
 async def pause_playback():
     playback_service.pause()
@@ -434,6 +454,7 @@ async def restart_audio():
 @app.post("/seek")
 async def seek_playback(data: dict = Body(...)):
     direction = data.get("direction", 1) # 1 for next, -1 for prev
+    event_log.record("seek_requested", direction=direction)
     
     runtime_state.reset_podcast_generation()
     
@@ -480,6 +501,8 @@ podcast_service = PodcastService(
     podcast_chunk_dir=PODCAST_CHUNK_DIR,
     runtime_state=runtime_state,
     active_url_tasks=ACTIVE_URL_TASKS,
+    jobs_file=PODCAST_JOBS_FILE,
+    event_log=event_log,
 )
 
 @app.post("/read_url")
@@ -499,11 +522,21 @@ async def read_url(payload: dict = Body(...)) -> dict:
     if not url: return {"error": "Empty URL"}
         
     current_time = time.time()
-    ACTIVE_URL_TASKS = {u: t for u, t in ACTIVE_URL_TASKS.items() if current_time - t["timestamp"] < 60}
+    for task_url, task_info in list(ACTIVE_URL_TASKS.items()):
+        if current_time - task_info["timestamp"] >= 60:
+            ACTIVE_URL_TASKS.pop(task_url, None)
     if url in ACTIVE_URL_TASKS:
         return {"status": "error", "message": "该网页正处于后台解析抓取中，请不要重复点击，稍候可在下方收藏列表中查看！"}
         
     ACTIVE_URL_TASKS[url] = {"timestamp": current_time, "is_podcast": podcast}
+    event_log.record(
+        "read_url_dispatched",
+        url=url,
+        mode=mode,
+        save=save,
+        podcast=podcast,
+        has_uploaded_html=bool(html),
+    )
     
     cli_path = os.path.join(os.path.dirname(BASE_DIR), "URL-Reader", "read_url_cli.py")
     cmd = [sys.executable, cli_path, url]
@@ -538,6 +571,7 @@ async def read_url(payload: dict = Body(...)) -> dict:
             await proc.wait()
         finally:
             ACTIVE_URL_TASKS.pop(url, None)
+            event_log.record("read_url_finished", url=url)
             if temp_html_path and os.path.exists(temp_html_path):
                 try: os.remove(temp_html_path)
                 except: pass
@@ -556,6 +590,10 @@ async def delete_saved(data: dict = Body(...)):
 @app.get("/podcasts/list")
 async def list_podcasts():
     return podcast_service.list_files()
+
+@app.get("/podcasts/jobs")
+async def list_podcast_jobs():
+    return podcast_service.list_jobs()
 
 @app.post("/podcasts/toggle_pin")
 async def toggle_pin(data: dict = Body(...)):
@@ -579,6 +617,7 @@ async def play_podcast(data: dict = Body(...)):
     if not filepath:
         return {"error": "File not found"}
     
+    event_log.record("podcast_play_requested", filename=filename, filepath=filepath)
     playback_service.play_wav_file(filepath, filename)
     return {"status": "ok"}
 
@@ -592,6 +631,7 @@ async def save_for_later(data: dict = Body(...)):
     if not text: return {"error": "Empty text"}
     
     count = saved_items_service.save(text, source, voice, title)
+    event_log.record("saved_item_added", source=source, voice=voice, title=title, text_chars=len(text))
     return {"status": "saved", "count": count}
 
 @app.post("/generate_single_podcast")
@@ -620,6 +660,14 @@ async def generate_single_podcast(data: dict = Body(...)):
         md5=md5_val,
         source=source,
         title=title,
+    )
+    event_log.record(
+        "single_podcast_requested",
+        md5=md5_val,
+        source=source,
+        voice=voice,
+        title=title,
+        text_chars=len(text),
     )
     
     return {"status": "generating", "md5": md5_val}
@@ -656,6 +704,13 @@ async def generate_podcast_api():
         text=text,
         config=config,
         md5=md5_val,
+    )
+    event_log.record(
+        "batch_podcast_requested",
+        md5=md5_val,
+        filename=filename,
+        item_count=len(saved_items),
+        text_chars=len(text),
     )
     
     saved_items_service.clear()

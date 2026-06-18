@@ -89,6 +89,7 @@ class PlaybackService:
         sentinel: str,
         get_text_hash: Callable[[str], str],
         get_performance_profile: Callable[[str | None], dict[str, Any]],
+        event_log: Any | None = None,
     ) -> None:
         self.shared_state = shared_state
         self.player = player
@@ -97,25 +98,35 @@ class PlaybackService:
         self.sentinel = sentinel
         self.get_text_hash = get_text_hash
         self.get_performance_profile = get_performance_profile
+        self.event_log = event_log
         self.controller = PlaybackController(shared_state, player)
 
     def start_new_session(self) -> tuple[int, int]:
-        return self.controller.start_new_session()
+        session_id, task_id = self.controller.start_new_session()
+        self._record_event("playback_session_started", session_id=session_id, task_id=task_id)
+        return session_id, task_id
 
     def stop_current_session(self) -> None:
         self.controller.stop_current_session()
+        self._record_event(
+            "playback_session_stopped",
+            current_task_id=self.shared_state.current_task_id.value,
+        )
 
     def snapshot(self) -> dict[str, Any]:
         return self.controller.snapshot()
 
     def pause(self) -> None:
         self.player.pause()
+        self._record_event("playback_paused")
 
     def resume(self) -> None:
         self.player.resume()
+        self._record_event("playback_resumed")
 
     def restart_device(self) -> None:
         self.player.restart_device()
+        self._record_event("audio_device_restarted")
 
     def start_tts_thread(
         self,
@@ -133,6 +144,14 @@ class PlaybackService:
             args=(session_id, task_id, start_idx, chunks, config, state, is_podcast),
             daemon=True,
         ).start()
+        self._record_event(
+            "tts_thread_started",
+            session_id=session_id,
+            task_id=task_id,
+            start_idx=start_idx,
+            chunk_count=len(chunks),
+            is_podcast=is_podcast,
+        )
 
     def play_wav_file(self, filepath: str, filename: str) -> None:
         self.runtime_state.set_main(
@@ -143,6 +162,13 @@ class PlaybackService:
         self.runtime_state.set_current_media(podcast=filename, md5=None)
         session_id, task_id = self.start_new_session()
         self.runtime_state.reset_podcast_generation()
+        self._record_event(
+            "wav_playback_started",
+            session_id=session_id,
+            task_id=task_id,
+            filename=filename,
+            filepath=filepath,
+        )
         threading.Thread(
             target=self._play_wav_thread,
             args=(filepath, session_id, task_id),
@@ -210,6 +236,12 @@ class PlaybackService:
                     self.player.wait_until_finished()
                     self.runtime_state.set_main(is_playing=False)
                 self.shared_state.set_status("IDLE")
+            self._record_event(
+                "tts_thread_finished",
+                session_id=session_id,
+                task_id=task_id,
+                is_current=self.controller.is_current(session_id, task_id),
+            )
 
     def _play_wav_thread(self, path: str, session_id: int, task_id: int) -> None:
         try:
@@ -243,6 +275,22 @@ class PlaybackService:
                 self.player.signal_end_of_article()
         except Exception as e:
             print(f"[WavPlayer] Error: {e}")
+            self._record_event(
+                "wav_playback_failed",
+                session_id=session_id,
+                task_id=task_id,
+                error=str(e),
+            )
         finally:
             if self.controller.can_feed_audio(session_id, task_id):
                 self.runtime_state.set_main(is_playing=False)
+            self._record_event(
+                "wav_playback_finished",
+                session_id=session_id,
+                task_id=task_id,
+                is_current=self.controller.is_current(session_id, task_id),
+            )
+
+    def _record_event(self, event: str, **fields: Any) -> None:
+        if self.event_log:
+            self.event_log.record(event, **fields)

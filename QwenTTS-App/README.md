@@ -43,6 +43,8 @@ PCMPlayer(sounddevice/CoreAudio)
 | `core/state/runtime_state.py` | 当前标题、进度、播放状态、当前播客、播客 buffer 等运行态 |
 | `core/services/playback_service.py` | `PlaybackController` + `PlaybackService`；统一管理播放 session、task id、队列清理、TTS/WAV 播放 |
 | `core/services/podcast_service.py` | 后台播客生成、GPU 独占锁、暂停调度、chunk 断点、播客文件管理 |
+| `core/services/podcast_jobs.py` | `podcast_jobs.json` 任务状态持久化，记录 queued/running/done/failed/canceled |
+| `core/services/runtime_log.py` | `runtime_events.jsonl` 结构化事件日志，记录播放、URL、播客任务和错误事件 |
 | `core/services/performance.py` | `fast`、`balanced`、`quiet` 三档性能 profile 与阅读时长估算 |
 | `core/services/saved_items_service.py` | `data/saved_for_later.json` 的增删查清理 |
 | `core/services/cache_service.py` | 临时音频缓存元数据、播放、导出、删除和清空 |
@@ -58,6 +60,7 @@ PCMPlayer(sounddevice/CoreAudio)
 - `GLOBAL_SENTINEL = "PIPELINE_END_STRICT_V1"` 必须保持字符串，保证 `mp.Queue` 跨进程序列化稳定。
 - 实时朗读默认 `balanced`；后台 podcast 默认 `quiet`；长单篇和合集 podcast 优先使用 `Qwen3-TTS-0.6B` 降温。
 - `PodcastService` 是后台 podcast 进程、暂停事件、GPU 锁和 chunk checkpoint 的唯一 owner。
+- `podcast_jobs.json` 是后台 podcast 任务的状态快照；`runtime_events.jsonl` 是排查串台、静音、任务残留和过热暂停的事件历史。
 - `PCMPlayer` 只在主进程初始化，推理子进程不要加载 CoreAudio 设备。
 
 ## 常用接口
@@ -65,9 +68,9 @@ PCMPlayer(sounddevice/CoreAudio)
 - 播放控制：`POST /read`、`POST /stop`、`POST /pause`、`POST /resume`、`POST /seek`、`POST /restart_audio`
 - URL 任务：`POST /read_url`
 - 稍后朗读：`POST /save_for_later`、`GET /saved_items`、`POST /play_saved`、`POST /delete_saved`、`POST /saved_items/clear`
-- 播客：`POST /generate_single_podcast`、`POST /generate_podcast`、`GET /podcasts/list`、`POST /podcasts/play`、`POST /podcasts/delete`、`POST /podcasts/toggle_pin`、`POST /podcasts/clear`
+- 播客：`POST /generate_single_podcast`、`POST /generate_podcast`、`GET /podcasts/list`、`GET /podcasts/jobs`、`POST /podcasts/play`、`POST /podcasts/delete`、`POST /podcasts/toggle_pin`、`POST /podcasts/clear`
 - 缓存：`GET /cache/items`、`POST /cache/play`、`POST /cache/export`、`POST /cache/delete`、`POST /cache/clear`
-- 诊断：`GET /status`、`GET /debug/state`
+- 诊断：`GET /status`、`GET /debug/state`、`GET /debug/events?limit=50`
 
 ## 运行文件
 
@@ -76,6 +79,8 @@ QwenTTS-App/data/
 ├── config.json
 ├── state.json
 ├── saved_for_later.json
+├── podcast_jobs.json
+├── runtime_events.jsonl
 ├── cache/*.npy
 └── podcast_chunks/*/chunk_*.npy
 
@@ -83,7 +88,7 @@ QwenTTS-App/data/
 └── podcast_*.wav
 ```
 
-`data/cache/` 是临时朗读缓存；根目录 `podcasts/` 是用户可保留的成品音频；`data/podcast_chunks/` 是长播客分段 checkpoint。
+`data/cache/` 是临时朗读缓存；根目录 `podcasts/` 是用户可保留的成品音频；`data/podcast_chunks/` 是长播客分段 checkpoint；`podcast_jobs.json` 记录后台任务当前状态；`runtime_events.jsonl` 记录最近运行事件。
 
 ## 验证命令
 
