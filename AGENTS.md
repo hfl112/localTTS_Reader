@@ -63,6 +63,7 @@ python -m mlx_audio.server                # Web UI + API (port 8000)
 | `core/services/podcast_service.py` | Background podcast generation processes, pause manager, GPU lock, chunk checkpoints, and podcast file list/delete/pin/clear |
 | `core/services/podcast_jobs.py` | File-backed `podcast_jobs.json` store for queued/running/done/failed/canceled podcast jobs |
 | `core/services/runtime_log.py` | Append-only `runtime_events.jsonl` structured event log for playback, URL, podcast, and error diagnostics |
+| `core/services/url_jobs.py` | File-backed `url_jobs.json` store for URL fetch/parse/Gemini/dispatch job status |
 | `core/services/performance.py` | `fast`/`balanced`/`quiet` profiles plus reading-time estimation |
 | `core/services/saved_items_service.py` | Saved-for-later JSON queue backed by `data/saved_for_later.json` |
 | `core/services/cache_service.py` | Cache metadata/list/play/export/delete/clear helpers for `data/cache/*.npy` and exported WAVs |
@@ -75,11 +76,12 @@ python -m mlx_audio.server                # Web UI + API (port 8000)
 **IPC**: `mp.Queue` for text/audio, `mp.Event` for stop, `mp.Value` for status (IDLE/BUSY/COOLING).
 **Playback controller**: `PlaybackService` owns `PlaybackController` plus `S.current_task_id` to invalidate stale TTS and WAV playback threads. Any new playback entrypoint must go through `playback_service.start_new_session()` or `stop_current_session()`, then only feed audio while `playback_service.controller.can_feed_audio(session_id, task_id)` remains true.
 **API request schemas**: Define new endpoint request bodies in `core/api_models.py` with Pydantic models. Avoid adding new loose `dict = Body(...)` parsing in `backend.py`.
+**URL input pipeline**: `/read_url` calls `URL-Reader/reader_service.py` directly from a backend async task. `read_url_cli.py` is only a thin manual CLI wrapper; do not reintroduce per-request CLI subprocess dispatch.
 **Performance profiles**: `fast`, `balanced`, and `quiet` live in `core/services/performance.py`. Realtime reading defaults to `balanced`; podcast generation defaults to `quiet`; long single podcasts and all batch podcasts should prefer `Qwen3-TTS-0.6B`.
 **Audio cache**: 10 `.npy` files in `QwenTTS-App/data/cache/`, MD5-keyed, LRU by mtime.
 **Sentinel**: string `"PIPELINE_END_STRICT_V1"` shared by inference worker and player (must remain a `str` to survive `mp.Queue` pickling).
 **Cruise mode**: realtime inference uses profile-specific buffer high/low watermarks (`balanced`: 20s/8s, `quiet`: 10s/4s, `fast`: 30s/12s) to cool the GPU.
-**Runtime files** under `QwenTTS-App/data/`: `config.json`, `state.json`, `cache/*.npy`, `podcast_chunks/*/chunk_*.npy`, `saved_for_later.json` (max 5 items), `podcast_jobs.json`, `runtime_events.jsonl`. Finished podcast WAVs live in the repo-level `podcasts/` directory.
+**Runtime files** under `QwenTTS-App/data/`: `config.json`, `state.json`, `cache/*.npy`, `podcast_chunks/*/chunk_*.npy`, `saved_for_later.json` (max 5 items), `podcast_jobs.json`, `url_jobs.json`, `runtime_events.jsonl`. Finished podcast WAVs live in the repo-level `podcasts/` directory.
 
 ## Default TTS config
 
@@ -99,6 +101,7 @@ performance_profile: balanced           (alts: fast, quiet; podcast defaults to 
 Standard playback endpoints (`/read`, `/status`, `/stop`, `/pause`, `/resume`, `/seek`, `/restart_audio`) are obvious from the menu callbacks in `app.py`. The non-obvious ones:
 
 - `POST /save_for_later` / `GET /saved_items` / `POST /play_saved` / `POST /delete_saved` / `POST /saved_items/clear` — saved-items queue backed by `data/saved_for_later.json` (max 5, FIFO).
+- `POST /read_url` / `GET /url_jobs` — URL input pipeline backed by `URL-Reader/reader_service.py`, `URL-Reader/cache/`, and `data/url_jobs.json`.
 - `POST /generate_single_podcast` — starts one background podcast process for a single text item → repo-level `podcasts/podcast_单篇_{source}_{title}_{hash}_{ts}.wav` (24kHz int16).
 - `POST /generate_podcast` — concatenates all saved items → repo-level `podcasts/podcast_合集_web_大合集播客_{ts}.wav` (24kHz int16).
 - `GET /podcasts/list` / `GET /podcasts/jobs` / `POST /podcasts/play` / `POST /podcasts/delete` / `POST /podcasts/toggle_pin` / `POST /podcasts/clear` — finished podcast file and job operations owned by `PodcastService`.
@@ -120,4 +123,4 @@ Standard playback endpoints (`/read`, `/status`, `/stop`, `/pause`, `/resume`, `
 - No mypy, no ruff — only Black + isort
 - CI order: `pre-commit run --all-files` → core tests → modular tests
 - Core tests under `mlx_audio/tests/` may require model weights on disk
-- QwenTTS-App service smoke tests: `python -m pytest -q QwenTTS-App/core/tests/test_services_smoke.py` (covers service basics, API model defaults, podcast job store, runtime event log, and playback session invalidation)
+- QwenTTS-App service smoke tests: `python -m pytest -q QwenTTS-App/core/tests/test_services_smoke.py` (covers service basics, API model defaults, podcast/url job stores, runtime event log, reader helpers, and playback session invalidation)

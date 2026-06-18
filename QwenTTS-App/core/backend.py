@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 import traceback
 import signal
+import uuid
 
 # 确保能找到 core 目录
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,6 +45,7 @@ from core.services.performance import get_performance_profile
 from core.services.saved_items_service import SavedItemsService
 from core.services.cache_service import CacheService
 from core.services.runtime_log import RuntimeEventLog
+from core.services.url_jobs import UrlJobStore
 
 CACHE_DIR = os.path.join(BASE_DIR, "data", "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -51,6 +53,7 @@ PODCAST_CHUNK_DIR = os.path.join(BASE_DIR, "data", "podcast_chunks")
 os.makedirs(PODCAST_CHUNK_DIR, exist_ok=True)
 RUNTIME_EVENTS_FILE = os.path.join(BASE_DIR, "data", "runtime_events.jsonl")
 PODCAST_JOBS_FILE = os.path.join(BASE_DIR, "data", "podcast_jobs.json")
+URL_JOBS_FILE = os.path.join(BASE_DIR, "data", "url_jobs.json")
 
 # 终极同步信号：必须是字符串，确保跨进程一致
 GLOBAL_SENTINEL = "PIPELINE_END_STRICT_V1"
@@ -228,6 +231,8 @@ runtime_state = RuntimeState()
 saved_items_service = SavedItemsService(BASE_DIR)
 cache_service = CacheService(storage, CACHE_DIR, PODCASTS_DIR)
 event_log = RuntimeEventLog(RUNTIME_EVENTS_FILE)
+url_job_store = UrlJobStore(URL_JOBS_FILE)
+url_job_store.mark_unfinished_failed("backend restarted before URL job completed")
 
 playback_service = PlaybackService(
     shared_state=S,
@@ -526,6 +531,7 @@ async def read_url(payload: ReadUrlRequest) -> dict:
     mode = payload.effective_mode()
     save = payload.save
     podcast = payload.podcast
+    action = payload.action()
     if not url: return {"error": "Empty URL"}
         
     current_time = time.time()
@@ -535,56 +541,94 @@ async def read_url(payload: ReadUrlRequest) -> dict:
     if url in ACTIVE_URL_TASKS:
         return {"status": "error", "message": "该网页正处于后台解析抓取中，请不要重复点击，稍候可在下方收藏列表中查看！"}
         
-    ACTIVE_URL_TASKS[url] = {"timestamp": current_time, "is_podcast": podcast}
-    event_log.record(
-        "read_url_dispatched",
+    job_id = f"url_{uuid.uuid4().hex[:12]}"
+    ACTIVE_URL_TASKS[url] = {"timestamp": current_time, "is_podcast": podcast, "job_id": job_id}
+    url_job_store.create(
+        job_id=job_id,
         url=url,
         mode=mode,
-        save=save,
-        podcast=podcast,
+        action=action,
+        has_html=bool(html),
+    )
+    event_log.record(
+        "read_url_dispatched",
+        job_id=job_id,
+        url=url,
+        mode=mode,
+        action=action,
         has_uploaded_html=bool(html),
     )
-    
-    cli_path = os.path.join(os.path.dirname(BASE_DIR), "URL-Reader", "read_url_cli.py")
-    cmd = [sys.executable, cli_path, url]
-    
-    # Save uploaded HTML to temporary file if available
-    temp_html_path = None
-    if html:
-        try:
-            import tempfile
-            import uuid
-            temp_dir = tempfile.gettempdir()
-            temp_html_path = os.path.join(temp_dir, f"qwentts_upload_{uuid.uuid4().hex}.html")
-            with open(temp_html_path, "w", encoding="utf-8") as f:
-                f.write(html)
-            cmd.extend(["--html-file", temp_html_path])
-        except Exception as e:
-            print(f"[Backend] Failed to save uploaded HTML: {e}")
-            
-    if mode == "translate":
-        cmd.append("-t")
-    elif mode == "podcast-trans":
-        cmd.append("-pt")
-    elif mode == "podcast-discuss":
-        cmd.append("-pd")
-        
-    if save: cmd.append("--save")
-    if podcast: cmd.append("--podcast")
-    
+
     async def run_cli_task():
         try:
-            proc = await asyncio.create_subprocess_exec(*cmd)
-            await proc.wait()
+            url_job_store.update(job_id, status="running", stage="starting")
+
+            def update_stage(stage: str, fields: dict) -> None:
+                url_job_store.update(job_id, status="running", stage=stage, **fields)
+                event_log.record("url_job_stage", job_id=job_id, url=url, stage=stage, **fields)
+
+            reader_dir = os.path.join(os.path.dirname(BASE_DIR), "URL-Reader")
+            if reader_dir not in sys.path:
+                sys.path.append(reader_dir)
+            from reader_service import process_url_job
+
+            result = await asyncio.to_thread(
+                process_url_job,
+                url=url,
+                html=html,
+                mode=mode,
+                base_dir=reader_dir,
+                cache_dir=os.path.join(reader_dir, "cache"),
+                stage_callback=update_stage,
+            )
+            url_job_store.update(
+                job_id,
+                status="dispatching",
+                stage="dispatching",
+                title=result.title,
+                source=result.source,
+                text_chars=len(result.text),
+                from_cache=result.from_cache,
+                error=None,
+            )
+
+            if podcast:
+                await generate_single_podcast(
+                    GenerateSinglePodcastRequest(
+                        text=result.text,
+                        source=result.source,
+                        voice=result.voice,
+                        title=result.title,
+                    )
+                )
+            elif save:
+                await save_for_later(
+                    SaveForLaterRequest(
+                        text=result.text,
+                        source=result.source,
+                        voice=result.voice,
+                        title=result.title,
+                    )
+                )
+            else:
+                await read_text(
+                    ReadRequest(text=result.text, source=result.source, voice=result.voice)
+                )
+
+            url_job_store.update(job_id, status="done", stage="done", error=None)
+            event_log.record("read_url_finished", job_id=job_id, url=url, action=action)
+        except Exception as e:
+            url_job_store.update(job_id, status="failed", stage="failed", error=str(e))
+            event_log.record("read_url_failed", job_id=job_id, url=url, error=str(e))
         finally:
             ACTIVE_URL_TASKS.pop(url, None)
-            event_log.record("read_url_finished", url=url)
-            if temp_html_path and os.path.exists(temp_html_path):
-                try: os.remove(temp_html_path)
-                except: pass
             
     asyncio.create_task(run_cli_task())
-    return {"status": "ok", "message": "Read URL task dispatched"}
+    return {"status": "ok", "job_id": job_id, "message": "Read URL task dispatched"}
+
+@app.get("/url_jobs")
+async def list_url_jobs():
+    return url_job_store.list()
 
 @app.post("/delete_saved")
 async def delete_saved(data: DeleteSavedRequest):

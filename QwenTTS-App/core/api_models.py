@@ -26,6 +26,13 @@ class ReadUrlRequest(BaseModel):
             return "translate"
         return self.mode
 
+    def action(self) -> str:
+        if self.podcast:
+            return "podcast"
+        if self.save:
+            return "save"
+        return "read"
+
 
 class DeleteSavedRequest(BaseModel):
     md5: str | None = None

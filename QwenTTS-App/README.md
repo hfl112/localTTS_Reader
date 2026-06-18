@@ -46,6 +46,7 @@ PCMPlayer(sounddevice/CoreAudio)
 | `core/services/podcast_service.py` | 后台播客生成、GPU 独占锁、暂停调度、chunk 断点、播客文件管理 |
 | `core/services/podcast_jobs.py` | `podcast_jobs.json` 任务状态持久化，记录 queued/running/done/failed/canceled |
 | `core/services/runtime_log.py` | `runtime_events.jsonl` 结构化事件日志，记录播放、URL、播客任务和错误事件 |
+| `core/services/url_jobs.py` | `url_jobs.json` URL 抓取/清洗/Gemini/分发任务状态持久化 |
 | `core/services/performance.py` | `fast`、`balanced`、`quiet` 三档性能 profile 与阅读时长估算 |
 | `core/services/saved_items_service.py` | `data/saved_for_later.json` 的增删查清理 |
 | `core/services/cache_service.py` | 临时音频缓存元数据、播放、导出、删除和清空 |
@@ -63,12 +64,13 @@ PCMPlayer(sounddevice/CoreAudio)
 - 实时朗读默认 `balanced`；后台 podcast 默认 `quiet`；长单篇和合集 podcast 优先使用 `Qwen3-TTS-0.6B` 降温。
 - `PodcastService` 是后台 podcast 进程、暂停事件、GPU 锁和 chunk checkpoint 的唯一 owner。
 - `podcast_jobs.json` 是后台 podcast 任务的状态快照；`runtime_events.jsonl` 是排查串台、静音、任务残留和过热暂停的事件历史。
+- `/read_url` 直接调用 `URL-Reader/reader_service.py`，不要再绕回 `read_url_cli.py` 子进程；CLI 只保留手工调试入口。
 - `PCMPlayer` 只在主进程初始化，推理子进程不要加载 CoreAudio 设备。
 
 ## 常用接口
 
 - 播放控制：`POST /read`、`POST /stop`、`POST /pause`、`POST /resume`、`POST /seek`、`POST /restart_audio`
-- URL 任务：`POST /read_url`
+- URL 任务：`POST /read_url`、`GET /url_jobs`
 - 稍后朗读：`POST /save_for_later`、`GET /saved_items`、`POST /play_saved`、`POST /delete_saved`、`POST /saved_items/clear`
 - 播客：`POST /generate_single_podcast`、`POST /generate_podcast`、`GET /podcasts/list`、`GET /podcasts/jobs`、`POST /podcasts/play`、`POST /podcasts/delete`、`POST /podcasts/toggle_pin`、`POST /podcasts/clear`
 - 缓存：`GET /cache/items`、`POST /cache/play`、`POST /cache/export`、`POST /cache/delete`、`POST /cache/clear`
@@ -82,6 +84,7 @@ QwenTTS-App/data/
 ├── state.json
 ├── saved_for_later.json
 ├── podcast_jobs.json
+├── url_jobs.json
 ├── runtime_events.jsonl
 ├── cache/*.npy
 └── podcast_chunks/*/chunk_*.npy
@@ -90,7 +93,7 @@ QwenTTS-App/data/
 └── podcast_*.wav
 ```
 
-`data/cache/` 是临时朗读缓存；根目录 `podcasts/` 是用户可保留的成品音频；`data/podcast_chunks/` 是长播客分段 checkpoint；`podcast_jobs.json` 记录后台任务当前状态；`runtime_events.jsonl` 记录最近运行事件。
+`data/cache/` 是临时朗读缓存；根目录 `podcasts/` 是用户可保留的成品音频；`data/podcast_chunks/` 是长播客分段 checkpoint；`podcast_jobs.json` 记录后台 podcast 任务当前状态；`url_jobs.json` 记录 URL 输入管线任务状态；`runtime_events.jsonl` 记录最近运行事件。
 
 ## 验证命令
 

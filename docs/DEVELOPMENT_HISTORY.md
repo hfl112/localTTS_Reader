@@ -254,4 +254,17 @@
 *   **验证结果**：`python -m py_compile ...` 通过；`python -m pytest -q QwenTTS-App/core/tests/test_services_smoke.py` → `8 passed`。
 
 ---
-**当前状态**: 🏆 服务层架构 + Pydantic 请求模型 + PlaybackService 播放隔离 + PodcastService 后台生成 + runtime event log + podcast_jobs.json + 8 个 smoke tests，长文/长播客的串台、发热、任务残留和接口漂移风险都已进入可控状态 | **负责人**: Codex
+
+## 📅 第十七阶段：URL 输入管线服务化、任务状态与缓存 (2026-06-18)
+*   **目标**：整理 `URL-Reader/extension` 这个输入限速点，减少每次 URL 处理的子进程开销，让网页抓取、正文清洗、Gemini 处理和分发状态可追踪、可缓存。
+*   **核心改动**：
+    1.  **reader_service.py**：新增 `URL-Reader/reader_service.py`，把网页抓取、上传 HTML 清洗、YouTube 字幕、Defuddle、Gemini 处理、标题/voice/source 推断统一成可复用 service。
+    2.  **CLI 薄壳化**：`read_url_cli.py` 改为只解析命令行参数并调用 `reader_service.py`，不再维护第二份抓取/清洗/Gemini 逻辑。
+    3.  **后端直连 service**：`/read_url` 不再 `create_subprocess_exec` 拉起 CLI，而是在后台 async task 中直接调用 `reader_service.process_url_job()`，完成后分发到 `/read`、`/save_for_later` 或 `/generate_single_podcast`。
+    4.  **URL job 状态**：新增 `core/services/url_jobs.py` 和 `QwenTTS-App/data/url_jobs.json`，记录 `queued/running/done/failed` 与 `fetching/parsing/gemini/dispatching` 阶段；新增 `GET /url_jobs`。
+    5.  **URL/Gemini 缓存**：新增 `URL-Reader/cache/`，缓存清洗后的 source markdown 和按 mode 缓存的 Gemini 结果，减少重复处理同一网页。
+    6.  **测试补充**：smoke tests 扩展到 10 个，覆盖 URL job store、reader helper、API action 优先级。
+*   **验证结果**：`python -m py_compile ...` 通过；`python -m pytest -q QwenTTS-App/core/tests/test_services_smoke.py` → `10 passed`。
+
+---
+**当前状态**: 🏆 服务层架构 + Pydantic 请求模型 + PlaybackService 播放隔离 + PodcastService 后台生成 + URL reader service + runtime event log + podcast_jobs/url_jobs + 10 个 smoke tests，长文/长播客与网页输入管线的串台、发热、任务残留、接口漂移和重复处理风险都已进入可控状态 | **负责人**: Codex

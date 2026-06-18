@@ -6,6 +6,9 @@ import multiprocessing as mp
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+URL_READER_ROOT = os.path.abspath(os.path.join(ROOT, "..", "URL-Reader"))
+if URL_READER_ROOT not in sys.path:
+    sys.path.insert(0, URL_READER_ROOT)
 
 from core.api_models import (
     GenerateSinglePodcastRequest,
@@ -19,7 +22,9 @@ from core.services.podcast_service import PodcastService
 from core.services.podcast_jobs import PodcastJobStore
 from core.services.runtime_log import RuntimeEventLog
 from core.services.playback_service import PlaybackController
+from core.services.url_jobs import UrlJobStore
 from core.state.runtime_state import RuntimeState
+from reader_service import cache_key, title_for_mode
 
 
 def test_performance_profile_defaults_to_balanced():
@@ -137,6 +142,9 @@ def test_api_models_keep_backward_compatible_defaults():
 
     read_url = ReadUrlRequest(url="https://example.com", translate=True)
     assert read_url.effective_mode() == "translate"
+    assert read_url.action() == "read"
+    assert ReadUrlRequest(url="x", save=True).action() == "save"
+    assert ReadUrlRequest(url="x", save=True, podcast=True).action() == "podcast"
 
     podcast = GenerateSinglePodcastRequest(text="hello")
     assert podcast.source == "web"
@@ -180,3 +188,28 @@ def test_playback_controller_invalidates_old_sessions():
     controller.stop_current_session()
     assert not controller.can_feed_audio(second_session, second_task)
     assert shared_state.stop_event.is_set()
+
+
+def test_url_job_store_round_trip():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = UrlJobStore(os.path.join(tmp, "url_jobs.json"))
+        store.create(
+            job_id="url-1",
+            url="https://example.com",
+            mode="podcast-discuss",
+            action="podcast",
+            has_html=True,
+        )
+        store.update("url-1", status="running", stage="gemini", text_chars=120)
+        assert store.list()[0]["stage"] == "gemini"
+        assert store.list()[0]["text_chars"] == 120
+
+        store.mark_unfinished_failed("restart")
+        assert store.list()[0]["status"] == "failed"
+        assert store.list()[0]["stage"] == "interrupted"
+
+
+def test_reader_service_helpers_are_stable():
+    assert cache_key("a", "bc") != cache_key("ab", "c")
+    assert title_for_mode("translate", "Title") == "[中文翻译]Title"
+    assert title_for_mode("original", "Title") == "Title"

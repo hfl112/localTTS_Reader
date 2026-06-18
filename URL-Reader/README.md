@@ -2,7 +2,7 @@
 
 本模块是 QwenTTS 生态中专门用于 **“输入网页 URL，自动抓取、净化正文并一键朗读”** 的核心控制与测试工具。它将重型的网页提取、WAF 绕过、正文去噪逻辑留在本地 Python 侧，直接利用正在运行的 macOS 状态栏应用进行语音播放。
 
-当前 CLI 已经不仅是网页朗读器，也承担网页转中文、双人播客脚本生成、稍后朗读保存、单篇播客后台生成和浏览器上传 HTML 解析等入口职责。
+当前 URL-Reader 已拆成两层：`reader_service.py` 是可被 QwenTTS-App 后端直接调用的输入管线；`read_url_cli.py` 只是手工调试用的命令行壳。浏览器插件触发 `/read_url` 时不再每次拉起 CLI 子进程。
 
 ---
 
@@ -19,7 +19,7 @@
       ↓
  调用 defuddle 净化 ──> 提取干净的 Markdown 格式文章正文 (去除广告、边栏、导航栏)
       ↓
- Gemini 处理模式 (可选：翻译 / 双人翻译 / 双人总结)
+ reader_service 缓存与 Gemini 处理模式 (可选：翻译 / 双人翻译 / 双人总结)
       ↓
  投喂给 QwenTTS-App (8001端口) ──> service 层分发到朗读、稍后朗读或后台播客生成
 ```
@@ -34,13 +34,18 @@
    * `POST /read`：直接朗读当前正文。
    * `POST /save_for_later`：保存到 QwenTTS-App 的“稍后朗读”列表。
    * `POST /generate_single_podcast`：启动后台单篇 podcast 生成，成品写入项目根目录 `podcasts/`。
+4. **缓存与任务状态**：
+   * `URL-Reader/cache/source_{hash}.md`：缓存抓取/清洗后的正文。
+   * `URL-Reader/cache/{mode}_{hash}.md`：缓存 Gemini 翻译、双人翻译或双人总结结果。
+   * `QwenTTS-App/data/url_jobs.json`：记录 URL 任务 `queued/running/done/failed` 和 `fetching/parsing/gemini/dispatching` 阶段。
 
 ---
 
 ## 📂 2. 文件结构与分工
 
 * **控制说明文档**：[README.md](file:///Users/funanhe/00_MyCode/TTS/URL-Reader/README.md)（本文件）
-* **独立命令行测试工具**：[read_url_cli.py](file:///Users/funanhe/00_MyCode/TTS/URL-Reader/read_url_cli.py)（包含完整 Type Hints 的 Python 控制脚本）
+* **可复用输入管线**：[reader_service.py](file:///Users/funanhe/00_MyCode/TTS/URL-Reader/reader_service.py)
+* **独立命令行测试工具**：[read_url_cli.py](file:///Users/funanhe/00_MyCode/TTS/URL-Reader/read_url_cli.py)（薄 CLI 壳，复用 `reader_service.py`）
 
 ---
 
@@ -98,7 +103,7 @@ python read_url_cli.py 'https://aeon.co/essays/why-did-measuring-earths-true-sha
 1. **保存临时源码**：脚本将抓取净化的原始网页正文写入 `temp_source.md`。
 2. **AI 智能处理**：除 `--original` 外，脚本会调用 [gemini_engine.py](file:///Users/funanhe/00_MyCode/TTS/URL-Reader/gemini_engine.py) 执行中文翻译、双人翻译或双人总结。
 3. **保存处理结果**：将处理后的正文写入 `temp_translated.md`。
-4. **投喂本地服务**：根据参数调用 `QwenTTS-App` 的 `/read`、`/save_for_later` 或 `/generate_single_podcast`。
+4. **投喂本地服务**：CLI 模式下根据参数调用 `QwenTTS-App` 的 `/read`、`/save_for_later` 或 `/generate_single_podcast`；后端 `/read_url` 模式下则直接在进程内分发到对应 endpoint。
 
 ## 4. 模式参数速查
 

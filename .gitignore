@@ -30,6 +30,8 @@ wheels/
 
 # Logs & Data
 *.log
+*.jsonl
+*.lock
 QwenTTS-App/data/*.json
 !QwenTTS-App/data/.gitkeep
 
@@ -44,4 +46,5 @@ qwen-tts-extension-backup-pcm/
 QwenTTS-App/data/cache/
 QwenTTS-App/data/exported/
 QwenTTS-App/data/podcasts/
+URL-Reader/cache/
 podcasts/
