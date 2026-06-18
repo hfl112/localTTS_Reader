@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 import traceback
 import signal
+import re
 
 # 确保能找到 core 目录
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -30,9 +31,49 @@ from core.storage import Storage
 
 CACHE_DIR = os.path.join(BASE_DIR, "data", "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
+PODCAST_CHUNK_DIR = os.path.join(BASE_DIR, "data", "podcast_chunks")
+os.makedirs(PODCAST_CHUNK_DIR, exist_ok=True)
 
 # 终极同步信号：必须是字符串，确保跨进程一致
 GLOBAL_SENTINEL = "PIPELINE_END_STRICT_V1"
+
+PERFORMANCE_PROFILES = {
+    "fast": {
+        "chunk_sleep": 0.02,
+        "sentence_sleep": 0.5,
+        "buffer_high_sec": 30.0,
+        "buffer_low_sec": 12.0,
+        "podcast_pause_poll_sec": 1.0,
+        "model": None,
+    },
+    "balanced": {
+        "chunk_sleep": 0.08,
+        "sentence_sleep": 1.5,
+        "buffer_high_sec": 20.0,
+        "buffer_low_sec": 8.0,
+        "podcast_pause_poll_sec": 2.0,
+        "model": None,
+    },
+    "quiet": {
+        "chunk_sleep": 0.25,
+        "sentence_sleep": 3.0,
+        "buffer_high_sec": 10.0,
+        "buffer_low_sec": 4.0,
+        "podcast_pause_poll_sec": 3.0,
+        "model": "Qwen3-TTS-0.6B",
+    },
+}
+
+def get_performance_profile(name: str | None) -> dict:
+    profile_name = name if name in PERFORMANCE_PROFILES else "balanced"
+    profile = PERFORMANCE_PROFILES[profile_name].copy()
+    profile["name"] = profile_name
+    return profile
+
+def estimate_reading_minutes(text: str) -> float:
+    zh_chars = len([ch for ch in text if '\u4e00' <= ch <= '\u9fff'])
+    en_words = len([w for w in re.split(r"\s+", text) if w.strip()])
+    return (zh_chars / 250.0) + (en_words / 150.0)
 
 def get_text_hash(text):
     return hashlib.md5(text.encode('utf-8')).hexdigest()
@@ -126,6 +167,7 @@ def inference_worker(shared_state):
                 continue
 
             config = task['config']
+            profile = get_performance_profile(config.get("performance_profile"))
             target_model_name = config.get("model", "Qwen3-TTS-1.7B-8bit")
             target_path = f"models/{target_model_name}"
 
@@ -162,16 +204,13 @@ def inference_worker(shared_state):
 
             # 2. 实时推理
             full_audio = []
-            # 针对不同模型决定“喘气”频率：小模型睡得更久，因为生成更快，发热更集中
-            is_small_model = "0.6B" in target_model_name
-            throttle_sleep = 0.04 if is_small_model else 0.01
+            throttle_sleep = profile["chunk_sleep"]
 
             for samples in engine.generate_stream(text, config):
                 if shared_state.stop_event.is_set() or task_id != shared_state.current_task_id.value: 
                     break
                 shared_state.audio_q.put((tid if 'tid' in locals() else task_id, samples))
                 full_audio.append(samples)
-                # 巡航节流
                 time.sleep(throttle_sleep)
             
             if not shared_state.stop_event.is_set() and task_id == shared_state.current_task_id.value and cache_file and full_audio:
@@ -330,6 +369,9 @@ def do_save_for_later(text: str, source: str = "web", voice: str | None = None, 
 
 def shared_task_loop(session_id, tid, start_idx, chunks, config, state, is_podcast=False):
     global MAIN_IS_PLAYING, MAIN_PROGRESS
+    profile = get_performance_profile(config.get("performance_profile"))
+    buffer_high_sec = profile["buffer_high_sec"]
+    buffer_low_sec = profile["buffer_low_sec"]
     try:
         if not is_podcast:
             player.start()
@@ -353,11 +395,10 @@ def shared_task_loop(session_id, tid, start_idx, chunks, config, state, is_podca
                 state["current_article"]["current_index"] = i
                 storage.save_state(state)
             
-            # Don't cool down based on player queue if it's podcast mode (since player isn't playing)
-            # Use 24000 for calculation
-            while (not is_podcast and player.audio_queue.qsize() * (2048/24000) > 20.0) and playback_controller.can_feed_audio(session_id, tid):
+            if not is_podcast and player.get_queue_duration() > buffer_high_sec:
                 S.set_status("COOLING")
-                time.sleep(1.0)
+                while player.get_queue_duration() > buffer_low_sec and playback_controller.can_feed_audio(session_id, tid):
+                    time.sleep(1.0)
                 S.set_status("BUSY")
     finally:
         if playback_controller.is_current(session_id, tid):
@@ -477,6 +518,7 @@ async def read_text(data: dict = Body(...)):
     
     state = storage.load_state()
     config = storage.load_config()
+    config["performance_profile"] = data.get("performance_profile", config.get("performance_profile", "balanced"))
     if voice:
         config["voice"] = voice
         
@@ -491,7 +533,7 @@ async def read_text(data: dict = Body(...)):
             except Exception as e:
                 print(f"[Backend] Auto-saving clipboard text failed: {e}")
                 
-        chunks = processor.parse_dialogue_or_text(text)
+        chunks = processor.parse_dialogue_or_text(text, performance_profile=config["performance_profile"])
         state["current_article"] = {"title": text[:15].replace("\n", " ") + "...", "chunks": chunks, "current_index": 0}
         storage.save_state(state)
         curr_idx = 0
@@ -580,6 +622,8 @@ async def debug_state():
         "current_playing_md5": CURRENT_PLAYING_MD5,
         "podcast_file": PODCAST_FILE,
         "podcast_buffer_chunks": len(PODCAST_BUFFER),
+        "podcast_generation_paused": GLOBAL_PAUSE_EVENT.is_set(),
+        "on_battery_power": is_on_battery_power(),
         "active_url_tasks": list(ACTIVE_URL_TASKS.keys()),
         "active_podcast_processes": sum(1 for p in ACTIVE_PODCAST_PROCS if p.is_alive()),
     }
@@ -636,6 +680,7 @@ async def seek_playback(data: dict = Body(...)):
     
     MAIN_IS_PLAYING = True
     config = storage.load_config()
+    config["performance_profile"] = config.get("performance_profile", "balanced")
     
     threading.Thread(target=shared_task_loop, args=(playback_session_id, new_task_id, new_idx, chunks, config, state), daemon=True).start()
     return {"status": "seeking", "new_index": new_idx}
@@ -651,6 +696,18 @@ GLOBAL_PAUSE_EVENT = mp.Event()
 GLOBAL_PODCAST_GPU_LOCK = mp.Lock()
 LAST_ACTIVE_TIME = time.time()
 
+def is_on_battery_power() -> bool:
+    try:
+        result = subprocess.run(
+            ["pmset", "-g", "batt"],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        return "Battery Power" in result.stdout
+    except Exception:
+        return False
+
 def podcast_manager_loop():
     global LAST_ACTIVE_TIME
     while True:
@@ -658,7 +715,14 @@ def podcast_manager_loop():
         if MAIN_IS_PLAYING or len(ACTIVE_URL_TASKS) > 0:
             LAST_ACTIVE_TIME = time.time()
             
-        if MAIN_IS_PLAYING or len(ACTIVE_URL_TASKS) > 0 or (time.time() - LAST_ACTIVE_TIME < 120):
+        should_pause = (
+            MAIN_IS_PLAYING
+            or len(ACTIVE_URL_TASKS) > 0
+            or (time.time() - LAST_ACTIVE_TIME < 120)
+            or is_on_battery_power()
+        )
+
+        if should_pause:
             if not GLOBAL_PAUSE_EVENT.is_set():
                 GLOBAL_PAUSE_EVENT.set()
         else:
@@ -667,6 +731,77 @@ def podcast_manager_loop():
         time.sleep(2)
 
 threading.Thread(target=podcast_manager_loop, daemon=True).start()
+
+def prepare_podcast_config(config: dict, text: str, force_small_model: bool = False) -> dict:
+    podcast_config = config.copy()
+    podcast_config["performance_profile"] = podcast_config.get("performance_profile", "quiet")
+    profile = get_performance_profile(podcast_config["performance_profile"])
+    if force_small_model or estimate_reading_minutes(text) >= 20.0:
+        podcast_config["model"] = profile.get("model") or "Qwen3-TTS-0.6B"
+    return podcast_config
+
+def wait_for_podcast_slot(pause_event, poll_sec: float) -> None:
+    while pause_event.is_set():
+        time.sleep(poll_sec)
+
+def generate_podcast_chunks(
+    engine: TTSEngine,
+    text: str,
+    config: dict,
+    chunk_dir: str,
+    pause_event,
+) -> list[str]:
+    profile = get_performance_profile(config.get("performance_profile"))
+    os.makedirs(chunk_dir, exist_ok=True)
+    chunks = TextProcessor().parse_dialogue_or_text(
+        text,
+        performance_profile=config.get("performance_profile", "quiet"),
+    )
+    chunk_files: list[str] = []
+    progress_path = os.path.join(chunk_dir, "progress.json")
+
+    for idx, chunk in enumerate(chunks):
+        chunk_file = os.path.join(chunk_dir, f"chunk_{idx:05d}.npy")
+        chunk_files.append(chunk_file)
+        if os.path.exists(chunk_file):
+            continue
+
+        wait_for_podcast_slot(pause_event, profile["podcast_pause_poll_sec"])
+        if isinstance(chunk, dict):
+            chunk_config = config.copy()
+            chunk_config.update(chunk.get('config', {}))
+            actual_text = chunk['text']
+        else:
+            chunk_config = config
+            actual_text = chunk
+
+        parts = []
+        for samples in engine.generate_stream(actual_text, chunk_config):
+            parts.append(samples)
+            time.sleep(profile["chunk_sleep"])
+
+        if parts:
+            np.save(chunk_file, np.concatenate(parts).astype(np.float32))
+            with open(progress_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"completed_chunks": idx + 1, "total_chunks": len(chunks)},
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        time.sleep(profile["sentence_sleep"])
+
+    return chunk_files
+
+def write_podcast_wav_from_chunks(chunk_files: list[str], output_path: str) -> bool:
+    existing_chunks = [path for path in chunk_files if os.path.exists(path)]
+    if not existing_chunks:
+        return False
+    audio_parts = [np.load(path) for path in existing_chunks]
+    full_wav = np.concatenate(audio_parts)
+    wav_data = (np.clip(full_wav, -1.0, 1.0) * 32767).astype(np.int16)
+    scipy.io.wavfile.write(output_path, 24000, wav_data)
+    return True
 
 def run_single_podcast_generation_thread(text: str, config: dict, md5: str, source: str, pause_event, gpu_lock, title: str = None) -> None:
     import traceback
@@ -693,33 +828,13 @@ def run_single_podcast_generation_thread(text: str, config: dict, md5: str, sour
     with open(pending_file, "w") as f: f.write(text[:20])
     try:
         with gpu_lock:
+            config = prepare_podcast_config(config, text)
             engine = TTSEngine(model_path=f"models/{config.get('model', 'Qwen3-TTS-1.7B-8bit')}", mlx_audio_path="../../mlx_audio")
             engine.ensure_model_loaded()
-            chunks = TextProcessor().parse_dialogue_or_text(text)
-            audio_data = []
-            for chunk in chunks:
-                # Wait if paused by the manager
-                while pause_event.is_set():
-                    time.sleep(2)
-                
-                if isinstance(chunk, dict):
-                    chunk_config = config.copy()
-                    chunk_config.update(chunk.get('config', {}))
-                    actual_text = chunk['text']
-                else:
-                    chunk_config = config
-                    actual_text = chunk
-                    
-                for samples in engine.generate_stream(actual_text, chunk_config):
-                    audio_data.append(samples)
-                    time.sleep(0.5) # 增加延迟，降低 GPU/CPU 占空比，防电脑风扇狂转
-                # Let the GPU cool down between sentences
-                time.sleep(3.0)
-            if audio_data:
-                full_wav = np.concatenate(audio_data)
-                wav_data = (np.clip(full_wav, -1.0, 1.0) * 32767).astype(np.int16)
-                out_name = f"podcast_单篇_{source}_{safe_title}_{md5[:8]}_{int(time.time())}.wav"
-                scipy.io.wavfile.write(os.path.join(PODCASTS_DIR, out_name), 24000, wav_data)
+            chunk_dir = os.path.join(PODCAST_CHUNK_DIR, f"single_{md5[:12]}")
+            chunk_files = generate_podcast_chunks(engine, text, config, chunk_dir, pause_event)
+            out_name = f"podcast_单篇_{source}_{safe_title}_{md5[:8]}_{int(time.time())}.wav"
+            write_podcast_wav_from_chunks(chunk_files, os.path.join(PODCASTS_DIR, out_name))
     except Exception as e:
         print(f"[PodcastProcess] Error: {e}")
         traceback.print_exc()
@@ -745,31 +860,13 @@ def run_podcast_generation_thread(filename: str, text: str, config: dict, pause_
     with open(pending_file, "w") as f: f.write("pending")
     try:
         with gpu_lock:
+            config = prepare_podcast_config(config, text, force_small_model=True)
             engine = TTSEngine(model_path=f"models/{config.get('model', 'Qwen3-TTS-1.7B-8bit')}", mlx_audio_path="../../mlx_audio")
             engine.ensure_model_loaded()
-            chunks = TextProcessor().parse_dialogue_or_text(text)
-            audio_data = []
-            for chunk in chunks:
-                while pause_event.is_set():
-                    time.sleep(2)
-                    
-                if isinstance(chunk, dict):
-                    chunk_config = config.copy()
-                    chunk_config.update(chunk.get('config', {}))
-                    actual_text = chunk['text']
-                else:
-                    chunk_config = config
-                    actual_text = chunk
-                    
-                for samples in engine.generate_stream(actual_text, chunk_config):
-                    audio_data.append(samples)
-                    time.sleep(0.5) # 增加延迟，降低 GPU/CPU 占空比，防电脑风扇狂转
-                # Let the GPU cool down between sentences
-                time.sleep(3.0)
-            if audio_data:
-                full_wav = np.concatenate(audio_data)
-                wav_data = (np.clip(full_wav, -1.0, 1.0) * 32767).astype(np.int16)
-                scipy.io.wavfile.write(filename, 24000, wav_data)
+            batch_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+            chunk_dir = os.path.join(PODCAST_CHUNK_DIR, f"batch_{batch_hash[:12]}")
+            chunk_files = generate_podcast_chunks(engine, text, config, chunk_dir, pause_event)
+            write_podcast_wav_from_chunks(chunk_files, filename)
     except Exception as e:
         print(f"[PodcastProcess] Error: {e}")
     finally:
@@ -1104,6 +1201,7 @@ async def generate_single_podcast(data: dict = Body(...)):
         return {"status": "generating", "md5": md5_val, "message": "该内容已在后台生成中，无需重复提交！"}
         
     config = storage.load_config()
+    config["performance_profile"] = data.get("performance_profile", "quiet")
     if voice:
         config["voice"] = voice
     p = mp.Process(target=run_single_podcast_generation_thread, args=(text, config, md5_val, source, GLOBAL_PAUSE_EVENT, GLOBAL_PODCAST_GPU_LOCK, title), daemon=True)
@@ -1160,6 +1258,7 @@ async def generate_podcast_api():
     filename = os.path.join(PODCASTS_DIR, f"podcast_合集_web_大合集播客_{int(time.time())}.wav")
     
     config = storage.load_config()
+    config["performance_profile"] = "quiet"
     first_voice = saved_items[0].get("voice") if saved_items else None
     if first_voice:
         config["voice"] = first_voice

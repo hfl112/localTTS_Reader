@@ -71,7 +71,7 @@ class TextProcessor:
         chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
         return chinese_chars > (len(text) * 0.3)
 
-    def smart_split(self, text: str) -> list[str]:
+    def smart_split(self, text: str, performance_profile: str | None = None) -> list[str]:
         cleaned_text = self.clean_text(text)
         
         # 1. 识别主语言并设置参数
@@ -112,13 +112,21 @@ class TextProcessor:
             processed_text = re.sub(r'\b([A-Z])\.(?=\s|$)', r'\1_DOT_', processed_text)
         
         # 3. 决定断句参数与正则
+        profile = performance_profile if performance_profile in {"fast", "balanced", "quiet"} else "balanced"
+        split_profiles = {
+            "fast": {"zh_max": 250, "zh_target": 180, "en_max": 600, "en_target": 450},
+            "balanced": {"zh_max": 220, "zh_target": 160, "en_max": 500, "en_target": 350},
+            "quiet": {"zh_max": 180, "zh_target": 130, "en_max": 400, "en_target": 280},
+        }
+        split_profile = split_profiles[profile]
+
         if is_zh:
-            max_chunk_chars = 120
-            target_chunk_chars = 80
+            max_chunk_chars = split_profile["zh_max"]
+            target_chunk_chars = split_profile["zh_target"]
             sentence_endings = re.compile(r'([。！？!?;；\n]|(?:\.|\?|\!)(?=\s|$))')
         else:
-            max_chunk_chars = 300
-            target_chunk_chars = 200
+            max_chunk_chars = split_profile["en_max"]
+            target_chunk_chars = split_profile["en_target"]
             sentence_endings = re.compile(r'([.?!;；\n](?=\s|$))')
         
         raw_parts = sentence_endings.split(processed_text)
@@ -179,7 +187,7 @@ class TextProcessor:
             
         return [c for c in chunks if c.strip()]
 
-    def parse_dialogue_or_text(self, text: str) -> list:
+    def parse_dialogue_or_text(self, text: str, performance_profile: str | None = None) -> list:
         # 定义 Serena 和 Ryan 的参考路径
         base_ref_path = "/Users/funanhe/00_MyCode/TTS/reference"
         serena_ref_audio = f"{base_ref_path}/bbc_news.wav"
@@ -228,7 +236,7 @@ class TextProcessor:
                 if not content.strip():
                     continue
                 # 将本段内容使用 smart_split 切分
-                sub_chunks = self.smart_split(content)
+                sub_chunks = self.smart_split(content, performance_profile=performance_profile)
                 for chunk in sub_chunks:
                     if not chunk.strip():
                         continue
@@ -256,7 +264,6 @@ class TextProcessor:
                     })
         else:
             # 普通文本直接 smart_split，返回普通的字符串列表即可
-            final_chunks = self.smart_split(text)
+            final_chunks = self.smart_split(text, performance_profile=performance_profile)
             
         return final_chunks
-

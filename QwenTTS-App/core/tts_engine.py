@@ -223,8 +223,8 @@ class TTSEngine:
                 if abs_samples.size > 0:
                     robust_peak = np.percentile(abs_samples, 99.5)
                     if robust_peak > 0.002:
-                        gain = 0.95 / robust_peak
-                        gain = min(gain, 12.0)  # 最大允许放大 12 倍
+                        gain = 0.85 / robust_peak
+                        gain = min(gain, 6.0)  # 最大允许放大 6 倍，避免长音频听感疲劳和削波
                         samples = samples * gain
                 
                 # 3. 物理绝对峰值安全限制，杜绝数字溢出

@@ -65,10 +65,11 @@ python -m mlx_audio.server                # Web UI + API (port 8000)
 
 **IPC**: `mp.Queue` for text/audio, `mp.Event` for stop, `mp.Value` for status (IDLE/BUSY/COOLING).
 **Playback controller**: `backend.py` uses `PlaybackController` plus `S.current_task_id` to invalidate stale TTS and WAV playback threads. Any new playback entrypoint must go through `playback_controller.start_new_session()` or `stop_current_session()`, then only feed audio while `can_feed_audio(session_id, task_id)` remains true.
+**Performance profiles**: `fast`, `balanced`, and `quiet` live in `backend.py`. Realtime reading defaults to `balanced`; podcast generation defaults to `quiet`; long single podcasts and all batch podcasts should prefer `Qwen3-TTS-0.6B`.
 **Audio cache**: 10 `.npy` files in `QwenTTS-App/data/cache/`, MD5-keyed, LRU by mtime.
 **Sentinel**: string `"PIPELINE_END_STRICT_V1"` shared by inference worker and player (must remain a `str` to survive `mp.Queue` pickling).
-**Cruise mode**: inference pauses when `audio_queue.qsize() * (2048/24000) > 20s` to cool the GPU.
-**Runtime files** under `QwenTTS-App/data/`: `config.json`, `state.json`, `cache/*.npy`, `saved_for_later.json` (max 3 items), `podcasts/*.wav`.
+**Cruise mode**: realtime inference uses profile-specific buffer high/low watermarks (`balanced`: 20s/8s, `quiet`: 10s/4s, `fast`: 30s/12s) to cool the GPU.
+**Runtime files** under `QwenTTS-App/data/`: `config.json`, `state.json`, `cache/*.npy`, `podcast_chunks/*.npy`, `saved_for_later.json` (max 3 items), `podcasts/*.wav`.
 
 ## Default TTS config
 
@@ -80,6 +81,7 @@ voice: Serena                      (alts: Ryan, Vivian)
 instruct: "Professional female anchor, steady and clear."
 temperature: 0.2  top_p: 0.5  top_k: 10  seed: 42  repetition_penalty: 1.1
 lang_code: zh  speed: 1.0
+performance_profile: balanced           (alts: fast, quiet; podcast defaults to quiet)
 ```
 
 ## Endpoints worth knowing

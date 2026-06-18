@@ -360,9 +360,7 @@ class PCMPlayer:
             except Exception as e:
                 print(f"[PCMPlayer] Callback Error: {e}")
                 
-            # 进行 1.8 倍物理放大并进行安全限幅，杜绝数字溢出噪音，保证整体音量足够大
-            boosted_data = data_to_fill * self.volume_scale * 1.8
-            outdata[:] = np.clip(boosted_data, -0.98, 0.98)
+            outdata[:] = np.clip(data_to_fill * self.volume_scale, -0.98, 0.98)
 
     def get_queue_duration(self) -> float:
         return self.audio_queue.qsize() * 0.5

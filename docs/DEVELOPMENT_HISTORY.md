@@ -203,4 +203,18 @@
 *   **维护约束更新**：以后新增任何播放能力，都必须通过 `PlaybackController` 创建/作废播放会话，不能重新在 endpoint 内手写 `stop_event + current_task_id + queue` 的组合逻辑。
 
 ---
-**当前状态**: 🏆 macOS 音频设备切换容灾加固 + PlaybackController 播放控制层，解决 AirPods/蓝牙切换静默、播客/TTS 残留串台，并提供 `/debug/state` 快速诊断入口 | **负责人**: Codex
+
+## 📅 第十三阶段：长文/长播客性能模式与静音散热优化 (2026-06-18)
+*   **目标**：降低长文朗读和长 podcast 离线生成时的持续 GPU/CPU 占用，减少风扇噪音和机身发热，同时保留可手动切换的速度策略。
+*   **核心改动**：
+    1.  **性能模式**：新增 `fast`、`balanced`、`quiet` 三档 profile。实时朗读默认 `balanced`，播客生成默认 `quiet`，各档统一控制推理片段 sleep、句间冷却和播放器 buffer 高低水位。
+    2.  **长播客小模型策略**：单篇 podcast 超过约 20 分钟时自动切到 `Qwen3-TTS-0.6B`；合集 podcast 默认使用 `quiet + 0.6B`，优先换取低热量和低噪音。
+    3.  **后台生成暂停更严格**：播放、URL 解析活跃、播放停止后的 120 秒冷却窗口、以及电池供电状态都会暂停后台 podcast 生成，避免与前台收听抢 Metal/GPU。
+    4.  **实时朗读 buffer 高低水位**：实时朗读不再固定按一个队列阈值巡航，而是根据 profile 在 buffer 超过 high 时暂停推理，降到 low 后恢复，减少长文持续满载。
+    5.  **分段按 profile 调整**：`TextProcessor.smart_split` 支持按性能模式切块；`quiet` 更短，便于冷却、断点和停止响应，`fast` 更长，减少调度开销。
+    6.  **响度单点化**：保留 `tts_engine.py` 的稳健归一化，降低最大增益；`player.py` 不再默认 1.8 倍二次放大，只做用户音量和安全限幅，减少削波和长时间听感疲劳。
+    7.  **播客分段断点文件**：离线 podcast 每个 chunk 生成后立即保存到 `data/podcast_chunks/`，失败或中断后同内容可复用已完成 chunk，最后再拼接成 WAV。
+*   **诊断补充**：`/debug/state` 新增 `podcast_generation_paused` 与 `on_battery_power`，便于判断后台生成是被播放、冷却窗口还是电池状态暂停。
+
+---
+**当前状态**: 🏆 PlaybackController 播放控制层 + 三档性能模式 + quiet 播客生成，降低长文/长播客持续满载、风扇噪音和发热，并保留 `/debug/state` 快速诊断入口 | **负责人**: Codex
