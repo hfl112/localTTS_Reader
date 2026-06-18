@@ -28,6 +28,7 @@ from core.tts_engine import TTSEngine
 from core.player import PCMPlayer
 from core.processor import TextProcessor
 from core.storage import Storage
+from core.state.runtime_state import RuntimeState
 
 CACHE_DIR = os.path.join(BASE_DIR, "data", "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -254,15 +255,8 @@ else:
     player = None
 
 processor = TextProcessor()
-MAIN_IS_PLAYING = False
-MAIN_TITLE = ""
-MAIN_PROGRESS = "0/0"
 save_file_lock = threading.Lock()
-podcast_buffer_lock = threading.Lock()
-PODCAST_FILE = None
-PODCAST_BUFFER = []
-CURRENT_PLAYING_PODCAST = None
-CURRENT_PLAYING_MD5 = None
+runtime_state = RuntimeState()
 
 class PlaybackController:
     """Single owner for playback session invalidation and audio queue cleanup."""
@@ -368,7 +362,6 @@ def do_save_for_later(text: str, source: str = "web", voice: str | None = None, 
     return len(saved_items)
 
 def shared_task_loop(session_id, tid, start_idx, chunks, config, state, is_podcast=False):
-    global MAIN_IS_PLAYING, MAIN_PROGRESS
     profile = get_performance_profile(config.get("performance_profile"))
     buffer_high_sec = profile["buffer_high_sec"]
     buffer_low_sec = profile["buffer_low_sec"]
@@ -378,7 +371,7 @@ def shared_task_loop(session_id, tid, start_idx, chunks, config, state, is_podca
         S.set_status("BUSY")
         for i in range(start_idx, len(chunks)):
             if not playback_controller.can_feed_audio(session_id, tid): break
-            MAIN_PROGRESS = f"{i+1}/{len(chunks)}"
+            runtime_state.set_main(progress=f"{i+1}/{len(chunks)}")
             chunk_text = chunks[i]
             if isinstance(chunk_text, dict):
                 chunk_config = config.copy()
@@ -405,7 +398,7 @@ def shared_task_loop(session_id, tid, start_idx, chunks, config, state, is_podca
             S.text_q.put(GLOBAL_SENTINEL)
             if not is_podcast:
                 player.wait_until_finished()
-                MAIN_IS_PLAYING = False
+                runtime_state.set_main(is_playing=False)
             S.set_status("IDLE")
 
 def performance_monitor_thread():
@@ -416,7 +409,7 @@ def performance_monitor_thread():
     while True:
         try:
             st = S.get_status()
-            if MAIN_IS_PLAYING and st == "IDLE": st = "PLAYING"
+            if runtime_state.main_is_playing and st == "IDLE": st = "PLAYING"
             
             if st == "IDLE" and last_status != "IDLE":
                 print(f"--- [DIAGNOSE] 任务已结束 (ID: {S.current_task_id.value}) ---\n")
@@ -439,31 +432,27 @@ def performance_monitor_thread():
         except: time.sleep(5)
 
 def audio_feeder_thread():
-    global PODCAST_FILE, PODCAST_BUFFER
     while True:
         try:
             item = S.audio_q.get()
             if item is None: break
             if isinstance(item, str) and item == GLOBAL_SENTINEL:
-                if PODCAST_FILE:
+                snapshot = runtime_state.snapshot()
+                if snapshot["podcast_file"]:
                     try:
-                        with podcast_buffer_lock:
-                            if PODCAST_BUFFER:
-                                wav_data = np.concatenate(PODCAST_BUFFER)
-                                wav_data = (np.clip(wav_data, -1.0, 1.0) * 32767).astype(np.int16)
-                                scipy.io.wavfile.write(PODCAST_FILE, 24000, wav_data)
-                                print(f"[Podcast] Saved to {PODCAST_FILE}")
-                                
-                                save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
-                                with save_file_lock:
-                                    with open(save_file, "w", encoding="utf-8") as f:
-                                        json.dump([], f)
+                        podcast_file, podcast_buffer = runtime_state.consume_podcast_buffer()
+                        if podcast_file and podcast_buffer:
+                            wav_data = np.concatenate(podcast_buffer)
+                            wav_data = (np.clip(wav_data, -1.0, 1.0) * 32767).astype(np.int16)
+                            scipy.io.wavfile.write(podcast_file, 24000, wav_data)
+                            print(f"[Podcast] Saved to {podcast_file}")
+                            
+                            save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
+                            with save_file_lock:
+                                with open(save_file, "w", encoding="utf-8") as f:
+                                    json.dump([], f)
                     except Exception as e:
                         print(f"[Podcast] Error saving: {e}")
-                    finally:
-                        PODCAST_FILE = None
-                        with podcast_buffer_lock:
-                            PODCAST_BUFFER = []
                 else:
                     player.signal_end_of_article()
                 continue
@@ -471,9 +460,8 @@ def audio_feeder_thread():
             if isinstance(item, tuple) and len(item) == 2:
                 tid, samples = item
                 if tid == S.current_task_id.value:
-                    if PODCAST_FILE is not None:
-                        with podcast_buffer_lock:
-                            PODCAST_BUFFER.append(samples)
+                    if runtime_state.snapshot()["podcast_file"] is not None:
+                        runtime_state.append_podcast_audio(samples)
                     else:
                         player.play_chunk(samples)
         except: pass
@@ -501,18 +489,12 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/read")
 async def read_text(data: dict = Body(...)):
-    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS, PODCAST_FILE, PODCAST_BUFFER, CURRENT_PLAYING_MD5, CURRENT_PLAYING_PODCAST
     text = data.get('text', "")
     voice = data.get("voice", None)
     source = data.get("source", None)
     
-    if not data.get("from_saved", False):
-        CURRENT_PLAYING_MD5 = None
-    CURRENT_PLAYING_PODCAST = None
-    
-    PODCAST_FILE = None
-    with podcast_buffer_lock:
-        PODCAST_BUFFER = []
+    runtime_state.clear_current_media(keep_md5=data.get("from_saved", False))
+    runtime_state.reset_podcast_generation()
     
     playback_session_id, new_task_id = playback_controller.start_new_session()
     
@@ -538,24 +520,20 @@ async def read_text(data: dict = Body(...)):
         storage.save_state(state)
         curr_idx = 0
     
-    MAIN_TITLE = state["current_article"]["title"]
-    MAIN_IS_PLAYING = True
+    runtime_state.set_main(title=state["current_article"]["title"], is_playing=True)
     
     threading.Thread(target=shared_task_loop, args=(playback_session_id, new_task_id, curr_idx, chunks, config, state), daemon=True).start()
     return {"status": "ok"}
 
 @app.post("/stop")
 async def stop_read():
-    global MAIN_IS_PLAYING, PODCAST_FILE, PODCAST_BUFFER, ACTIVE_PODCAST_PROCS, ACTIVE_PODCAST_TASKS, CURRENT_PLAYING_MD5, CURRENT_PLAYING_PODCAST
+    global ACTIVE_PODCAST_PROCS, ACTIVE_PODCAST_TASKS
     
-    CURRENT_PLAYING_MD5 = None
-    CURRENT_PLAYING_PODCAST = None
-    PODCAST_FILE = None
-    with podcast_buffer_lock:
-        PODCAST_BUFFER = []
+    runtime_state.clear_current_media()
+    runtime_state.reset_podcast_generation()
     
     playback_controller.stop_current_session()
-    MAIN_IS_PLAYING = False
+    runtime_state.set_main(is_playing=False)
     S.set_status("IDLE")
     
     # Cancel all active podcast generation processes
@@ -577,8 +555,7 @@ async def stop_read():
 
 @app.get("/status")
 async def get_status():
-    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS
-    
+    runtime_snapshot = runtime_state.snapshot()
     generating_title = ""
     if os.path.exists(PODCASTS_DIR):
         try:
@@ -599,12 +576,12 @@ async def get_status():
         status_code = "BUSY"
         
     return {
-        "is_playing": MAIN_IS_PLAYING and not player.is_paused,
+        "is_playing": runtime_snapshot["main_is_playing"] and not player.is_paused,
         "is_paused": player.is_paused,
-        "current_podcast_file": CURRENT_PLAYING_PODCAST,
-        "current_playing_md5": CURRENT_PLAYING_MD5,
-        "title": MAIN_TITLE,
-        "progress": MAIN_PROGRESS,
+        "current_podcast_file": runtime_snapshot["current_podcast_file"],
+        "current_playing_md5": runtime_snapshot["current_playing_md5"],
+        "title": runtime_snapshot["main_title"],
+        "progress": runtime_snapshot["main_progress"],
         "buffer_sec": player.get_queue_duration(),
         "status_code": status_code,
         "generating_title": generating_title
@@ -612,16 +589,11 @@ async def get_status():
 
 @app.get("/debug/state")
 async def debug_state():
+    runtime_snapshot = runtime_state.snapshot()
     return {
         **playback_controller.snapshot(),
         "status_code": S.get_status(),
-        "main_is_playing": MAIN_IS_PLAYING,
-        "main_title": MAIN_TITLE,
-        "main_progress": MAIN_PROGRESS,
-        "current_podcast_file": CURRENT_PLAYING_PODCAST,
-        "current_playing_md5": CURRENT_PLAYING_MD5,
-        "podcast_file": PODCAST_FILE,
-        "podcast_buffer_chunks": len(PODCAST_BUFFER),
+        **runtime_snapshot,
         "podcast_generation_paused": GLOBAL_PAUSE_EVENT.is_set(),
         "on_battery_power": is_on_battery_power(),
         "active_url_tasks": list(ACTIVE_URL_TASKS.keys()),
@@ -650,12 +622,9 @@ async def restart_audio():
 
 @app.post("/seek")
 async def seek_playback(data: dict = Body(...)):
-    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS, PODCAST_FILE, PODCAST_BUFFER
     direction = data.get("direction", 1) # 1 for next, -1 for prev
     
-    PODCAST_FILE = None
-    with podcast_buffer_lock:
-        PODCAST_BUFFER = []
+    runtime_state.reset_podcast_generation()
     
     state = storage.load_state()
     current_art = state.get("current_article", {})
@@ -678,7 +647,7 @@ async def seek_playback(data: dict = Body(...)):
     # We must stop current task first
     playback_session_id, new_task_id = playback_controller.start_new_session()
     
-    MAIN_IS_PLAYING = True
+    runtime_state.set_main(is_playing=True)
     config = storage.load_config()
     config["performance_profile"] = config.get("performance_profile", "balanced")
     
@@ -694,7 +663,6 @@ ACTIVE_PODCAST_TASKS = {}
 
 GLOBAL_PAUSE_EVENT = mp.Event()
 GLOBAL_PODCAST_GPU_LOCK = mp.Lock()
-LAST_ACTIVE_TIME = time.time()
 
 def is_on_battery_power() -> bool:
     try:
@@ -709,16 +677,17 @@ def is_on_battery_power() -> bool:
         return False
 
 def podcast_manager_loop():
-    global LAST_ACTIVE_TIME
     while True:
         # Update last active time if anything is actively playing or URL is being fetched
-        if MAIN_IS_PLAYING or len(ACTIVE_URL_TASKS) > 0:
-            LAST_ACTIVE_TIME = time.time()
+        runtime_snapshot = runtime_state.snapshot()
+        has_frontend_activity = runtime_snapshot["main_is_playing"] or len(ACTIVE_URL_TASKS) > 0
+        runtime_state.update_activity_if_busy(has_frontend_activity)
+        runtime_snapshot = runtime_state.snapshot()
             
         should_pause = (
-            MAIN_IS_PLAYING
+            runtime_snapshot["main_is_playing"]
             or len(ACTIVE_URL_TASKS) > 0
-            or (time.time() - LAST_ACTIVE_TIME < 120)
+            or (time.time() - runtime_snapshot["last_active_time"] < 120)
             or is_on_battery_power()
         )
 
@@ -1112,21 +1081,18 @@ async def play_podcast(data: dict = Body(...)):
     if not filepath:
         return {"error": "File not found"}
     
-    global MAIN_IS_PLAYING, MAIN_TITLE, MAIN_PROGRESS, PODCAST_BUFFER, PODCAST_FILE, CURRENT_PLAYING_PODCAST, CURRENT_PLAYING_MD5
-    MAIN_TITLE = "🎙️ " + filename.replace(".wav", "").replace("podcast_", "")
-    MAIN_PROGRESS = ""
-    MAIN_IS_PLAYING = True
-    CURRENT_PLAYING_PODCAST = filename
-    CURRENT_PLAYING_MD5 = None
+    runtime_state.set_main(
+        title="🎙️ " + filename.replace(".wav", "").replace("podcast_", ""),
+        progress="",
+        is_playing=True,
+    )
+    runtime_state.set_current_media(podcast=filename, md5=None)
     
     playback_session_id, playback_task_id = playback_controller.start_new_session()
     
-    with podcast_buffer_lock:
-        PODCAST_BUFFER = []
-        PODCAST_FILE = None
+    runtime_state.reset_podcast_generation()
 
     def play_wav_thread(path, session_id, task_id):
-        global MAIN_IS_PLAYING
         try:
             import scipy.io.wavfile as wavfile
             import numpy as np
@@ -1160,15 +1126,14 @@ async def play_podcast(data: dict = Body(...)):
             print(f"[WavPlayer] Error: {e}")
         finally:
             if playback_controller.can_feed_audio(session_id, task_id):
-                MAIN_IS_PLAYING = False
+                runtime_state.set_main(is_playing=False)
             
     threading.Thread(target=play_wav_thread, args=(filepath, playback_session_id, playback_task_id), daemon=True).start()
     return {"status": "ok"}
 
 @app.post("/save_for_later")
 async def save_for_later(data: dict = Body(...)):
-    global LAST_ACTIVE_TIME
-    LAST_ACTIVE_TIME = time.time()
+    runtime_state.touch_activity()
     text = data.get("text", "").strip()
     source = data.get("source", "web")
     voice = data.get("voice", None)
@@ -1180,8 +1145,8 @@ async def save_for_later(data: dict = Body(...)):
 
 @app.post("/generate_single_podcast")
 async def generate_single_podcast(data: dict = Body(...)):
-    global ACTIVE_PODCAST_PROCS, ACTIVE_PODCAST_TASKS, LAST_ACTIVE_TIME
-    LAST_ACTIVE_TIME = time.time()
+    global ACTIVE_PODCAST_PROCS, ACTIVE_PODCAST_TASKS
+    runtime_state.touch_activity()
     
     text = data.get("text", "").strip()
     source = data.get("source", "web")
@@ -1324,11 +1289,10 @@ async def play_saved(data: dict = Body(...)):
     if 0 <= first_idx < len(saved_items):
         voice = saved_items[first_idx].get("voice")
     
-    global CURRENT_PLAYING_MD5
     if indices and 0 <= indices[0] < len(saved_items):
-        CURRENT_PLAYING_MD5 = saved_items[indices[0]].get("md5")
+        runtime_state.set_current_media(podcast=None, md5=saved_items[indices[0]].get("md5"))
     else:
-        CURRENT_PLAYING_MD5 = None
+        runtime_state.set_current_media(podcast=None, md5=None)
 
     payload = {"text": text_to_play, "from_saved": True}
     if voice: payload["voice"] = voice
