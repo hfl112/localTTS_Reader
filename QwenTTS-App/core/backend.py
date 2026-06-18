@@ -220,33 +220,84 @@ MAIN_TITLE = ""
 MAIN_PROGRESS = "0/0"
 save_file_lock = threading.Lock()
 podcast_buffer_lock = threading.Lock()
-playback_session_lock = threading.Lock()
 PODCAST_FILE = None
 PODCAST_BUFFER = []
 CURRENT_PLAYING_PODCAST = None
 CURRENT_PLAYING_MD5 = None
-PLAYBACK_SESSION_ID = 0
 
-def _new_playback_session() -> tuple[int, int]:
-    global PLAYBACK_SESSION_ID
-    with playback_session_lock:
-        PLAYBACK_SESSION_ID += 1
-        session_id = PLAYBACK_SESSION_ID
-    with S.current_task_id.get_lock():
-        S.current_task_id.value += 1
-        task_id = S.current_task_id.value
-    return session_id, task_id
+class PlaybackController:
+    """Single owner for playback session invalidation and audio queue cleanup."""
 
-def _is_current_playback_session(session_id: int) -> bool:
-    with playback_session_lock:
-        return session_id == PLAYBACK_SESSION_ID
+    def __init__(self, shared_state: SharedState, pcm_player: PCMPlayer | None):
+        self.shared_state = shared_state
+        self.player = pcm_player
+        self._lock = threading.Lock()
+        self._session_id = 0
 
-def _drain_audio_queue() -> None:
-    while True:
+    def _next_session(self) -> tuple[int, int]:
+        with self._lock:
+            self._session_id += 1
+            session_id = self._session_id
+        with self.shared_state.current_task_id.get_lock():
+            self.shared_state.current_task_id.value += 1
+            task_id = self.shared_state.current_task_id.value
+        return session_id, task_id
+
+    def start_new_session(self) -> tuple[int, int]:
+        self.shared_state.stop_event.set()
+        if self.player is not None:
+            self.player.stop()
+        session_id, task_id = self._next_session()
+        self.drain_audio_queue()
+        self.shared_state.stop_event.clear()
+        return session_id, task_id
+
+    def stop_current_session(self) -> None:
+        self._next_session()
+        self.shared_state.stop_event.set()
+        if self.player is not None:
+            self.player.stop()
+        self.drain_audio_queue()
+
+    def is_current(self, session_id: int, task_id: int | None = None) -> bool:
+        with self._lock:
+            session_matches = session_id == self._session_id
+        if task_id is None:
+            return session_matches
+        return session_matches and task_id == self.shared_state.current_task_id.value
+
+    def can_feed_audio(self, session_id: int, task_id: int) -> bool:
+        return (
+            not self.shared_state.stop_event.is_set()
+            and self.is_current(session_id, task_id)
+        )
+
+    def drain_audio_queue(self) -> None:
+        while True:
+            try:
+                self.shared_state.audio_q.get_nowait()
+            except Exception:
+                break
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            session_id = self._session_id
+        return {
+            "playback_session_id": session_id,
+            "current_task_id": self.shared_state.current_task_id.value,
+            "stop_event": self.shared_state.stop_event.is_set(),
+            "audio_qsize": self._safe_qsize(self.shared_state.audio_q),
+            "player_qsize": self._safe_qsize(self.player.audio_queue) if self.player else 0,
+        }
+
+    @staticmethod
+    def _safe_qsize(q) -> int:
         try:
-            S.audio_q.get_nowait()
+            return q.qsize()
         except Exception:
-            break
+            return -1
+
+playback_controller = PlaybackController(S, player)
 
 def do_save_for_later(text: str, source: str = "web", voice: str | None = None, title: str | None = None) -> int:
     text = text.strip()
@@ -284,7 +335,7 @@ def shared_task_loop(session_id, tid, start_idx, chunks, config, state, is_podca
             player.start()
         S.set_status("BUSY")
         for i in range(start_idx, len(chunks)):
-            if S.stop_event.is_set() or tid != S.current_task_id.value or not _is_current_playback_session(session_id): break
+            if not playback_controller.can_feed_audio(session_id, tid): break
             MAIN_PROGRESS = f"{i+1}/{len(chunks)}"
             chunk_text = chunks[i]
             if isinstance(chunk_text, dict):
@@ -304,12 +355,12 @@ def shared_task_loop(session_id, tid, start_idx, chunks, config, state, is_podca
             
             # Don't cool down based on player queue if it's podcast mode (since player isn't playing)
             # Use 24000 for calculation
-            while (not is_podcast and player.audio_queue.qsize() * (2048/24000) > 20.0) and not S.stop_event.is_set() and tid == S.current_task_id.value and _is_current_playback_session(session_id):
+            while (not is_podcast and player.audio_queue.qsize() * (2048/24000) > 20.0) and playback_controller.can_feed_audio(session_id, tid):
                 S.set_status("COOLING")
                 time.sleep(1.0)
                 S.set_status("BUSY")
     finally:
-        if tid == S.current_task_id.value and _is_current_playback_session(session_id):
+        if playback_controller.is_current(session_id, tid):
             S.text_q.put(GLOBAL_SENTINEL)
             if not is_podcast:
                 player.wait_until_finished()
@@ -422,11 +473,7 @@ async def read_text(data: dict = Body(...)):
     with podcast_buffer_lock:
         PODCAST_BUFFER = []
     
-    S.stop_event.set()
-    player.stop()
-    playback_session_id, new_task_id = _new_playback_session()
-    _drain_audio_queue()
-    S.stop_event.clear()
+    playback_session_id, new_task_id = playback_controller.start_new_session()
     
     state = storage.load_state()
     config = storage.load_config()
@@ -465,10 +512,7 @@ async def stop_read():
     with podcast_buffer_lock:
         PODCAST_BUFFER = []
     
-    _new_playback_session()
-    S.stop_event.set()
-    player.stop()
-    _drain_audio_queue()
+    playback_controller.stop_current_session()
     MAIN_IS_PLAYING = False
     S.set_status("IDLE")
     
@@ -524,6 +568,22 @@ async def get_status():
         "generating_title": generating_title
     }
 
+@app.get("/debug/state")
+async def debug_state():
+    return {
+        **playback_controller.snapshot(),
+        "status_code": S.get_status(),
+        "main_is_playing": MAIN_IS_PLAYING,
+        "main_title": MAIN_TITLE,
+        "main_progress": MAIN_PROGRESS,
+        "current_podcast_file": CURRENT_PLAYING_PODCAST,
+        "current_playing_md5": CURRENT_PLAYING_MD5,
+        "podcast_file": PODCAST_FILE,
+        "podcast_buffer_chunks": len(PODCAST_BUFFER),
+        "active_url_tasks": list(ACTIVE_URL_TASKS.keys()),
+        "active_podcast_processes": sum(1 for p in ACTIVE_PODCAST_PROCS if p.is_alive()),
+    }
+
 @app.post("/pause")
 async def pause_playback():
     player.pause()
@@ -572,11 +632,7 @@ async def seek_playback(data: dict = Body(...)):
     
     # Restart playback at new index by triggering the read flow but simulating "RESUME_MODE"
     # We must stop current task first
-    S.stop_event.set()
-    player.stop()
-    playback_session_id, new_task_id = _new_playback_session()
-    _drain_audio_queue()
-    S.stop_event.clear()
+    playback_session_id, new_task_id = playback_controller.start_new_session()
     
     MAIN_IS_PLAYING = True
     config = storage.load_config()
@@ -966,11 +1022,7 @@ async def play_podcast(data: dict = Body(...)):
     CURRENT_PLAYING_PODCAST = filename
     CURRENT_PLAYING_MD5 = None
     
-    S.stop_event.set()
-    player.stop()
-    playback_session_id, playback_task_id = _new_playback_session()
-    _drain_audio_queue()
-    S.stop_event.clear()
+    playback_session_id, playback_task_id = playback_controller.start_new_session()
     
     with podcast_buffer_lock:
         PODCAST_BUFFER = []
@@ -992,25 +1044,25 @@ async def play_podcast(data: dict = Body(...)):
             
             player.start()
             for i in range(0, len(float_data), chunk_size):
-                if S.stop_event.is_set() or task_id != S.current_task_id.value or not _is_current_playback_session(session_id):
+                if not playback_controller.can_feed_audio(session_id, task_id):
                     break
                 
                 # Keep audio queue small to avoid memory bloat and allow quick stop
-                while player.audio_queue.qsize() > 5 and not S.stop_event.is_set() and task_id == S.current_task_id.value and _is_current_playback_session(session_id):
+                while player.audio_queue.qsize() > 5 and playback_controller.can_feed_audio(session_id, task_id):
                     time.sleep(0.5)
                     
-                if S.stop_event.is_set() or task_id != S.current_task_id.value or not _is_current_playback_session(session_id):
+                if not playback_controller.can_feed_audio(session_id, task_id):
                     break
                     
                 chunk = float_data[i:i+chunk_size]
                 player.play_chunk(chunk)
                 
-            if task_id == S.current_task_id.value and _is_current_playback_session(session_id):
+            if playback_controller.is_current(session_id, task_id):
                 player.signal_end_of_article()
         except Exception as e:
             print(f"[WavPlayer] Error: {e}")
         finally:
-            if task_id == S.current_task_id.value and _is_current_playback_session(session_id) and not S.stop_event.is_set():
+            if playback_controller.can_feed_audio(session_id, task_id):
                 MAIN_IS_PLAYING = False
             
     threading.Thread(target=play_wav_thread, args=(filepath, playback_session_id, playback_task_id), daemon=True).start()

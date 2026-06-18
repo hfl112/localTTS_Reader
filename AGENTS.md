@@ -64,7 +64,7 @@ python -m mlx_audio.server                # Web UI + API (port 8000)
 | `core/worker.py` | Standalone CLI (`python core/worker.py --text "..."`). **Not used by `app.py` / `backend.py`**. |
 
 **IPC**: `mp.Queue` for text/audio, `mp.Event` for stop, `mp.Value` for status (IDLE/BUSY/COOLING).
-**Playback session lock**: `backend.py` uses `PLAYBACK_SESSION_ID` plus `S.current_task_id` to invalidate stale TTS and WAV playback threads. Any new playback entrypoint must create a new playback session, set `stop_event`, clear `PCMPlayer` and stale `audio_q` messages, then only feed audio while its captured session/task id is still current.
+**Playback controller**: `backend.py` uses `PlaybackController` plus `S.current_task_id` to invalidate stale TTS and WAV playback threads. Any new playback entrypoint must go through `playback_controller.start_new_session()` or `stop_current_session()`, then only feed audio while `can_feed_audio(session_id, task_id)` remains true.
 **Audio cache**: 10 `.npy` files in `QwenTTS-App/data/cache/`, MD5-keyed, LRU by mtime.
 **Sentinel**: string `"PIPELINE_END_STRICT_V1"` shared by inference worker and player (must remain a `str` to survive `mp.Queue` pickling).
 **Cruise mode**: inference pauses when `audio_queue.qsize() * (2048/24000) > 20s` to cool the GPU.
@@ -88,6 +88,7 @@ Standard playback endpoints (`/read`, `/status`, `/stop`, `/pause`, `/resume`, `
 
 - `POST /save_current` / `GET /saved_items` / `POST /play_saved` / `POST /delete_saved` — saved-items queue backed by `data/saved_for_later.json` (max 3, FIFO).
 - `POST /generate_podcast` — concatenates all saved items → `data/podcasts/podcast_{ts}.wav` (24kHz int16).
+- `GET /debug/state` — local diagnostics for playback session id, task id, queues, stop event, current title, active URL tasks, and active podcast worker count.
 
 ## Constraints
 

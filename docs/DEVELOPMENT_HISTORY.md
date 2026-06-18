@@ -189,7 +189,18 @@
     2.  **旧线程硬失效**：`shared_task_loop` 与 `play_wav_thread` 均捕获自己的 `session_id/task_id`。只要发现不再是当前会话，就立即退出，不能继续 `player.play_chunk()`，也不能发送结束哨兵。
     3.  **播客入口完整清场**：`/podcasts/play` 开始前先 `stop_event.set()`，调用 `player.stop()` 清空队列与 leftover，再创建新会话并清空主进程侧 `audio_q` 旧消息，避免旧 TTS 与旧播客残留进入新队列。
     4.  **状态写保护**：过期线程不再允许把新任务的 `MAIN_IS_PLAYING` 改成 `False`，避免菜单栏状态被旧线程覆盖。
-*   **维护约束**：以后新增任何播放入口，都必须先换代 `PLAYBACK_SESSION_ID` 与 `S.current_task_id`，并在后台循环中检查捕获的会话仍然有效；不能只依赖 `stop_event`。
+*   **维护约束**：以后新增任何播放入口，都必须通过 `PlaybackController` 换代播放会话与 `S.current_task_id`，并在后台循环中检查捕获的会话仍然有效；不能只依赖 `stop_event`。
 
 ---
-**当前状态**: 🏆 macOS 音频设备切换容灾加固 + 播放会话隔离，解决 AirPods/蓝牙切换静默与播客/TTS 残留串台问题 | **负责人**: Codex
+
+## 📅 第十二阶段：播放控制层架构收口与诊断入口 (2026-06-17)
+*   **目标**：在不重写 TTS、URL 抓取、菜单栏与插件的前提下，将最容易出错的播放生命周期从散落的全局 helper 收口为单一控制层。
+*   **核心改动**：
+    1.  **PlaybackController**：新增统一播放控制器，集中负责会话换代、`S.current_task_id` 递增、`stop_event` 切换、`PCMPlayer.stop()`、主进程 `audio_q` 清理，以及线程有效性判断。
+    2.  **播放入口统一化**：`/read`、`/seek`、`/podcasts/play`、`/stop` 不再直接拼装 session/task/queue 清理逻辑，统一调用 `start_new_session()` 或 `stop_current_session()`。
+    3.  **后台线程条件统一**：TTS 朗读线程和 WAV 播客线程统一使用 `can_feed_audio(session_id, task_id)` 判断是否还能投喂音频，减少后续新增入口时漏掉某个条件的风险。
+    4.  **诊断入口**：新增只读 `/debug/state`，暴露当前 playback session、task id、stop_event、主/播放器队列长度、当前标题、播客文件、活跃 URL 任务和后台播客进程数，方便排查静音、串台和任务残留。
+*   **维护约束更新**：以后新增任何播放能力，都必须通过 `PlaybackController` 创建/作废播放会话，不能重新在 endpoint 内手写 `stop_event + current_task_id + queue` 的组合逻辑。
+
+---
+**当前状态**: 🏆 macOS 音频设备切换容灾加固 + PlaybackController 播放控制层，解决 AirPods/蓝牙切换静默、播客/TTS 残留串台，并提供 `/debug/state` 快速诊断入口 | **负责人**: Codex
