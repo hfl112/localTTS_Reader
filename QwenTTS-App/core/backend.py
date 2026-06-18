@@ -206,9 +206,13 @@ def inference_worker(shared_state):
 # ==========================================
 S = SharedState()
 storage = Storage(data_dir=os.path.join(BASE_DIR, "data"))
-# 强制播放器的 SENTINEL 与全局一致
-player = PCMPlayer(sample_rate=24000)
-player.SENTINEL = GLOBAL_SENTINEL
+# 强制播放器的 SENTINEL 与全局一致，只在主进程中初始化播放器，子进程（InferenceProcess）不加载 CoreAudio 硬件驱动
+import multiprocessing
+if multiprocessing.parent_process() is None:
+    player = PCMPlayer(sample_rate=24000)
+    player.SENTINEL = GLOBAL_SENTINEL
+else:
+    player = None
 
 processor = TextProcessor()
 MAIN_IS_PLAYING = False
@@ -368,7 +372,13 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=audio_feeder_thread, daemon=True).start()
     threading.Thread(target=performance_monitor_thread, daemon=True).start()
     yield
+    print("[Backend] lifespan正在进行资源清理并终止播放器...")
     p.terminate()
+    if player is not None:
+        try:
+            player.close()
+        except Exception as e:
+            print(f"[Backend] 关闭播放器异常: {e}")
     clear_all_cache()
     S.text_q.put(None)
 
@@ -502,6 +512,16 @@ async def pause_playback():
 async def resume_playback():
     player.resume()
     return {"status": "resumed"}
+
+@app.post("/restart_audio")
+async def restart_audio():
+    if player is not None:
+        try:
+            player.restart_device()
+            return {"status": "ok"}
+        except Exception as e:
+            return {"error": str(e)}
+    return {"error": "Player not initialized"}
 
 @app.post("/seek")
 async def seek_playback(data: dict = Body(...)):

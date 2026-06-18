@@ -42,7 +42,14 @@ python -m mlx_audio.server                # Web UI + API (port 8000)
 - `backend.py` resolves the model via a RELATIVE path `models/{name}` rooted at `mlx_audio/`, and sets `mlx_audio_path="../../mlx_audio"` rooted at `QwenTTS-App/`. **Do not move `QwenTTS-App/` to a different depth** — both relative paths will break (unless overridden by environment variables `MLX_AUDIO_PATH` and `TTS_WORKSPACE_PATH` which decouple these paths).
 - Model weights must exist at `mlx_audio/models/{Qwen3-TTS-1.7B-8bit, Qwen3-TTS-0.6B}`.
 - `backend.py` calls `mp.set_start_method("spawn", force=True)` in the FastAPI lifespan. On macOS MLX/Metal is spawn-only; do not switch to fork.
-- The 0.6B Base model needs a `"Persona Anchor: {voice}."` prefix injected into `instruct` (see `backend.py:inference_worker` ~L165), otherwise it falls back to its base voice.
+- **Voice Stability / Double Lock / ICL**: Both 0.6B and 1.7B models suffer from severe random drift in voice and gender if not properly constrained. To fix this, you must apply the following techniques:
+  1. **Seed Lock**: Always enforce a fixed seed (e.g. `seed=42`) in `generate_stream` kwargs to stop codebook stochasticity.
+  2. **Semantic Anchor (Instruct) Lock**: The `instruct` string heavily influences the generated voice. If switching voices (e.g. "Serena" to "Ryan"), the `instruct` MUST reflect the gender and style (e.g., `"A professional male anchor."` for Ryan).
+  3. **In-Context Learning (ICL) Lock (In-Context Clone)**: For production-grade voice locking, zero-shot is insufficient. We inject `ref_audio` and `ref_text` parameters to the model generation options. 
+     - **Serena Reference**: Audio at `reference/bbc_news.wav`, Text: `"This is the research headquarters for one of the oldest companies in tech, IBM."`
+     - **Ryan Reference**: Audio at `reference/ref_ryan.wav`, Text: `"各位听众大家好，欢迎收听本期的新闻快报，我是男主持瑞恩。"`
+  4. **Dialogue Parser for Multi-Speaker Podcasts**: The `TextProcessor` provides `parse_dialogue_or_text(text)` which parses turn-based dialogues tagged with `[Serena]:` or `[Ryan]:` (case-insensitive, optional brackets and colons). It outputs a list of chunks where dialogue sentences are automatically annotated with their respective speaker name, instruct prompt, and ICL references (`ref_audio` and `ref_text`). Ordinary paragraphs fall back to standard single-speaker text generation.
+  *(Note: For 0.6B Base model specifically, it requires the literal prefix `"Persona Anchor: {voice}. "` injected into `instruct` to hold the voice, see `backend.py`.)*
 
 ## QwenTTS-App — architecture
 

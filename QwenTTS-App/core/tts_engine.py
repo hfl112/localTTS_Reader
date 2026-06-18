@@ -83,19 +83,112 @@ class TTSEngine:
         dynamic_max_tokens = max(2048, len(text_to_generate) * 20)
         dynamic_max_tokens = min(dynamic_max_tokens, 8192)
 
+        # Auto-detect language per chunk to prevent JIT collapse / "sisisi" garble
+        has_chinese = any('\u4e00' <= char <= '\u9fff' for char in text_to_generate)
+        current_lang_code = config.get("lang_code", "zh")
+        if current_lang_code == "zh" and not has_chinese:
+            print(f"[TTSEngine] Auto-detect: No Chinese chars, overriding lang_code to 'en'")
+            current_lang_code = "en"
+        elif current_lang_code == "en" and has_chinese:
+            print(f"[TTSEngine] Auto-detect: Chinese chars detected, overriding lang_code to 'zh'")
+            current_lang_code = "zh"
+
         generate_kwargs = {
             "voice": config.get("voice", "Serena"),
             "instruct": config.get("instruct", "Professional female anchor, steady and clear."),
             "temperature": config.get("temperature", 0.2),
             "top_p": config.get("top_p", 0.5),
             "top_k": config.get("top_k", 10),
-            "repetition_penalty": config.get("repetition_penalty", 1.1), # 提高到 1.1 增加稳定性
-            "lang_code": config.get("lang_code", "zh"),
+            "repetition_penalty": config.get("repetition_penalty", 1.1),
+            "lang_code": current_lang_code,
             "stream": True,
-            "streaming_interval": 0.5, # 缩短到 0.5s，让数据流更均匀
+            "streaming_interval": 0.5,
             "response_format": "pcm",
-            "max_tokens": dynamic_max_tokens # 传入动态限制
+            "max_tokens": dynamic_max_tokens
         }
+
+        # Inject ICL parameters if provided
+        if "ref_audio" in config:
+            generate_kwargs["ref_audio"] = config["ref_audio"]
+        if "ref_text" in config:
+            generate_kwargs["ref_text"] = config["ref_text"]
+
+        # Global ICL auto-injection mechanism to prevent voice drift in zero-shot mode
+        if "ref_audio" not in generate_kwargs:
+            base_ref_path = "/Users/funanhe/00_MyCode/TTS/reference"
+            
+            serena_zh_audio = f"{base_ref_path}/ref_serena_zh.wav"
+            serena_zh_text = "欢迎收听本期播客，我是女主持塞蕾娜。"
+            
+            serena_en_audio = f"{base_ref_path}/bbc_news.wav"
+            serena_en_text = "This is the research headquarters for one of the oldest companies in tech, IBM."
+            
+            ryan_ref_audio = f"{base_ref_path}/ref_ryan.wav"
+            ryan_ref_text = "各位听众大家好，欢迎收听本期的新闻快报，我是男主持瑞恩。"
+            
+            current_voice = generate_kwargs.get("voice", "Serena")
+            current_lang = generate_kwargs.get("lang_code", "zh")
+            
+            if current_voice == "Serena":
+                if current_lang == "zh" and os.path.exists(serena_zh_audio):
+                    generate_kwargs["ref_audio"] = serena_zh_audio
+                    generate_kwargs["ref_text"] = serena_zh_text
+                    print(f"[TTSEngine] 全局 ICL 保护：自动为 Serena 注入中文锁音")
+                elif current_lang == "en" and os.path.exists(serena_en_audio):
+                    generate_kwargs["ref_audio"] = serena_en_audio
+                    generate_kwargs["ref_text"] = serena_en_text
+                    print(f"[TTSEngine] 全局 ICL 保护：自动为 Serena 注入英文锁音")
+            elif current_voice == "Ryan":
+                if current_lang == "zh" and os.path.exists(ryan_ref_audio):
+                    generate_kwargs["ref_audio"] = ryan_ref_audio
+                    generate_kwargs["ref_text"] = ryan_ref_text
+                    print(f"[TTSEngine] 全局 ICL 保护：自动为 Ryan 注入中文锁音")
+
+        # 跨语言 ICL 安全防护与自动语种重定向：
+        # 防止自回归无限循环崩溃。如检测到提示词参考文本与当前要合成的语种不一致，
+        # 则自动重定向至对应的同语种 ICL 提示词；若无同语种提示词，退避至内置零样本模式。
+        ref_text = generate_kwargs.get("ref_text", "")
+        current_lang = generate_kwargs.get("lang_code", "zh")
+        current_voice = generate_kwargs.get("voice", "Serena")
+        base_ref_path = "/Users/funanhe/00_MyCode/TTS/reference"
+        
+        if ref_text and current_lang:
+            has_chinese_ref = any('\u4e00' <= char <= '\u9fff' for char in ref_text)
+            ref_lang = "zh" if has_chinese_ref else "en"
+            
+            if ref_lang != current_lang:
+                print(f"[TTSEngine] 检测到跨语言 ICL 潜在冲突 ({ref_lang} 提示词 -> {current_lang} 生成)。尝试自动语种重定向...")
+                redirected = False
+                
+                if current_voice == "Serena":
+                    serena_zh_audio = f"{base_ref_path}/ref_serena_zh.wav"
+                    serena_zh_text = "欢迎收听本期播客，我是女主持塞蕾娜。"
+                    serena_en_audio = f"{base_ref_path}/bbc_news.wav"
+                    serena_en_text = "This is the research headquarters for one of the oldest companies in tech, IBM."
+                    
+                    if current_lang == "zh" and os.path.exists(serena_zh_audio):
+                        generate_kwargs["ref_audio"] = serena_zh_audio
+                        generate_kwargs["ref_text"] = serena_zh_text
+                        redirected = True
+                    elif current_lang == "en" and os.path.exists(serena_en_audio):
+                        generate_kwargs["ref_audio"] = serena_en_audio
+                        generate_kwargs["ref_text"] = serena_en_text
+                        redirected = True
+                        
+                elif current_voice == "Ryan":
+                    ryan_ref_audio = f"{base_ref_path}/ref_ryan.wav"
+                    ryan_ref_text = "各位听众大家好，欢迎收听本期的新闻快报，我是男主持瑞恩。"
+                    if current_lang == "zh" and os.path.exists(ryan_ref_audio):
+                        generate_kwargs["ref_audio"] = ryan_ref_audio
+                        generate_kwargs["ref_text"] = ryan_ref_text
+                        redirected = True
+                
+                if redirected:
+                    print(f"[TTSEngine] 成功重定向至 {current_lang} 同语种锁音提示词，实现单语言稳定 ICL 生成。")
+                else:
+                    print(f"[TTSEngine] 无法重定向，自动退避为内置零样本模式以防止自回归崩溃。")
+                    generate_kwargs.pop("ref_audio", None)
+                    generate_kwargs.pop("ref_text", None)
 
         print(f"[TTSEngine] 开始生成: \"{text_to_generate[:20]}...\", MaxTokens: {dynamic_max_tokens}, Penalty: {generate_kwargs['repetition_penalty']}")
 
@@ -118,20 +211,24 @@ class TTSEngine:
                 if audio_data.dtype != mx.float32:
                     audio_data = audio_data.astype(mx.float32)
                 
-                # 1. 自动归一化
-                peak = mx.max(mx.abs(audio_data))
-                if peak > 0.01:
-                    gain = mx.minimum(0.7 / peak, mx.array(4.0))
-                    audio_data = audio_data * gain
-                
-                # 2. 转双声道并应用主音量 (都在 MLX/C++ 层完成，不占 GIL)
-                # 使用 broadcast 方式扩展为双声道
+                # 1. 转双声道 (broadcast 方式，MLX/C++ 层完成，不占 GIL)
                 audio_data = audio_data[:, None] # [N, 1]
                 audio_data = mx.concatenate([audio_data, audio_data], axis=1) # [N, 2]
-                audio_data = audio_data * 0.8 # 安全增益
                 
-                # 直接输出 24kHz，无需 scipy resampling
+                # 直接转换为 NumPy 数组进行稳健归一化
                 samples = np.array(audio_data)
+                
+                # 2. 稳健增益归一化：采用 99.5% 分位数，过滤掉单点瞬态脉冲 (Clicks) 干扰，释放真实的最大人声音量
+                abs_samples = np.abs(samples)
+                if abs_samples.size > 0:
+                    robust_peak = np.percentile(abs_samples, 99.5)
+                    if robust_peak > 0.002:
+                        gain = 0.95 / robust_peak
+                        gain = min(gain, 12.0)  # 最大允许放大 12 倍
+                        samples = samples * gain
+                
+                # 3. 物理绝对峰值安全限制，杜绝数字溢出
+                samples = np.clip(samples, -0.98, 0.98)
                 yield samples.astype(np.float32)
         except Exception as e:
             print(f"[TTSEngine] 生成过程发生错误: {e}")

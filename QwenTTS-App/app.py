@@ -445,6 +445,12 @@ class QwenTTSApp(rumps.App):
 
     def on_quit(self, _):
         if self.backend_process:
+            # 先停止播放，让 callback 输出静音填满硬件缓冲区，防止退出时复读
+            try:
+                self.session.post(f"{self.backend_url}/stop", timeout=1)
+                time.sleep(0.5)  # 等待 8192 帧（~340ms）的硬件缓冲区被静音数据覆盖
+            except:
+                pass
             self.backend_process.terminate()
             self.backend_process.wait()
         try:

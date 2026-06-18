@@ -199,6 +199,44 @@ def translate_to_chinese(text: str) -> str:
     )
     return call_gemini(prompt, task_level="standard", step_name="Translate")
 
+def generate_podcast_discussion(text: str) -> str:
+    """
+    将输入的文章/正文转化为类似 NotebookLM 风格的双人播客对谈解释。
+    由 [Serena] (女主持) 和 [Ryan] (男主持) 交替对话。
+    """
+    prompt: str = (
+        "你是一个播客脚本创作专家。请将以下输入的文章或网页内容，改编为一个类似 NotebookLM 风格的双人对谈播客脚本。\n"
+        "要求：\n"
+        "1. 播客有两个主持人：[Serena] (女性，语气温和、好奇、擅长引导和总结) 和 [Ryan] (男性，语气幽默、博学、擅长解释专业概念和给出例证)。\n"
+        "2. 他们需要交替对话，以通俗易懂、口语化、生动有趣的方式讨论和解释输入文章的核心内容，让听众像听故事一样理解这篇文章。\n"
+        "3. 输出格式必须严格遵循以下格式（中英文冒号均可，但每行必须以 [Serena]: 或 [Ryan]: 开头，且只有这两个人，绝不能包含其他说话人）：\n"
+        "   [Serena]: [说话内容]\n"
+        "   [Ryan]: [说话内容]\n"
+        "4. 对话内容应使用全中文进行（但技术术语和专有名词可保留英文，以便自然朗读）。\n"
+        "5. 对话轮数建议在 8 到 15 轮之间，使内容充实。每一轮说话要口语化，不要过长（单次说话在 50~150 字以内为宜）。\n"
+        "6. 仅输出最终的对话内容，绝对不能包含任何 ```markdown、多余的前言、后记或解释性段落。\n\n"
+        f"待对谈解释的原文内容如下：\n{text}"
+    )
+    return call_gemini(prompt, task_level="standard", step_name="PodcastDiscussion")
+
+def generate_podcast_translation(text: str) -> str:
+    """
+    将输入的原文内容翻译成由 [Serena] (提问/引导者) 和 [Ryan] (翻译/解答者) 之间进行一问一答的多轮翻译对话。
+    """
+    prompt: str = (
+        "你是一个播客翻译和编辑专家。请将以下输入的内容，以双人对谈翻译（一问一答）的形式翻译并改编为中文播客脚本。\n"
+        "要求：\n"
+        "1. 播客有两个角色：[Serena] (负责用中文进行提问、引出段落主题或承上启下) 和 [Ryan] (负责对原文的具体内容进行直译、解释与解答)。\n"
+        "2. 你需要梳理文章脉络，如果是访谈记录，则直接对应翻译；如果是单人文章，请将其解构为 [Serena] 提问/引导、[Ryan] 翻译/具体阐述的交替对话形式。\n"
+        "3. 输出格式必须严格遵循以下格式（中英文冒号均可，但每行必须以 [Serena]: 或 [Ryan]: 开头）：\n"
+        "   [Serena]: [用中文提问或引导]\n"
+        "   [Ryan]: [对应的中文翻译与具体解释内容]\n"
+        "4. 所有的对话和回答均使用中文进行。\n"
+        "5. 仅输出最终的对话内容，绝对不能包含任何 ```markdown、多余的前言、后记或解释性段落。\n\n"
+        f"待翻译并解构的原文内容如下：\n{text}"
+    )
+    return call_gemini(prompt, task_level="standard", step_name="PodcastTranslation")
+
 if __name__ == "__main__":
     if not API_KEYS:
         print("Test Aborted: No API keys configured.")

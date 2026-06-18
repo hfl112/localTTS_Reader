@@ -178,3 +178,85 @@ class TextProcessor:
             chunks.append(current_chunk.strip())
             
         return [c for c in chunks if c.strip()]
+
+    def parse_dialogue_or_text(self, text: str) -> list:
+        # 定义 Serena 和 Ryan 的参考路径
+        base_ref_path = "/Users/funanhe/00_MyCode/TTS/reference"
+        serena_ref_audio = f"{base_ref_path}/bbc_news.wav"
+        serena_ref_text = "This is the research headquarters for one of the oldest companies in tech, IBM."
+        
+        ryan_ref_audio = f"{base_ref_path}/ref_ryan.wav"
+        ryan_ref_text = "各位听众大家好，欢迎收听本期的新闻快报，我是男主持瑞恩。"
+        
+        # 1. 识别对话标识，例如:
+        # [Serena]: Hello
+        # [Ryan]: Hi
+        # Serena: Hello
+        # Ryan: Hi
+        # 支持中英文冒号，支持括号
+        lines = text.split("\n")
+        dialogue_pattern = re.compile(r'^\s*(?:\[?(Serena|Ryan)\]?)\s*[:：]\s*(.*)', re.IGNORECASE)
+        
+        turns = []
+        is_dialogue = False
+        
+        for line in lines:
+            if not line.strip():
+                continue
+            match = dialogue_pattern.match(line)
+            if match:
+                is_dialogue = True
+                speaker = match.group(1).strip().capitalize() # 规范化为 "Serena" 或 "Ryan"
+                content = match.group(2).strip()
+                turns.append((speaker, content))
+            else:
+                # 如果当前行没有匹配到，但前面已经是对话模式，我们可以追加到上一个人的说话内容里
+                if is_dialogue and turns:
+                    prev_speaker, prev_content = turns[-1]
+                    turns[-1] = (prev_speaker, prev_content + "\n" + line.strip())
+                else:
+                    # 还没有开启对话模式，按普通文本存
+                    turns.append((None, line.strip()))
+                    
+        # 如果至少有一次检测到了 Serena 或 Ryan 说话，那么就按对话模式分发
+        # 否则回退为普通文本
+        has_dialogue = any(sp in ["Serena", "Ryan"] for sp, _ in turns)
+        
+        final_chunks = []
+        if has_dialogue:
+            for speaker, content in turns:
+                if not content.strip():
+                    continue
+                # 将本段内容使用 smart_split 切分
+                sub_chunks = self.smart_split(content)
+                for chunk in sub_chunks:
+                    if not chunk.strip():
+                        continue
+                    
+                    if speaker == "Serena":
+                        cfg = {
+                            "voice": "Serena",
+                            "instruct": "Professional female anchor, steady and clear.",
+                            "ref_audio": serena_ref_audio,
+                            "ref_text": serena_ref_text
+                        }
+                    elif speaker == "Ryan":
+                        cfg = {
+                            "voice": "Ryan",
+                            "instruct": "A professional male anchor, reading news in a steady and clear voice.",
+                            "ref_audio": ryan_ref_audio,
+                            "ref_text": ryan_ref_text
+                        }
+                    else:
+                        cfg = {}
+                    
+                    final_chunks.append({
+                        "text": chunk,
+                        "config": cfg
+                    })
+        else:
+            # 普通文本直接 smart_split，返回普通的字符串列表即可
+            final_chunks = self.smart_split(text)
+            
+        return final_chunks
+
