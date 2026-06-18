@@ -13,7 +13,6 @@ from contextlib import asynccontextmanager
 import uvicorn
 import traceback
 import signal
-import re
 
 # 确保能找到 core 目录
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -30,6 +29,8 @@ from core.processor import TextProcessor
 from core.storage import Storage
 from core.state.runtime_state import RuntimeState
 from core.services.playback_service import PlaybackService
+from core.services.podcast_service import PodcastService
+from core.services.performance import get_performance_profile
 
 CACHE_DIR = os.path.join(BASE_DIR, "data", "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -38,44 +39,6 @@ os.makedirs(PODCAST_CHUNK_DIR, exist_ok=True)
 
 # 终极同步信号：必须是字符串，确保跨进程一致
 GLOBAL_SENTINEL = "PIPELINE_END_STRICT_V1"
-
-PERFORMANCE_PROFILES = {
-    "fast": {
-        "chunk_sleep": 0.02,
-        "sentence_sleep": 0.5,
-        "buffer_high_sec": 30.0,
-        "buffer_low_sec": 12.0,
-        "podcast_pause_poll_sec": 1.0,
-        "model": None,
-    },
-    "balanced": {
-        "chunk_sleep": 0.08,
-        "sentence_sleep": 1.5,
-        "buffer_high_sec": 20.0,
-        "buffer_low_sec": 8.0,
-        "podcast_pause_poll_sec": 2.0,
-        "model": None,
-    },
-    "quiet": {
-        "chunk_sleep": 0.25,
-        "sentence_sleep": 3.0,
-        "buffer_high_sec": 10.0,
-        "buffer_low_sec": 4.0,
-        "podcast_pause_poll_sec": 3.0,
-        "model": "Qwen3-TTS-0.6B",
-    },
-}
-
-def get_performance_profile(name: str | None) -> dict:
-    profile_name = name if name in PERFORMANCE_PROFILES else "balanced"
-    profile = PERFORMANCE_PROFILES[profile_name].copy()
-    profile["name"] = profile_name
-    return profile
-
-def estimate_reading_minutes(text: str) -> float:
-    zh_chars = len([ch for ch in text if '\u4e00' <= ch <= '\u9fff'])
-    en_words = len([w for w in re.split(r"\s+", text) if w.strip()])
-    return (zh_chars / 250.0) + (en_words / 150.0)
 
 def get_text_hash(text):
     return hashlib.md5(text.encode('utf-8')).hexdigest()
@@ -431,8 +394,6 @@ async def read_text(data: dict = Body(...)):
 
 @app.post("/stop")
 async def stop_read():
-    global ACTIVE_PODCAST_PROCS, ACTIVE_PODCAST_TASKS
-    
     runtime_state.clear_current_media()
     runtime_state.reset_podcast_generation()
     
@@ -440,20 +401,8 @@ async def stop_read():
     runtime_state.set_main(is_playing=False)
     S.set_status("IDLE")
     
-    # Cancel all active podcast generation processes
-    for p in ACTIVE_PODCAST_PROCS:
-        if p.is_alive():
-            try: p.terminate()
-            except: pass
-    ACTIVE_PODCAST_PROCS.clear()
-    ACTIVE_PODCAST_TASKS.clear()
-    
-    # Cleanup pending podcast files
-    if os.path.exists(PODCASTS_DIR):
-        for f in os.listdir(PODCASTS_DIR):
-            if ".pending_" in f:
-                try: os.remove(os.path.join(PODCASTS_DIR, f))
-                except: pass
+    podcast_service.cancel_all()
+    podcast_service.cleanup_pending_files()
                 
     return {"status": "ok"}
 
@@ -498,10 +447,8 @@ async def debug_state():
         **playback_service.snapshot(),
         "status_code": S.get_status(),
         **runtime_snapshot,
-        "podcast_generation_paused": GLOBAL_PAUSE_EVENT.is_set(),
-        "on_battery_power": is_on_battery_power(),
+        **podcast_service.snapshot(),
         "active_url_tasks": list(ACTIVE_URL_TASKS.keys()),
-        "active_podcast_processes": sum(1 for p in ACTIVE_PODCAST_PROCS if p.is_alive()),
     }
 
 @app.post("/pause")
@@ -566,191 +513,14 @@ async def seek_playback(data: dict = Body(...)):
     return {"status": "seeking", "new_index": new_idx}
 
 import asyncio
-import subprocess
 
 ACTIVE_URL_TASKS: dict[str, dict] = {}
-ACTIVE_PODCAST_PROCS = []
-ACTIVE_PODCAST_TASKS = {}
-
-GLOBAL_PAUSE_EVENT = mp.Event()
-GLOBAL_PODCAST_GPU_LOCK = mp.Lock()
-
-def is_on_battery_power() -> bool:
-    try:
-        result = subprocess.run(
-            ["pmset", "-g", "batt"],
-            capture_output=True,
-            text=True,
-            timeout=1,
-        )
-        return "Battery Power" in result.stdout
-    except Exception:
-        return False
-
-def podcast_manager_loop():
-    while True:
-        # Update last active time if anything is actively playing or URL is being fetched
-        runtime_snapshot = runtime_state.snapshot()
-        has_frontend_activity = runtime_snapshot["main_is_playing"] or len(ACTIVE_URL_TASKS) > 0
-        runtime_state.update_activity_if_busy(has_frontend_activity)
-        runtime_snapshot = runtime_state.snapshot()
-            
-        should_pause = (
-            runtime_snapshot["main_is_playing"]
-            or len(ACTIVE_URL_TASKS) > 0
-            or (time.time() - runtime_snapshot["last_active_time"] < 120)
-            or is_on_battery_power()
-        )
-
-        if should_pause:
-            if not GLOBAL_PAUSE_EVENT.is_set():
-                GLOBAL_PAUSE_EVENT.set()
-        else:
-            if GLOBAL_PAUSE_EVENT.is_set():
-                GLOBAL_PAUSE_EVENT.clear()
-        time.sleep(2)
-
-threading.Thread(target=podcast_manager_loop, daemon=True).start()
-
-def prepare_podcast_config(config: dict, text: str, force_small_model: bool = False) -> dict:
-    podcast_config = config.copy()
-    podcast_config["performance_profile"] = podcast_config.get("performance_profile", "quiet")
-    profile = get_performance_profile(podcast_config["performance_profile"])
-    if force_small_model or estimate_reading_minutes(text) >= 20.0:
-        podcast_config["model"] = profile.get("model") or "Qwen3-TTS-0.6B"
-    return podcast_config
-
-def wait_for_podcast_slot(pause_event, poll_sec: float) -> None:
-    while pause_event.is_set():
-        time.sleep(poll_sec)
-
-def generate_podcast_chunks(
-    engine: TTSEngine,
-    text: str,
-    config: dict,
-    chunk_dir: str,
-    pause_event,
-) -> list[str]:
-    profile = get_performance_profile(config.get("performance_profile"))
-    os.makedirs(chunk_dir, exist_ok=True)
-    chunks = TextProcessor().parse_dialogue_or_text(
-        text,
-        performance_profile=config.get("performance_profile", "quiet"),
-    )
-    chunk_files: list[str] = []
-    progress_path = os.path.join(chunk_dir, "progress.json")
-
-    for idx, chunk in enumerate(chunks):
-        chunk_file = os.path.join(chunk_dir, f"chunk_{idx:05d}.npy")
-        chunk_files.append(chunk_file)
-        if os.path.exists(chunk_file):
-            continue
-
-        wait_for_podcast_slot(pause_event, profile["podcast_pause_poll_sec"])
-        if isinstance(chunk, dict):
-            chunk_config = config.copy()
-            chunk_config.update(chunk.get('config', {}))
-            actual_text = chunk['text']
-        else:
-            chunk_config = config
-            actual_text = chunk
-
-        parts = []
-        for samples in engine.generate_stream(actual_text, chunk_config):
-            parts.append(samples)
-            time.sleep(profile["chunk_sleep"])
-
-        if parts:
-            np.save(chunk_file, np.concatenate(parts).astype(np.float32))
-            with open(progress_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {"completed_chunks": idx + 1, "total_chunks": len(chunks)},
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-        time.sleep(profile["sentence_sleep"])
-
-    return chunk_files
-
-def write_podcast_wav_from_chunks(chunk_files: list[str], output_path: str) -> bool:
-    existing_chunks = [path for path in chunk_files if os.path.exists(path)]
-    if not existing_chunks:
-        return False
-    audio_parts = [np.load(path) for path in existing_chunks]
-    full_wav = np.concatenate(audio_parts)
-    wav_data = (np.clip(full_wav, -1.0, 1.0) * 32767).astype(np.int16)
-    scipy.io.wavfile.write(output_path, 24000, wav_data)
-    return True
-
-def run_single_podcast_generation_thread(text: str, config: dict, md5: str, source: str, pause_event, gpu_lock, title: str = None) -> None:
-    import traceback
-    try:
-        os.nice(19)
-        print("[PodcastProcess] Nice level set to 19 (lowest priority)")
-    except Exception as e:
-        print(f"[PodcastProcess] Failed to set nice level: {e}")
-        
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-    os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
-    if title:
-        safe_title = "".join(c for c in title if c.isalnum() or '\u4e00' <= c <= '\u9fff' or c in '[]_-')
-    else:
-        safe_title = "".join(c for c in text[:20] if c.isalnum() or '\u4e00' <= c <= '\u9fff' or c in '[]_-')
-    if not safe_title: safe_title = "无标题"
-    
-    pending_file = os.path.join(PODCASTS_DIR, f".pending_单篇_{source}_{safe_title}_{md5[:8]}")
-    os.makedirs(os.path.dirname(pending_file), exist_ok=True)
-    with open(pending_file, "w") as f: f.write(text[:20])
-    try:
-        with gpu_lock:
-            config = prepare_podcast_config(config, text)
-            engine = TTSEngine(model_path=f"models/{config.get('model', 'Qwen3-TTS-1.7B-8bit')}", mlx_audio_path="../../mlx_audio")
-            engine.ensure_model_loaded()
-            chunk_dir = os.path.join(PODCAST_CHUNK_DIR, f"single_{md5[:12]}")
-            chunk_files = generate_podcast_chunks(engine, text, config, chunk_dir, pause_event)
-            out_name = f"podcast_单篇_{source}_{safe_title}_{md5[:8]}_{int(time.time())}.wav"
-            write_podcast_wav_from_chunks(chunk_files, os.path.join(PODCASTS_DIR, out_name))
-    except Exception as e:
-        print(f"[PodcastProcess] Error: {e}")
-        traceback.print_exc()
-    finally:
-        if os.path.exists(pending_file): os.remove(pending_file)
-
-def run_podcast_generation_thread(filename: str, text: str, config: dict, pause_event, gpu_lock) -> None:
-    import traceback
-    try:
-        os.nice(19)
-        print("[PodcastProcess] Nice level set to 19 (lowest priority)")
-    except Exception as e:
-        print(f"[PodcastProcess] Failed to set nice level: {e}")
-        
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-    os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
-    pending_file = filename.replace(".wav", "") + ".pending_合集"
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    with open(pending_file, "w") as f: f.write("pending")
-    try:
-        with gpu_lock:
-            config = prepare_podcast_config(config, text, force_small_model=True)
-            engine = TTSEngine(model_path=f"models/{config.get('model', 'Qwen3-TTS-1.7B-8bit')}", mlx_audio_path="../../mlx_audio")
-            engine.ensure_model_loaded()
-            batch_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
-            chunk_dir = os.path.join(PODCAST_CHUNK_DIR, f"batch_{batch_hash[:12]}")
-            chunk_files = generate_podcast_chunks(engine, text, config, chunk_dir, pause_event)
-            write_podcast_wav_from_chunks(chunk_files, filename)
-    except Exception as e:
-        print(f"[PodcastProcess] Error: {e}")
-    finally:
-        if os.path.exists(pending_file): os.remove(pending_file)
+podcast_service = PodcastService(
+    podcasts_dir=PODCASTS_DIR,
+    podcast_chunk_dir=PODCAST_CHUNK_DIR,
+    runtime_state=runtime_state,
+    active_url_tasks=ACTIVE_URL_TASKS,
+)
 
 @app.post("/read_url")
 async def read_url(payload: dict = Body(...)) -> dict:
@@ -1009,7 +779,6 @@ async def save_for_later(data: dict = Body(...)):
 
 @app.post("/generate_single_podcast")
 async def generate_single_podcast(data: dict = Body(...)):
-    global ACTIVE_PODCAST_PROCS, ACTIVE_PODCAST_TASKS
     runtime_state.touch_activity()
     
     text = data.get("text", "").strip()
@@ -1020,31 +789,21 @@ async def generate_single_podcast(data: dict = Body(...)):
     
     md5_val = hashlib.md5(text.encode("utf-8")).hexdigest()
     
-    # 过滤并清理已结束的任务进程
-    for m, proc in list(ACTIVE_PODCAST_TASKS.items()):
-        if not proc.is_alive():
-            ACTIVE_PODCAST_TASKS.pop(m, None)
-            
     # 如果检测到相同内容的任务已在生成中，直接返回成功状态（不需要重复排队）
-    if md5_val in ACTIVE_PODCAST_TASKS:
+    if podcast_service.is_generating(md5_val):
         return {"status": "generating", "md5": md5_val, "message": "该内容已在后台生成中，无需重复提交！"}
         
     config = storage.load_config()
     config["performance_profile"] = data.get("performance_profile", "quiet")
     if voice:
         config["voice"] = voice
-    p = mp.Process(target=run_single_podcast_generation_thread, args=(text, config, md5_val, source, GLOBAL_PAUSE_EVENT, GLOBAL_PODCAST_GPU_LOCK, title), daemon=True)
-    p.start()
-    
-    ACTIVE_PODCAST_PROCS = [proc for proc in ACTIVE_PODCAST_PROCS if proc.is_alive()]
-    ACTIVE_PODCAST_PROCS.append(p)
-    ACTIVE_PODCAST_TASKS[md5_val] = p
-    
-    async def cleanup(proc, m):
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, proc.join)
-        ACTIVE_PODCAST_TASKS.pop(m, None)
-    asyncio.create_task(cleanup(p, md5_val))
+    podcast_service.start_single(
+        text=text,
+        config=config,
+        md5=md5_val,
+        source=source,
+        title=title,
+    )
     
     return {"status": "generating", "md5": md5_val}
 
@@ -1058,8 +817,6 @@ async def clear_saved_items():
 
 @app.post("/generate_podcast")
 async def generate_podcast_api():
-    global ACTIVE_PODCAST_PROCS, ACTIVE_PODCAST_TASKS
-    
     save_file = os.path.join(BASE_DIR, "data", "saved_for_later.json")
     saved_items = []
     with save_file_lock:
@@ -1072,13 +829,8 @@ async def generate_podcast_api():
     text = "\n\n".join(item.get("text", "") for item in saved_items)
     md5_val = hashlib.md5(text.encode("utf-8")).hexdigest()
     
-    # 过滤并清理已结束的任务进程
-    for m, proc in list(ACTIVE_PODCAST_TASKS.items()):
-        if not proc.is_alive():
-            ACTIVE_PODCAST_TASKS.pop(m, None)
-            
     # 如果检测到相同内容的任务已在生成中，直接返回成功并清空原列表
-    if md5_val in ACTIVE_PODCAST_TASKS:
+    if podcast_service.is_generating(md5_val):
         with save_file_lock:
             with open(save_file, "w", encoding="utf-8") as f: json.dump([], f)
         return {"status": "generating", "message": "该合集内容已在后台生成中，无需重复提交！"}
@@ -1092,18 +844,12 @@ async def generate_podcast_api():
     if first_voice:
         config["voice"] = first_voice
         
-    p = mp.Process(target=run_podcast_generation_thread, args=(filename, text, config, GLOBAL_PAUSE_EVENT, GLOBAL_PODCAST_GPU_LOCK), daemon=True)
-    p.start()
-    
-    ACTIVE_PODCAST_PROCS = [proc for proc in ACTIVE_PODCAST_PROCS if proc.is_alive()]
-    ACTIVE_PODCAST_PROCS.append(p)
-    ACTIVE_PODCAST_TASKS[md5_val] = p
-    
-    async def cleanup(proc, m):
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, proc.join)
-        ACTIVE_PODCAST_TASKS.pop(m, None)
-    asyncio.create_task(cleanup(p, md5_val))
+    podcast_service.start_batch(
+        filename=filename,
+        text=text,
+        config=config,
+        md5=md5_val,
+    )
     
     with save_file_lock:
         with open(save_file, "w", encoding="utf-8") as f: json.dump([], f)
