@@ -12,7 +12,6 @@ import numpy as np
 import scipy.io.wavfile
 
 from core.processor import TextProcessor
-from core.tts_engine import TTSEngine
 from core.services.performance import estimate_reading_minutes, get_performance_profile
 
 
@@ -48,7 +47,7 @@ def wait_for_podcast_slot(pause_event, poll_sec: float) -> None:
 
 
 def generate_podcast_chunks(
-    engine: TTSEngine,
+    engine: Any,
     text: str,
     config: dict[str, Any],
     chunk_dir: str,
@@ -152,6 +151,8 @@ def run_single_podcast_generation_thread(
         f.write(text[:20])
     try:
         with gpu_lock:
+            from core.tts_engine import TTSEngine
+
             config = prepare_podcast_config(config, text)
             engine = TTSEngine(
                 model_path=f"models/{config.get('model', 'Qwen3-TTS-1.7B-8bit')}",
@@ -186,6 +187,8 @@ def run_podcast_generation_thread(
         f.write("pending")
     try:
         with gpu_lock:
+            from core.tts_engine import TTSEngine
+
             config = prepare_podcast_config(config, text, force_small_model=True)
             engine = TTSEngine(
                 model_path=f"models/{config.get('model', 'Qwen3-TTS-1.7B-8bit')}",
