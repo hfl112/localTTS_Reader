@@ -62,6 +62,7 @@ PCMPlayer(sounddevice/CoreAudio)
 - endpoint 请求参数必须优先在 `core/api_models.py` 中定义 Pydantic model，避免 route 内继续手写松散 `dict.get()` 解析。
 - `GLOBAL_SENTINEL = "PIPELINE_END_STRICT_V1"` 必须保持字符串，保证 `mp.Queue` 跨进程序列化稳定。
 - 实时朗读默认 `balanced`；后台 podcast 默认 `quiet`；长单篇和合集 podcast 优先使用 `Qwen3-TTS-0.6B` 降温。
+- 后台 podcast 暂停策略：前台真实播放时暂停；播放器 pause 后只保留 120 秒冷却窗口，长时间 pause 会释放后台生成。
 - `PodcastService` 是后台 podcast 进程、暂停事件、GPU 锁和 chunk checkpoint 的唯一 owner。
 - `podcast_jobs.json` 是后台 podcast 任务的状态快照；`runtime_events.jsonl` 是排查串台、静音、任务残留和过热暂停的事件历史。
 - `/read_url` 直接调用 `URL-Reader/reader_service.py`，不要再绕回 `read_url_cli.py` 子进程；CLI 只保留手工调试入口。

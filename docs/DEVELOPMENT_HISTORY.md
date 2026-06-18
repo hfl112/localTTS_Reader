@@ -267,4 +267,15 @@
 *   **验证结果**：`python -m py_compile ...` 通过；`python -m pytest -q QwenTTS-App/core/tests/test_services_smoke.py` → `10 passed`。
 
 ---
-**当前状态**: 🏆 服务层架构 + Pydantic 请求模型 + PlaybackService 播放隔离 + PodcastService 后台生成 + URL reader service + runtime event log + podcast_jobs/url_jobs + 10 个 smoke tests，长文/长播客与网页输入管线的串台、发热、任务残留、接口漂移和重复处理风险都已进入可控状态 | **负责人**: Codex
+
+## 📅 第十八阶段：长暂停释放后台 Podcast 生成 (2026-06-18)
+*   **目标**：修复播放器长时间 pause 后，`main_is_playing=True` 仍被后台 podcast 调度器视为前台播放，导致后台生成一直不恢复的问题。
+*   **核心改动**：
+    1.  **真实前台活跃判断**：`PodcastService` 新增 `is_frontend_active` 回调，后端传入 `main_is_playing and not player.is_paused`，不再把 pause 状态永久当作正在播放。
+    2.  **保留短暂停保护**：播放器 pause 后仍受 120 秒 recent-activity 冷却保护；超过冷却窗口后，后台 podcast 会自动恢复。
+    3.  **暂停原因诊断**：`/debug/state` 新增 `podcast_generation_pause_reason`，可区分 `frontend_active`、`url_active`、`recent_activity`、`battery` 和 `none`。
+    4.  **测试补充**：smoke tests 扩展到 12 个，覆盖长暂停允许后台生成、真实前台播放阻止后台生成。
+*   **验证结果**：`python -m py_compile ...` 通过；`python -m pytest -q QwenTTS-App/core/tests/test_services_smoke.py` → `12 passed`。
+
+---
+**当前状态**: 🏆 服务层架构 + Pydantic 请求模型 + PlaybackService 播放隔离 + PodcastService 后台生成 + URL reader service + runtime event log + podcast_jobs/url_jobs + 长暂停恢复策略 + 12 个 smoke tests，长文/长播客与网页输入管线的串台、发热、任务残留、接口漂移和重复处理风险都已进入可控状态 | **负责人**: Codex

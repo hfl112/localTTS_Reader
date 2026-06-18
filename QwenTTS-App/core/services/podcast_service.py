@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import scipy.io.wavfile
@@ -250,11 +250,13 @@ class PodcastService:
         active_url_tasks: dict[str, dict],
         jobs_file: str | None = None,
         event_log: RuntimeEventLog | None = None,
+        is_frontend_active: Callable[[], bool] | None = None,
     ) -> None:
         self.podcasts_dir = podcasts_dir
         self.podcast_chunk_dir = podcast_chunk_dir
         self.runtime_state = runtime_state
         self.active_url_tasks = active_url_tasks
+        self.is_frontend_active = is_frontend_active
         self.job_store = PodcastJobStore(
             jobs_file
             or os.path.join(os.path.dirname(self.podcast_chunk_dir), "podcast_jobs.json")
@@ -266,33 +268,48 @@ class PodcastService:
         self.active_procs: list[mp.Process] = []
         self.active_tasks: dict[str, mp.Process] = {}
         self.active_job_ids: dict[str, str] = {}
+        self.last_pause_reason = "recent_activity"
         threading.Thread(target=self._manager_loop, daemon=True).start()
 
     def _manager_loop(self) -> None:
         while True:
-            runtime_snapshot = self.runtime_state.snapshot()
-            has_frontend_activity = (
-                runtime_snapshot["main_is_playing"] or len(self.active_url_tasks) > 0
-            )
-            self.runtime_state.update_activity_if_busy(has_frontend_activity)
-            runtime_snapshot = self.runtime_state.snapshot()
-
-            should_pause = (
-                runtime_snapshot["main_is_playing"]
-                or len(self.active_url_tasks) > 0
-                or (time.time() - runtime_snapshot["last_active_time"] < 120)
-                or is_on_battery_power()
-            )
+            should_pause, reason = self._pause_state()
 
             if should_pause:
+                self.last_pause_reason = reason
                 if not self.pause_event.is_set():
                     self.pause_event.set()
-                    self._record_event("podcast_generation_paused")
+                    self._record_event("podcast_generation_paused", reason=reason)
             else:
+                self.last_pause_reason = "none"
                 if self.pause_event.is_set():
                     self.pause_event.clear()
                     self._record_event("podcast_generation_resumed")
             time.sleep(2)
+
+    def _frontend_active(self) -> bool:
+        if self.is_frontend_active is not None:
+            try:
+                return bool(self.is_frontend_active())
+            except Exception:
+                return True
+        return bool(self.runtime_state.snapshot()["main_is_playing"])
+
+    def _pause_state(self) -> tuple[bool, str]:
+        frontend_active = self._frontend_active()
+        url_active = len(self.active_url_tasks) > 0
+        self.runtime_state.update_activity_if_busy(frontend_active or url_active)
+        runtime_snapshot = self.runtime_state.snapshot()
+
+        if frontend_active:
+            return True, "frontend_active"
+        if url_active:
+            return True, "url_active"
+        if time.time() - runtime_snapshot["last_active_time"] < 120:
+            return True, "recent_activity"
+        if is_on_battery_power():
+            return True, "battery"
+        return False, "none"
 
     def cleanup_finished(self) -> None:
         for md5, proc in list(self.active_tasks.items()):
@@ -439,6 +456,7 @@ class PodcastService:
         self.cleanup_finished()
         return {
             "podcast_generation_paused": self.pause_event.is_set(),
+            "podcast_generation_pause_reason": self.last_pause_reason,
             "on_battery_power": is_on_battery_power(),
             "active_podcast_processes": sum(1 for p in self.active_procs if p.is_alive()),
             "podcast_jobs": self.job_store.list()[:20],

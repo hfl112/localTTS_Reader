@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import multiprocessing as mp
+import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT not in sys.path:
@@ -87,6 +88,41 @@ def test_podcast_service_file_ops():
         assert service.find_file(os.path.basename(path)) == path
         assert service.toggle_pin(os.path.basename(path))["status"] == "ok"
         assert service.delete("pinned_" + os.path.basename(path))["status"] == "ok"
+
+
+def test_podcast_pause_state_allows_long_paused_frontend():
+    with tempfile.TemporaryDirectory() as tmp:
+        state = RuntimeState()
+        state.set_main(is_playing=True)
+        state.last_active_time = time.time() - 180
+        service = PodcastService(
+            podcasts_dir=os.path.join(tmp, "podcasts"),
+            podcast_chunk_dir=os.path.join(tmp, "chunks"),
+            runtime_state=state,
+            active_url_tasks={},
+            is_frontend_active=lambda: False,
+        )
+
+        should_pause, reason = service._pause_state()
+        assert should_pause is False
+        assert reason == "none"
+
+
+def test_podcast_pause_state_blocks_active_frontend():
+    with tempfile.TemporaryDirectory() as tmp:
+        state = RuntimeState()
+        state.last_active_time = time.time() - 180
+        service = PodcastService(
+            podcasts_dir=os.path.join(tmp, "podcasts"),
+            podcast_chunk_dir=os.path.join(tmp, "chunks"),
+            runtime_state=state,
+            active_url_tasks={},
+            is_frontend_active=lambda: True,
+        )
+
+        should_pause, reason = service._pause_state()
+        assert should_pause is True
+        assert reason == "frontend_active"
 
 
 def test_runtime_event_log_recent_events():

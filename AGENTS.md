@@ -78,6 +78,7 @@ python -m mlx_audio.server                # Web UI + API (port 8000)
 **API request schemas**: Define new endpoint request bodies in `core/api_models.py` with Pydantic models. Avoid adding new loose `dict = Body(...)` parsing in `backend.py`.
 **URL input pipeline**: `/read_url` calls `URL-Reader/reader_service.py` directly from a backend async task. `read_url_cli.py` is only a thin manual CLI wrapper; do not reintroduce per-request CLI subprocess dispatch.
 **Performance profiles**: `fast`, `balanced`, and `quiet` live in `core/services/performance.py`. Realtime reading defaults to `balanced`; podcast generation defaults to `quiet`; long single podcasts and all batch podcasts should prefer `Qwen3-TTS-0.6B`.
+**Podcast pause policy**: `PodcastService` should pause background generation while frontend audio is actively playing, while URL jobs are active, during the 120s recent-activity cooldown, or on battery. A paused player is not active playback forever; after the cooldown, background podcast generation should resume.
 **Audio cache**: 10 `.npy` files in `QwenTTS-App/data/cache/`, MD5-keyed, LRU by mtime.
 **Sentinel**: string `"PIPELINE_END_STRICT_V1"` shared by inference worker and player (must remain a `str` to survive `mp.Queue` pickling).
 **Cruise mode**: realtime inference uses profile-specific buffer high/low watermarks (`balanced`: 20s/8s, `quiet`: 10s/4s, `fast`: 30s/12s) to cool the GPU.

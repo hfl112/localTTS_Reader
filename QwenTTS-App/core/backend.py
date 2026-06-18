@@ -521,6 +521,9 @@ podcast_service = PodcastService(
     active_url_tasks=ACTIVE_URL_TASKS,
     jobs_file=PODCAST_JOBS_FILE,
     event_log=event_log,
+    is_frontend_active=lambda: bool(
+        runtime_state.snapshot()["main_is_playing"] and player is not None and not player.is_paused
+    ),
 )
 
 @app.post("/read_url")
