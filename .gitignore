@@ -53,3 +53,9 @@ podcasts/
 localTTS_macOS/release_runtime/
 # requirements.prod.lock is a tracked source-of-truth (overrides *.lock above)
 !localTTS_macOS/requirements.prod.lock
+
+# QwenTTS Swift sources include a 'Models/' dir (ModelManager.swift). The
+# case-insensitive **/models/ weight-dir rule (macOS core.ignorecase=true) would
+# otherwise drop it from git and break a clean-checkout build. Re-include it.
+!localTTS_macOS/QwenTTS/QwenTTS/Models/
+!localTTS_macOS/QwenTTS/QwenTTS/Models/**
