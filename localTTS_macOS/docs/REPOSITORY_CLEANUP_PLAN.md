@@ -99,7 +99,9 @@ cd backend && python -m pytest core/tests/ -v    # 后端测试全过（当前 3
 
 ---
 
-## Step 2：建立 `scripts/` 与 `experiments/`，迁移 spike
+## Step 2：建立 `scripts/` 与 `experiments/`，迁移 spike ✅ 已完成
+
+> `git mv` 移动：`ProcessSupervisorSpike.swift`+`watchdog_helper.py`→`experiments/process-supervisor/`，`test_click/menu.swift`→`experiments/ui-smoke/`（均 rename 保留历史）；`git rm` 删 `ProcessSupervisorSpike`、`QwenTTS_bin`（编译产物）；更新 spike 内 helper 绝对路径到新位置。已提交 `fabd641`。验收：根目录无 spike/临时测试/二进制、主工程零引用。`scripts/` 暂空（Step 5 填 `check_boundaries.py`）。
 
 - **目标**：根目录不再出现 spike、临时测试、编译二进制。
 - **步骤**（用 `git mv` 保留历史；Step 0 后才可用）：
@@ -119,7 +121,9 @@ cd backend && python -m pytest core/tests/ -v    # 后端测试全过（当前 3
 
 ---
 
-## Step 3：清缓存，确认产物不入库
+## Step 3：清缓存，确认产物不入库 ✅ 已完成
+
+> 删除 `__pycache__`/`.pytest_cache`/`.DS_Store`；验收：`build`/`dist`/`release_runtime`/`__pycache__`/`.pytest_cache` 的 `git ls-files` 计数全为 0，且 `build/`/`dist/`/`release_runtime/` 处于 `!!` ignored 状态。无 git 变更（清的均为未跟踪缓存）。
 
 - **目标**：缓存目录清除；`build/`/`dist/`/`release_runtime/` 本地存在但不被 git 跟踪。
 - **步骤**：
@@ -136,7 +140,9 @@ cd backend && python -m pytest core/tests/ -v    # 后端测试全过（当前 3
 
 ---
 
-## Step 4：固化 native↔legacy 边界（加护栏，防回归）
+## Step 4：固化 native↔legacy 边界（加护栏，防回归）✅ 已完成（验证）
+
+> 扫描确认无真实违规：发布脚本不从父级复制；Swift 仅注释提及 native `Resources/Backend/mlx_audio`；`paths.py` 的 `QwenTTS-App/data` 是显式一次性 migration（backend 下不存在→no-op）+ 边界注释；README 为边界约束文档。唯一遗留是 `URL-Reader/read_url_cli.py` 的 print 字符串仍写"QwenTTS-App"（命名漂移、非代码依赖）→ 归 Step 6 处理。`不应出现`三类（源码复制/Swift 硬编码/PYTHONPATH 注入 legacy）零命中。
 
 - **目标**：保证 native 工程永不依赖父级 `QwenTTS-App/`、父级 `URL-Reader/`、父级 `mlx_audio/`。
 - **现状**：已核实 `package_release.py` 仅从 `ROOT/backend` 复制（`BACKEND_SOURCE = ROOT/"backend"`，mlx_audio/URL-Reader/reference 均在其下），**无父级 `QwenTTS-App` 引用**；`paths.migrate_legacy_data` 指向 `backend/QwenTTS-App/data`（不存在→no-op）。即边界当前**已干净**，本步是防止未来回归。
