@@ -192,7 +192,9 @@ cd backend && python -m pytest core/tests/ -v    # 后端测试全过（当前 3
 
 ---
 
-## Step 7（可后置·重构阶段）：收紧 Swift 后端管理职责
+## Step 7（可后置·重构阶段）：收紧 Swift 后端管理职责 ✅ 首项已完成
+
+> 已提取 `BackendHealthMonitor`（@MainActor，含 `/health` 轮询 + 超时），`BackendProcessManager.startHealthCheck` 改为调用它、删除 `healthTask`/`launchTime` 字段。**用 Xcode 26.5 编译 BUILD SUCCEEDED（无 actor/隔离报错）+ 重启 Debug 构建实测后端 ~2s 到 `/health=ready`**（健康轮询→ready→快照轮询链路运行时正常）。已提交 `e982994`。其余拆分（`BackendSupervisor` 重启策略外移等）属可选后续，未做。
 
 - **目标**：避免 `BackendProcessManager` 持续膨胀，保持其为"协调状态机"，职责外移。
 - **步骤**：按职责拆分，并**用真实 Xcode 编译验证**：
