@@ -74,10 +74,17 @@ enum EnvironmentDiagnostics {
                               fixHint: "当前包缺少 ffmpeg，请重新下载完整 DMG；或在「设置 → 运行环境」指定 ffmpeg。"))
         }
 
-        // 5. 模型（0.6B 或 1.7B 任一即可）
+        // 5. 模型（0.6B 或 1.7B 任一即可）。必须查后端实际使用的目录：custom 模式用
+        //    EnvironmentConfigManager.modelsPath（dev 指向 mlx_audio/models），否则
+        //    App Support/QwenTTS/Models——而非 ModelManager 固定的 App Support，否则
+        //    dev 模式会误报缺失。
         func modelInstalled(_ name: String) -> Bool {
-            if case .installed = ModelManager.shared.checkModelStatus(name: name) { return true }
-            return false
+            let dir = modelsDirectory()
+            let m = (dir as NSString).appendingPathComponent(name)
+            let weights = (m as NSString).appendingPathComponent("model.safetensors")
+            let config = (m as NSString).appendingPathComponent("config.json")
+            return FileManager.default.fileExists(atPath: weights)
+                && FileManager.default.fileExists(atPath: config)
         }
         if modelInstalled("Qwen3-TTS-0.6B") {
             items.append(Item(name: "模型", status: .ok, detail: "Qwen3-TTS-0.6B 已安装", fixHint: nil))
@@ -107,6 +114,16 @@ enum EnvironmentDiagnostics {
     /// 是否可进入主界面：无任何 .fail（.warn 允许继续）。
     static func canProceed(_ items: [Item]) -> Bool {
         !items.contains { $0.status == .fail }
+    }
+
+    /// 后端实际使用的模型根目录（与 launcher 注入的 TTS_MODELS_PATH 同源）。
+    static func modelsDirectory() -> String {
+        let cfg = EnvironmentConfigManager.shared
+        if cfg.mode == .custom, !cfg.customConfig.modelsPath.isEmpty {
+            return cfg.customConfig.modelsPath
+        }
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        return appSupport?.appendingPathComponent("QwenTTS/Models").path ?? ""
     }
 
     private static func isAppleSilicon() -> Bool {
