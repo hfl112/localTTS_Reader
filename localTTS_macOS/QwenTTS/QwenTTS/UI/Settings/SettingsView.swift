@@ -55,37 +55,75 @@ struct SettingsCard<Content: View>: View {
 }
 
 struct SettingsView: View {
+    weak var coordinator: ApplicationCoordinator?
+
     @State private var showingRuntimeConfig = false
     @State private var showAdvanced = false
-    
+
     // States
     @State private var defaultVoice = "Serena"
     @State private var performanceMode = "Balanced"
     @State private var batteryPolicy = true
-    
+
     @State private var temperature = 0.2
     @State private var topP = 0.5
     @State private var repPenalty = 1.1
     @State private var seed = "42"
-    
+
+    // 保存/加载状态
+    @State private var isSaving = false
+    @State private var saveStatus: String? = nil
+    @State private var saveOK = true
+    @State private var loadError: String? = nil
+
     // Download States
     @State private var qwen17BDownloading = false
     @State private var qwen17BProgress: Double = 0.0
     @State private var qwen17BError: String? = nil
-    
+
+    // performance_profile：后端用小写 fast/balanced/quiet，UI 用首字母大写。
+    private let perfUIToBackend = ["Fast": "fast", "Balanced": "balanced", "Quiet": "quiet"]
+    private let perfBackendToUI = ["fast": "Fast", "balanced": "Balanced", "quiet": "Quiet"]
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 32) {
-                
+
+                // 保存栏：把本页设置写回后端（PATCH /settings）。
+                HStack(spacing: 12) {
+                    Button(isSaving ? "保存中…" : "保存设置") {
+                        Task { await saveSettings() }
+                    }
+                    .disabled(isSaving)
+                    .keyboardShortcut("s", modifiers: .command)
+
+                    if let saveStatus = saveStatus {
+                        Text(saveStatus)
+                            .font(.system(size: 12))
+                            .foregroundColor(saveOK ? .secondary : .red)
+                    }
+                    Spacer()
+                }
+
+                // 加载失败提示（GET /settings 失败时不再静默）
+                if let loadError = loadError {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+                        Text(loadError).font(.system(size: 12)).foregroundColor(.secondary)
+                        Button("重试") { Task { await loadSettings() } }.controlSize(.small)
+                    }
+                }
+
                 // General Card
                 SettingsCard(title: "General") {
                     SettingsRow("Default Voice:") {
                         Picker("", selection: $defaultVoice) {
-                            Text("Serena").tag("Serena")
-                            Text("Ryan").tag("Ryan")
+                            Text("Serena（女声 · 新闻播报）").tag("Serena")
+                            Text("Ryan（男声 · 中文播报）").tag("Ryan")
+                            Text("Vivian（备用声音）").tag("Vivian")
                         }
                         .pickerStyle(.menu)
-                        .frame(width: 160)
+                        .frame(width: 200)
                     }
                     
                     SettingsRow("Performance Mode:") {
@@ -252,6 +290,54 @@ struct SettingsView: View {
         .sheet(isPresented: $showingRuntimeConfig) {
             RuntimeConfigSheet()
         }
+        .task {
+            await loadSettings()
+        }
+    }
+
+    /// 从后端拉取当前配置并填充到表单（GET /settings）。
+    @MainActor
+    private func loadSettings() async {
+        guard let client = coordinator?.processManager.apiClient else {
+            loadError = "无法加载设置：后端未就绪"; return
+        }
+        guard let s = await client.fetchSettings() else {
+            loadError = "无法加载设置：请求失败（后端可能尚未就绪，可点重试）"; return
+        }
+        loadError = nil
+        if let v = s.voice { defaultVoice = v }
+        if let p = s.performance_profile { performanceMode = perfBackendToUI[p] ?? "Balanced" }
+        if let t = s.temperature { temperature = t }
+        if let tp = s.top_p { topP = tp }
+        if let rp = s.repetition_penalty { repPenalty = rp }
+        if let sd = s.seed { seed = String(sd) }
+        if let bp = s.battery_podcast_policy { batteryPolicy = (bp == "pause") }
+    }
+
+    /// 把表单写回后端（PATCH /settings，需管理令牌）。
+    @MainActor
+    private func saveSettings() async {
+        guard let client = coordinator?.processManager.apiClient else {
+            saveOK = false; saveStatus = "后端未就绪"; return
+        }
+        isSaving = true
+        saveStatus = nil
+        var body: [String: Any] = [
+            "voice": defaultVoice,
+            "performance_profile": perfUIToBackend[performanceMode] ?? "balanced",
+            "temperature": temperature,
+            "top_p": topP,
+            "repetition_penalty": repPenalty,
+            // 后端合法值为 {pause, quiet, allow}；关闭=allow（此前误用 "continue" 是无效值）
+            "battery_podcast_policy": batteryPolicy ? "pause" : "allow",
+        ]
+        if let sd = Int(seed.trimmingCharacters(in: .whitespaces)) { body["seed"] = sd }
+
+        let token = client.managementToken
+        let ok = await client.updateSettings(settings: body, token: token)
+        isSaving = false
+        saveOK = ok
+        saveStatus = ok ? "已保存（性能/模型相关改动可能需重启后端生效）" : "保存失败，请确认后端已就绪"
     }
 }
 
@@ -260,7 +346,7 @@ class SettingsHostingController: NSHostingController<SettingsView> {
     
     init(coordinator: ApplicationCoordinator?) {
         self.coordinator = coordinator
-        super.init(rootView: SettingsView())
+        super.init(rootView: SettingsView(coordinator: coordinator))
     }
     
     @MainActor required dynamic init?(coder: NSCoder) {

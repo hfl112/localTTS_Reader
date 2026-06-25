@@ -124,9 +124,8 @@ class ApplicationCoordinator {
 
     func openSettings() {
         openMainWindow()
-        if let tabVC = mainWindowController?.window?.contentViewController as? MainTabViewController {
-            tabVC.selectedTabViewItemIndex = 4
-        }
+        // 活跃路径是 MainSplitViewController（旧 MainTabViewController 已弃用）。
+        mainWindowController?.selectTab(MainSplitViewController.settingsTabIndex)
     }
 
     func openDiagnostics() {

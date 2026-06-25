@@ -59,4 +59,10 @@ class MainWindowController: NSWindowController {
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
+
+    /// 切换主窗口内容页（转发给 split view），供 coordinator 打开指定页。
+    func selectTab(_ index: Int) {
+        _ = self.window           // 确保已 loadWindow，splitVC 已创建
+        splitVC?.selectTab(index)
+    }
 }

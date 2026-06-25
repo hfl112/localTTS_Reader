@@ -7,7 +7,10 @@ extension Notification.Name {
 
 @MainActor
 class MainSplitViewController: NSSplitViewController {
-    /// tabVC 中「AI 引擎」页的索引（与 viewDidLoad 中的添加顺序一致）。
+    /// tabVC 各页索引（与 viewDidLoad 中的添加顺序一致）。
+    static let consoleTabIndex = 0
+    static let libraryTabIndex = 1
+    static let settingsTabIndex = 2
     private static let engineTabIndex = 3
     weak var coordinator: ApplicationCoordinator?
     
@@ -75,7 +78,9 @@ class MainSplitViewController: NSSplitViewController {
         }
 
         // 跨页跳转：Console 失败提示中的「打开 AI 引擎」按钮 → 切到引擎配置页。
-        NotificationCenter.default.addObserver(
+        // block-based observer 返回 token，必须保存并在 deinit 显式移除
+        // （removeObserver(self) 不会移除 block observer，否则控制器重建会累积）。
+        engineObserver = NotificationCenter.default.addObserver(
             forName: .qwenShowEngineSettings, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
@@ -84,7 +89,18 @@ class MainSplitViewController: NSSplitViewController {
         }
     }
 
+    /// 保存 block-based observer 的 token，供 deinit 精确移除。
+    private var engineObserver: NSObjectProtocol?
+
+    /// 程序化切换内容页（同步侧边栏高亮），供外部（如 popover「设置」入口）调用。
+    func selectTab(_ index: Int) {
+        sidebarVC.selectTab(index)
+    }
+
     deinit {
+        if let engineObserver = engineObserver {
+            NotificationCenter.default.removeObserver(engineObserver)
+        }
         NotificationCenter.default.removeObserver(self)
     }
 }
