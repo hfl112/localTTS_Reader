@@ -1,8 +1,10 @@
 import AppKit
 
 class SetupWizardWindowController: NSWindowController {
-    convenience init(onComplete: @escaping () -> Void) {
+    convenience init(onContinue: ((@escaping (String?) -> Void) -> Void)? = nil,
+                     onComplete: @escaping () -> Void) {
         let vc = SetupWizardViewController()
+        vc.onContinue = onContinue
         vc.onComplete = onComplete
         
         let window = NSWindow(contentViewController: vc)

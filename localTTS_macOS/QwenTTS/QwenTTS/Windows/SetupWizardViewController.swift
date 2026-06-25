@@ -3,7 +3,11 @@ import Foundation
 
 @MainActor
 class SetupWizardViewController: NSViewController {
+    /// 仅当试读成功后调用：置 hasCompletedWizard、打开主界面。
     var onComplete: (() -> Void)?
+    /// 点「开始使用」时触发：调用方启动后端 + 等就绪 + 短句试读，
+    /// 通过 completion 回传 nil（成功）或错误文案（失败）。未设置时退化为直接完成。
+    var onContinue: ((@escaping (String?) -> Void) -> Void)?
 
     private let titleLabel = NSTextField(labelWithString: "QwenTTS 首次启动设置")
     private let infoLabel = NSTextField(labelWithString: "正在检查运行环境…")
@@ -232,9 +236,30 @@ class SetupWizardViewController: NSViewController {
     }
 
     @objc private func continueClicked() {
-        // 末页试读在后续步骤接入；当前仅在无阻塞项时允许完成。
         guard EnvironmentDiagnostics.canProceed(lastItems) else { return }
-        onComplete?()
+        guard let onContinue = onContinue else { onComplete?(); return }
+        // 末页试读：启动后端 → 等就绪 → 短句试读，成功才完成。
+        continueButton.isEnabled = false
+        recheckButton.isEnabled = false
+        progressIndicator.isHidden = false
+        progressIndicator.isIndeterminate = true
+        progressIndicator.startAnimation(nil)
+        infoLabel.stringValue = "正在启动后端并试读「你好，欢迎使用 QwenTTS」…"
+        onContinue { [weak self] err in
+            guard let self else { return }
+            self.progressIndicator.stopAnimation(nil)
+            self.progressIndicator.isIndeterminate = false
+            self.progressIndicator.isHidden = true
+            self.recheckButton.isEnabled = true
+            if let err = err {
+                self.continueButton.isEnabled = true
+                self.infoLabel.stringValue = "试读未通过：\(err)"
+                self.showAlert(style: .warning, "试读未通过", "\(err)\n\n可点「重新检查」后重试，或「导出诊断」。")
+            } else {
+                self.infoLabel.stringValue = "试读成功 ✅"
+                self.onComplete?()
+            }
+        }
     }
 
     private func showAlert(style: NSAlert.Style, _ title: String, _ message: String) {

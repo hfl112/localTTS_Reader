@@ -47,13 +47,25 @@ class ApplicationCoordinator {
         if case .missing = modelStatus { needsWizard = true }
         
         if needsWizard {
-            setupWizardController = SetupWizardWindowController { [weak self] in
-                UserDefaults.standard.set(true, forKey: "hasCompletedWizard")
-                self?.setupWizardController?.close()
-                self?.setupWizardController = nil
-                self?.startBackend()
-                self?.openMainWindow()
-            }
+            setupWizardController = SetupWizardWindowController(
+                onContinue: { [weak self] done in
+                    guard let self else { done("内部错误"); return }
+                    // 启动后端（避免重复 spawn：仅在未启动/失败时），等就绪后试读。
+                    if self.processManager.state == .stopped || self.processManager.state == .failed {
+                        self.startBackend()
+                    }
+                    Task { @MainActor in
+                        let ok = await self.waitReadyAndTestRead()
+                        done(ok ? nil : "后端未在 40s 内就绪或试读请求失败")
+                    }
+                },
+                onComplete: { [weak self] in
+                    UserDefaults.standard.set(true, forKey: "hasCompletedWizard")
+                    self?.setupWizardController?.close()
+                    self?.setupWizardController = nil
+                    self?.openMainWindow()   // 后端已在 onContinue 中启动
+                }
+            )
             setupWizardController?.showWindow(nil)
             NSApp.activate(ignoringOtherApps: true)
         } else {
@@ -74,6 +86,21 @@ class ApplicationCoordinator {
                 }
             }
         }
+    }
+
+    /// Wizard 末页试读：等后端就绪（最多 timeout），再发一句短文本 /read。
+    /// 返回 true 表示后端已就绪且试读请求被接受（HTTP 200）。
+    private func waitReadyAndTestRead(timeout: TimeInterval = 40) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if processManager.state == .ready { break }
+            if processManager.state == .failed { return false }
+            try? await Task.sleep(for: .milliseconds(400))
+        }
+        guard processManager.state == .ready else { return false }
+        return await processManager.apiClient?.readText(
+            text: "你好，欢迎使用 QwenTTS。", voice: nil, performanceProfile: nil
+        ) ?? false
     }
 
     func stop() {
