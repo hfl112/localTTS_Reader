@@ -38,7 +38,9 @@ cd backend && python -m pytest core/tests/ -v    # 后端测试全过（当前 3
 
 ---
 
-## Step 0（前置·最高优先）：纳入版本控制 / 建立可恢复点
+## Step 0（前置·最高优先）：纳入版本控制 / 建立可恢复点 ✅ 已完成
+
+> 已备份 `/tmp/localTTS_macOS_backup_*.tgz`（5.1M 纯源码）；补 `.gitignore` 忽略 `localTTS_macOS/release_runtime/` 并加 `!localTTS_macOS/requirements.prod.lock` 例外；`git add localTTS_macOS` 提交基线（commit "pre-cleanup baseline"）。验收：tracked 120 文件、无 build/dist/release_runtime 误入、备份存在。注：mlx_audio vendored 快照的 `**/models/` 代码受既有 gitignore `**/models/` 排除（连权重），未硬塞进 git（可从上游/备份恢复）——留作单独决策。
 
 - **目标**：在动任何文件之前，让 `localTTS_macOS/` 的源码进入 git（产物除外），使后续每一步移动/删除都可回滚。
 - **步骤**：
@@ -69,7 +71,9 @@ cd backend && python -m pytest core/tests/ -v    # 后端测试全过（当前 3
 
 ---
 
-## Step 1：盘点并分类根目录文件（只盘点，不删）
+## Step 1：盘点并分类根目录文件（只盘点，不删）✅ 已完成
+
+> 盘点 25 个根条目并按下表分类；`grep` 确认移动/删除候选在 `QwenTTS`/`backend`/发布脚本中**零引用**（唯一引用是 `ProcessSupervisorSpike.swift → watchdog_helper.py`，二者一起移走）。`AppIcon.icns` 被 `package_release.py` 引用→保留。
 
 - **目标**：在移动/删除前明确每个根目录条目的归属，确认无源码引用。
 - **步骤**：

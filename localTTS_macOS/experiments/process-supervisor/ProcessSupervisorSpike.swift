@@ -5,7 +5,8 @@ import Darwin
 #endif
 
 let pythonPath = "/Users/funanhe/miniconda3/envs/gemini/bin/python"
-let helperScript = "/Users/funanhe/00_MyCode/TTS/localTTS_macOS/watchdog_helper.py"
+// watchdog_helper.py 与本 spike 同处 experiments/process-supervisor/（仓库整理时一并移动）
+let helperScript = "/Users/funanhe/00_MyCode/TTS/localTTS_macOS/experiments/process-supervisor/watchdog_helper.py"
 
 func checkProcessAlive(pid: pid_t) -> Bool {
     var status: Int32 = 0
