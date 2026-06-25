@@ -23,6 +23,7 @@
 		6AE00E046DFF6DC12D35142D /* RuntimeConfigSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16B5A355D564B28607C1319A /* RuntimeConfigSheet.swift */; };
 		71DBA6F3E72F954C9CF2FACB /* CrashReporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9647D62D7C3F656162ADEA8F /* CrashReporter.swift */; };
 		750157F1996DCD0A90360F37 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C651154F49FB2FC1A2B5799 /* AppDelegate.swift */; };
+		7667ACC1F10DD52F8269265E /* EnvironmentDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3249AE367069B74A487D5DDC /* EnvironmentDiagnostics.swift */; };
 		76A39581BC0916F3678C249F /* SavedItemsViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF40293C6B18060596600235 /* SavedItemsViewController.swift */; };
 		7B728ED54187C67F96F404FB /* UrlReaderViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6BBAC0B3F9DDFC22D6D2882D /* UrlReaderViewController.swift */; };
 		7CD92E850368CC4F663A4727 /* ModelManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2856AE0BD41E81950DBB55EF /* ModelManager.swift */; };
@@ -54,6 +55,7 @@
 		2C651154F49FB2FC1A2B5799 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		2DBDE4005522BC163D4BD12C /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		2F4B0F6E206A9EE749E6BED1 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		3249AE367069B74A487D5DDC /* EnvironmentDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EnvironmentDiagnostics.swift; sourceTree = "<group>"; };
 		40DC47C67E30585ABE2F5B0F /* QwenTTS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = QwenTTS.entitlements; sourceTree = "<group>"; };
 		4877552BC2BA13493C8B2D19 /* BackendHealthMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackendHealthMonitor.swift; sourceTree = "<group>"; };
 		56F7DA0B224F58A459AE2E9D /* AppStateStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppStateStore.swift; sourceTree = "<group>"; };
@@ -117,6 +119,7 @@
 				9647D62D7C3F656162ADEA8F /* CrashReporter.swift */,
 				BCDAD145CC44A229A01D3D9E /* DiagnosticsManager.swift */,
 				B1AB03C98384CB7DD4CEC51D /* EnvironmentConfigManager.swift */,
+				3249AE367069B74A487D5DDC /* EnvironmentDiagnostics.swift */,
 				944F0DCCEEBD1CD9294CF0A0 /* MockBackend.swift */,
 			);
 			path = Backend;
@@ -301,6 +304,7 @@
 				2736B7F67DE20EF48D5AC9AC /* DiagnosticsManager.swift in Sources */,
 				8DA0C9A3D653E4A074779D91 /* EngineSettingsViewController.swift in Sources */,
 				895C33DFC20C71B97C11A64B /* EnvironmentConfigManager.swift in Sources */,
+				7667ACC1F10DD52F8269265E /* EnvironmentDiagnostics.swift in Sources */,
 				3F2FBD41D2A49DCE41627C5B /* EnvironmentViewController.swift in Sources */,
 				E303F8AA6A81E194D6469B91 /* LibraryView.swift in Sources */,
 				CD8F540F606954C812C54897 /* MainSplitViewController.swift in Sources */,
