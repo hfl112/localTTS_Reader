@@ -1,7 +1,14 @@
 import AppKit
 
+extension Notification.Name {
+    /// 跨页跳转到「AI 引擎」配置页（如 Console 失败提示中的「打开 AI 引擎」按钮）。
+    static let qwenShowEngineSettings = Notification.Name("qwenShowEngineSettings")
+}
+
 @MainActor
 class MainSplitViewController: NSSplitViewController {
+    /// tabVC 中「AI 引擎」页的索引（与 viewDidLoad 中的添加顺序一致）。
+    private static let engineTabIndex = 3
     weak var coordinator: ApplicationCoordinator?
     
     private let sidebarVC = SidebarViewController()
@@ -66,5 +73,18 @@ class MainSplitViewController: NSSplitViewController {
                 }
             }
         }
+
+        // 跨页跳转：Console 失败提示中的「打开 AI 引擎」按钮 → 切到引擎配置页。
+        NotificationCenter.default.addObserver(
+            forName: .qwenShowEngineSettings, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.sidebarVC.selectTab(MainSplitViewController.engineTabIndex)
+            }
+        }
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 }

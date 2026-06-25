@@ -496,11 +496,14 @@ class ConsoleViewController: NSViewController {
             // URL：走 /read_url 抓取并按模式处理后保存（双人总结/翻译等）；纯文本：直接保存原文
             let success: Bool
             if isUrl {
+                let baseline = await failedJobIDs(isPodcast: false)
                 success = await client.readUrl(url: text, mode: mode, save: true)
+                if success { watchJobForFailure(isPodcast: false, baseline: baseline) }
             } else {
                 success = await client.saveForLater(text: text, source: "web", voice: nil, title: nil)
             }
             if success { inputTextField.stringValue = "" }
+            else { surfaceActionableError(message: "保存请求未被后端接受，请确认后端已就绪后重试。", offerEngine: false) }
         }
     }
 
@@ -514,11 +517,21 @@ class ConsoleViewController: NSViewController {
             // URL：走 /read_url 抓取并按模式处理后生成播客；纯文本：直接对文本生成播客
             let success: Bool
             if isUrl {
+                let urlBaseline = await failedJobIDs(isPodcast: false)
+                let podBaseline = await failedJobIDs(isPodcast: true)
                 success = await client.readUrl(url: text, mode: mode, podcast: true)
+                if success {
+                    // URL→播客两段都可能失败：抓取/处理(url_jobs)与播客渲染(podcast jobs)。
+                    watchJobForFailure(isPodcast: false, baseline: urlBaseline)
+                    watchJobForFailure(isPodcast: true, baseline: podBaseline)
+                }
             } else {
+                let baseline = await failedJobIDs(isPodcast: true)
                 success = await client.generateSinglePodcast(text: text, source: "web", voice: nil, title: nil)
+                if success { watchJobForFailure(isPodcast: true, baseline: baseline) }
             }
             if success { inputTextField.stringValue = "" }
+            else { surfaceActionableError(message: "生成播客请求未被后端接受，请确认后端已就绪后重试。", offerEngine: false) }
         }
     }
 
@@ -548,6 +561,66 @@ class ConsoleViewController: NSViewController {
         return true
     }
     
+    /// 统一的可执行错误提示(对应文档 §8.4)。offerEngine=true 时提供「打开 AI 引擎」
+    /// 按钮跳转配置页。smoke/headless 下不弹模态(避免阻塞),但始终打印 marker 供观测。
+    private func surfaceActionableError(message: String, offerEngine: Bool) {
+        print("[ConsoleError] \(message)")
+        if ProcessInfo.processInfo.arguments.contains("--smoke-test") { return }
+        let alert = NSAlert()
+        alert.messageText = offerEngine ? "需要配置 AI 引擎" : "操作失败"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        if offerEngine {
+            alert.addButton(withTitle: "打开 AI 引擎")
+            alert.addButton(withTitle: "取消")
+            if alert.runModal() == .alertFirstButtonReturn {
+                NotificationCenter.default.post(name: .qwenShowEngineSettings, object: nil)
+            }
+        } else {
+            alert.addButton(withTitle: "好的")
+            alert.runModal()
+        }
+    }
+
+    /// 错误文案是否指向引擎/密钥问题(决定是否给出「打开 AI 引擎」)。
+    private func isEngineError(_ message: String) -> Bool {
+        let m = message.lowercased()
+        return m.contains("key") || m.contains("api") || message.contains("引擎")
+            || message.contains("鉴权") || message.contains("配置")
+    }
+
+    /// 提交前记录现有失败 job 的 id,用于之后只对“本次新产生”的失败告警。
+    private func failedJobIDs(isPodcast: Bool) async -> Set<String> {
+        guard let client = coordinator?.processManager.apiClient else { return [] }
+        let jobs = (isPodcast ? await client.fetchPodcastJobs() : await client.fetchUrlJobs()) ?? []
+        var ids = Set<String>()
+        for job in jobs where (job["status"] as? String ?? "").lowercased() == "failed" {
+            if let id = job["job_id"] as? String ?? job["id"] as? String { ids.insert(id) }
+        }
+        return ids
+    }
+
+    /// 提交后短时轮询 job 列表,捕捉本次“新”失败并在前台给出可执行提示
+    /// (覆盖流程 D 的无字幕 / 无 key / 超时 / 鉴权等后端处理失败)。
+    private func watchJobForFailure(isPodcast: Bool, baseline: Set<String>) {
+        guard let client = coordinator?.processManager.apiClient else { return }
+        Task {
+            for _ in 0..<16 {   // ~8s
+                let jobs = (isPodcast ? await client.fetchPodcastJobs() : await client.fetchUrlJobs()) ?? []
+                for job in jobs {
+                    let status = (job["status"] as? String ?? "").lowercased()
+                    let id = job["job_id"] as? String ?? job["id"] as? String ?? ""
+                    if status == "failed", !baseline.contains(id) {
+                        let err = job["error"] as? String ?? "处理失败"
+                        surfaceActionableError(message: err, offerEngine: isEngineError(err))
+                        return
+                    }
+                }
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+        }
+    }
+
     private func selectedModeString() -> String {
         // 必须与后端 reader_service 的 mode 字符串一致
         switch modeSegmentedControl.selectedSegment {
@@ -567,31 +640,41 @@ class ConsoleViewController: NSViewController {
         return nil // Uses backend default
     }
     
+    /// Smoke 驱动入口:程序化填入文本/URL 并触发即时朗读,用于离线验证流程 B/D
+    /// 的失败呈现(配合 --mock-failure)。仅供 --smoke-drive-read 调用。
+    func smokeDriveInstantRead(_ text: String) {
+        inputTextField.stringValue = text
+        triggerInstantRead()
+    }
+
     private func triggerInstantRead() {
         let text = inputTextField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         
         let isUrl = text.lowercased().hasPrefix("http://") || text.lowercased().hasPrefix("https://")
         
+        let mode = selectedModeString()
         Task {
             guard let client = coordinator?.processManager.apiClient else { return }
-            guard await ensureLLMConfigured(forMode: selectedModeString()) else { return }
+            guard await ensureLLMConfigured(forMode: mode) else { return }
+            let success: Bool
             if isUrl {
-                _ = await client.readUrl(
-                    url: text,
-                    html: "",
-                    translate: false,
-                    mode: selectedModeString(),
-                    save: false,
-                    podcast: false
+                let baseline = await failedJobIDs(isPodcast: false)
+                success = await client.readUrl(
+                    url: text, html: "", translate: false,
+                    mode: mode, save: false, podcast: false
                 )
+                if success { watchJobForFailure(isPodcast: false, baseline: baseline) }
             } else {
-                _ = await client.readText(
+                success = await client.readText(
                     text: text,
                     voice: selectedVoice(),
                     performanceProfile: selectedPerformanceProfile(),
-                    mode: selectedModeString()
+                    mode: mode
                 )
+            }
+            if !success {
+                surfaceActionableError(message: "朗读请求未被后端接受，请确认后端已就绪后重试。", offerEngine: false)
             }
         }
     }

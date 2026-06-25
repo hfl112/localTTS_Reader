@@ -98,6 +98,12 @@ class SidebarViewController: NSViewController {
         updateSelection(selectedIndex: sender.tag)
         onSelectTab?(sender.tag)
     }
+
+    /// 程序化切换到指定页（同步高亮 + 内容），供跨页跳转（如错误提示「打开 AI 引擎」）使用。
+    func selectTab(_ index: Int) {
+        updateSelection(selectedIndex: index)
+        onSelectTab?(index)
+    }
     
     private func updateSelection(selectedIndex: Int) {
         for btn in buttons {

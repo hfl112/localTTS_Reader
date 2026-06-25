@@ -10,6 +10,9 @@ class BackendAPIClient {
     var managementToken: String = ""
     private let session: URLSession
 
+    /// 非 nil 时(仅 `--mock-backend`)所有请求由内存 mock 应答,不发起网络请求。
+    var mock: MockBackend?
+
     // MARK: - 错误冒泡（不再静默吞掉传输错误）
     /// 最近一次传输错误描述（含 path 与底层 error）。成功请求不会清空它，
     /// 由上层（BackendProcessManager / AppStateStore）根据轮询结果决定连接健康度。
@@ -40,6 +43,9 @@ class BackendAPIClient {
     // 一旦 managementToken 非空，所有请求都会自动带上该头。保留该参数仅为表达调用方意图，
     // 不影响认证正确性。此处刻意不重构，避免破坏现在能跑的认证流程。
     private func postJSON(path: String, body: [String: Any]?, requireToken: Bool = false) async -> (statusCode: Int, data: Data?) {
+        if let mock = mock {
+            return mock.respond(method: "POST", path: path, body: body)
+        }
         guard let url = URL(string: path, relativeTo: baseURL) else { return (0, nil) }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -68,6 +74,9 @@ class BackendAPIClient {
     }
 
     private func getJSON(path: String, requireToken: Bool = false) async -> (statusCode: Int, data: Data?) {
+        if let mock = mock {
+            return mock.respond(method: "GET", path: path, body: nil)
+        }
         guard let url = URL(string: path, relativeTo: baseURL) else { return (0, nil) }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
@@ -150,6 +159,9 @@ class BackendAPIClient {
 
     func updateSettings(settings: [String: Any], token: String) async -> Bool {
         self.managementToken = token
+        if let mock = mock {
+            return mock.respond(method: "PATCH", path: "/settings", body: settings).0 == 200
+        }
         guard let url = URL(string: "/settings", relativeTo: baseURL) else { return false }
         var request = URLRequest(url: url)
         request.httpMethod = "PATCH"
@@ -181,6 +193,9 @@ class BackendAPIClient {
 
     func updateEngines(_ body: [String: Any], token: String) async -> Bool {
         self.managementToken = token
+        if let mock = mock {
+            return mock.respond(method: "PATCH", path: "/engines", body: body).0 == 200
+        }
         guard let url = URL(string: "/engines", relativeTo: baseURL) else { return false }
         var request = URLRequest(url: url)
         request.httpMethod = "PATCH"

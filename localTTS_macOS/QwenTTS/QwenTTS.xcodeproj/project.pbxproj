@@ -11,6 +11,7 @@
 		078B006B301562D1041513E9 /* APIModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73BECC9FDEC7F0685531AF8F /* APIModels.swift */; };
 		0D81863D9D28D30A112320C2 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2DBDE4005522BC163D4BD12C /* main.swift */; };
 		11CD0B01D9EA35D71A87E9E2 /* BackendLauncher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DF24A4FC8491E45579B2AF8 /* BackendLauncher.swift */; };
+		1CA61F681F47E9050E6DE89B /* MockBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 944F0DCCEEBD1CD9294CF0A0 /* MockBackend.swift */; };
 		1E4678124D621356C274E34F /* SetupWizardViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59523B590EA35B68E2249E70 /* SetupWizardViewController.swift */; };
 		1E6F525CD2A40DB475F0DF84 /* ConsoleViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B59E2AC404478D54730A5C23 /* ConsoleViewController.swift */; };
 		2736B7F67DE20EF48D5AC9AC /* DiagnosticsManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCDAD145CC44A229A01D3D9E /* DiagnosticsManager.swift */; };
@@ -28,6 +29,7 @@
 		895C33DFC20C71B97C11A64B /* EnvironmentConfigManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1AB03C98384CB7DD4CEC51D /* EnvironmentConfigManager.swift */; };
 		8DA0C9A3D653E4A074779D91 /* EngineSettingsViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3F9B871B5EB86EA7B3E3954 /* EngineSettingsViewController.swift */; };
 		9AE2923A43E845B27182B1F6 /* AppStateStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 56F7DA0B224F58A459AE2E9D /* AppStateStore.swift */; };
+		A20CF6DF05BD22F2AAEFDA15 /* BackendHealthMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4877552BC2BA13493C8B2D19 /* BackendHealthMonitor.swift */; };
 		A249C7830E615EC08E82C463 /* CacheViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AD90753FEBA1DB214C54C0E /* CacheViewController.swift */; };
 		A3747645A372D5815B107E61 /* SettingsViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD57C622F121CC6654FD25CB /* SettingsViewController.swift */; };
 		AB763C4534BA2B6705FD21E8 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC49CE0F2756CAAFC73576FF /* SettingsView.swift */; };
@@ -53,6 +55,7 @@
 		2DBDE4005522BC163D4BD12C /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		2F4B0F6E206A9EE749E6BED1 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		40DC47C67E30585ABE2F5B0F /* QwenTTS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = QwenTTS.entitlements; sourceTree = "<group>"; };
+		4877552BC2BA13493C8B2D19 /* BackendHealthMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackendHealthMonitor.swift; sourceTree = "<group>"; };
 		56F7DA0B224F58A459AE2E9D /* AppStateStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppStateStore.swift; sourceTree = "<group>"; };
 		59523B590EA35B68E2249E70 /* SetupWizardViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupWizardViewController.swift; sourceTree = "<group>"; };
 		6BBAC0B3F9DDFC22D6D2882D /* UrlReaderViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UrlReaderViewController.swift; sourceTree = "<group>"; };
@@ -64,6 +67,7 @@
 		8D04776F659D339FD2959839 /* SidebarViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarViewController.swift; sourceTree = "<group>"; };
 		928176DBF4247DED8D825C54 /* en */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = en; path = en.lproj/Localizable.strings; sourceTree = "<group>"; };
 		937FB9CA1D363FA886D7E613 /* LibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryView.swift; sourceTree = "<group>"; };
+		944F0DCCEEBD1CD9294CF0A0 /* MockBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MockBackend.swift; sourceTree = "<group>"; };
 		9647D62D7C3F656162ADEA8F /* CrashReporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CrashReporter.swift; sourceTree = "<group>"; };
 		9B337A38F2A1BC990B87B33A /* PlaybackPopoverController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackPopoverController.swift; sourceTree = "<group>"; };
 		9E651628643A73BD2BBB0EC5 /* QwenTTS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = QwenTTS.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -107,11 +111,13 @@
 			children = (
 				73BECC9FDEC7F0685531AF8F /* APIModels.swift */,
 				248E68796C818BEAF3CAD902 /* BackendAPIClient.swift */,
+				4877552BC2BA13493C8B2D19 /* BackendHealthMonitor.swift */,
 				6DF24A4FC8491E45579B2AF8 /* BackendLauncher.swift */,
 				AD5EBC97EBDE106B5404600A /* BackendProcessManager.swift */,
 				9647D62D7C3F656162ADEA8F /* CrashReporter.swift */,
 				BCDAD145CC44A229A01D3D9E /* DiagnosticsManager.swift */,
 				B1AB03C98384CB7DD4CEC51D /* EnvironmentConfigManager.swift */,
+				944F0DCCEEBD1CD9294CF0A0 /* MockBackend.swift */,
 			);
 			path = Backend;
 			sourceTree = "<group>";
@@ -286,6 +292,7 @@
 				9AE2923A43E845B27182B1F6 /* AppStateStore.swift in Sources */,
 				371A63FC9BB8F53E987F8300 /* ApplicationCoordinator.swift in Sources */,
 				518A00BC31F9CBCE31EA78D5 /* BackendAPIClient.swift in Sources */,
+				A20CF6DF05BD22F2AAEFDA15 /* BackendHealthMonitor.swift in Sources */,
 				11CD0B01D9EA35D71A87E9E2 /* BackendLauncher.swift in Sources */,
 				F134D299823C9B304D49422B /* BackendProcessManager.swift in Sources */,
 				A249C7830E615EC08E82C463 /* CacheViewController.swift in Sources */,
@@ -299,6 +306,7 @@
 				CD8F540F606954C812C54897 /* MainSplitViewController.swift in Sources */,
 				D7073DB6AEE195F79557EA39 /* MainTabViewController.swift in Sources */,
 				AB893650000D9B9ACB6ED152 /* MainWindowController.swift in Sources */,
+				1CA61F681F47E9050E6DE89B /* MockBackend.swift in Sources */,
 				7CD92E850368CC4F663A4727 /* ModelManager.swift in Sources */,
 				69E556674445C61E2A2FE04B /* PlaybackPopoverController.swift in Sources */,
 				DFC4305EB0E0E75D3D42A28E /* PodcastViewController.swift in Sources */,
