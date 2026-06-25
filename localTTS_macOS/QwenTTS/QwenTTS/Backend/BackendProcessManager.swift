@@ -125,21 +125,31 @@ class BackendProcessManager {
     }
     #endif
 
-    private var healthTask: Task<Void, Never>?
-    private var launchTime: Date?
-    
+    private let healthMonitor = BackendHealthMonitor()
+
     private var snapshotTask: Task<Void, Never>?
     var onPlaybackUpdate: ((_ title: String, _ progress: String, _ playing: Bool, _ paused: Bool) -> Void)?
 
+    /// `--mock-backend`:用内存 mock 替代真实 Python 后端(UI 验证用,见 §4)。
+    private var isMockMode: Bool {
+        ProcessInfo.processInfo.arguments.contains("--mock-backend")
+    }
+
     func startBackend(onStateChange: @escaping (BackendState) -> Void) {
         self.stateCallback = onStateChange
+
+        if isMockMode {
+            startMockBackend()
+            return
+        }
+
         #if DEBUG
         seedDevEnvironmentIfNeeded()
         #endif
         updateState(.launching)
-        
+
         self.apiClient = BackendAPIClient(port: port)
-        
+
         let success = launcher.launch(
             pythonPath: pythonPath,
             scriptPath: scriptPath,
@@ -150,20 +160,30 @@ class BackendProcessManager {
                 self?.handleProcessExit()
             }
         }
-        
+
         if !success {
             updateState(.failed)
             return
         }
-        
+
+        updateState(.waitingForHealth)
+        startHealthCheck()
+    }
+
+    /// Mock 启动路径:不 spawn Python,挂上内存 mock,走正常 health → ready → snapshot 轮询。
+    private func startMockBackend() {
+        print("[ProcessManager] Mock backend mode active (--mock-backend).")
+        updateState(.launching)
+        let client = BackendAPIClient(port: port)
+        client.mock = MockBackend.fromProcessArgs()
+        self.apiClient = client
         updateState(.waitingForHealth)
         startHealthCheck()
     }
 
     func stopBackend() {
         guard state != .stopped && state != .stopping else { return }
-        healthTask?.cancel()
-        healthTask = nil
+        healthMonitor.cancel()
         updateState(.stopping)
         
         launcher.closeWatchdogPipe()
@@ -222,28 +242,16 @@ class BackendProcessManager {
     }
 
     private func startHealthCheck() {
-        healthTask?.cancel()
-        launchTime = Date()
-
-        healthTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(500))
-                guard let self, !Task.isCancelled else { return }
-                let token = self.launcher.managementToken
-                let (alive, _) = await self.apiClient?.checkHealth(token: token) ?? (false, nil)
-                if alive {
-                    self.updateState(.ready)
-                    return
-                }
-                if let launchTime = self.launchTime,
-                   Date().timeIntervalSince(launchTime) > 30.0 {
-                    print("[ProcessManager] Health check timeout. Stopping backend.")
-                    self.stateStore?.reportConnectionError("后端健康检查超时（30s 内未就绪）")
-                    self.stopBackend()
-                    return
-                }
+        healthMonitor.start(
+            apiClient: apiClient,
+            token: { [weak self] in self?.launcher.managementToken ?? "" },
+            onReady: { [weak self] in self?.updateState(.ready) },
+            onTimeout: { [weak self] in
+                print("[ProcessManager] Health check timeout. Stopping backend.")
+                self?.stateStore?.reportConnectionError("后端健康检查超时（30s 内未就绪）")
+                self?.stopBackend()
             }
-        }
+        )
     }
 
     private func startSnapshotPolling() {
@@ -278,8 +286,7 @@ class BackendProcessManager {
     private var lastReadyTime: Date?
 
     private func handleProcessExit() {
-        healthTask?.cancel()
-        healthTask = nil
+        healthMonitor.cancel()
 
         if state == .stopping {
             updateState(.stopped)

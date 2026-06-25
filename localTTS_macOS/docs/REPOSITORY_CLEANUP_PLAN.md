@@ -173,7 +173,9 @@ cd backend && python -m pytest core/tests/ -v    # 后端测试全过（当前 3
 
 ---
 
-## Step 6：修正文档旧命名 + 跑后端测试
+## Step 6：修正文档旧命名 + 跑后端测试 ✅ 已完成
+
+> `read_url_cli.py` 的 5 处 print 字符串与 `URL-Reader/README.md` 的多处"投喂/保存到 QwenTTS-App"改为中性"QwenTTS 后端"（CLI 实际 POST 到端口上的后端，与是否 legacy 无关）；唯一真正指向旧版的启动命令显式标注"旧版 legacy"。剩余 `QwenTTS-App` 命中全属边界约束/显式 migration。边界脚本通过、34 测试通过。已提交。
 
 - **目标**：文档不把 native 后端与 legacy `QwenTTS-App` 混淆；改动未破坏后端。
 - **现状**：`backend/URL-Reader/README.md` 的 `gemini_engine` 链接、`podcast_service` 的 legacy 路径已在先前清理中修正；本步处理**剩余**命名。
