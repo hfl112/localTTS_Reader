@@ -48,3 +48,8 @@ QwenTTS-App/data/exported/
 QwenTTS-App/data/podcasts/
 URL-Reader/cache/
 podcasts/
+
+# localTTS_macOS native build/release products (keep local, do not track)
+localTTS_macOS/release_runtime/
+# requirements.prod.lock is a tracked source-of-truth (overrides *.lock above)
+!localTTS_macOS/requirements.prod.lock
