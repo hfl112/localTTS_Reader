@@ -4,6 +4,8 @@
 
 - `mlx_audio/` — upstream MLX-Audio v0.4.3 fork; all Python tooling lives here (`pyproject.toml`, `pytest.ini`, `.pre-commit-config.yaml`)
 - `QwenTTS-App/` — macOS menu-bar App, the primary deliverable
+- `localTTS_macOS/` — native macOS App; all ongoing native development stays here
+- `localTTS_macOS/backend/` — physically independent native backend snapshot
 - `qwen-tts-extension/` — Chrome extension (WXT+TypeScript), HTTP client of QwenTTS-App
 - `URL-Reader/` — URL extractor & cleanser CLI tool
 - `docs/` — global documentation (e.g. development history)
@@ -18,6 +20,46 @@
 - Apple Silicon only (MLX framework); no CUDA/ROCm
 - `ffmpeg` required on `PATH`
 - Source code, comments, and internal docs are **largely in Chinese**
+
+## Legacy Python App protection (mandatory)
+
+`QwenTTS-App/` is the user's current stable daily-use application. The following
+command must continue to work while `localTTS_macOS/` is under development:
+
+```bash
+cd QwenTTS-App
+python app.py
+```
+
+Rules for all agents working on `localTTS_macOS/`:
+
+1. Do **not** modify `QwenTTS-App/app.py` or any file under
+   `QwenTTS-App/core/` as part of native macOS development.
+2. Do **not** change the legacy config/data formats, port `8001`, existing API
+   behavior, model paths, authentication compatibility, or startup behavior.
+3. Do **not** let build, packaging, migration, or synchronization scripts write
+   to or overwrite files inside `QwenTTS-App/`.
+4. Native UI, process management, and packaging changes belong under
+   `localTTS_macOS/` only.
+5. The separately evolving native Python backend already exists under
+   `localTTS_macOS/backend/`. Modify that copy only. Never edit the stable
+   backend in place and never automatically sync either copy to the other.
+6. Any unavoidable change to `QwenTTS-App/` requires the user's explicit
+   approval **before editing**, with the reason, affected files, compatibility
+   impact, rollback method, and proposed verification stated first.
+7. After an approved legacy change, verify at minimum that the App starts,
+   `/health` returns HTTP 200, the legacy Chrome extension can call `/read` and
+   `/read_url` without HTTP 401, requests reach the inference queue, and model
+   resolution still uses `mlx_audio/models/`.
+
+Do not treat shared code reuse as permission to change the stable legacy App.
+Preserving `python app.py` takes priority over deduplicating the native and
+legacy implementations during native development.
+
+`localTTS_macOS` build scripts must not read source files from `QwenTTS-App/`,
+root `URL-Reader/`, or root `mlx_audio/mlx_audio/`. Native backend resources are
+owned by `localTTS_macOS/backend/`; model weights may be referenced externally
+as read-only data through `TTS_MODELS_PATH` and are not source-code coupling.
 
 ## mlx_audio/ — dev commands
 

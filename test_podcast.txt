@@ -1,4 +1,0 @@
-[Serena]: Welcome to our daily podcast! Today we are discussing the future of artificial intelligence.
-[Ryan]: Yes, Serena. It's a very exciting topic. I think running models locally is the future.
-[Serena]: I agree. Running models locally keeps our private data secure.
-[Ryan]: Exactly! And with MLX on Mac, the speed is amazing.
