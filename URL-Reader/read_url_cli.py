@@ -6,9 +6,10 @@ import requests
 
 from reader_service import process_url_job
 
+PORT = int(os.environ.get("TTS_BACKEND_PORT", 8001))
 
 def send_to_qwentts(text: str, voice: str | None = None, source: str = "web") -> None:
-    url = "http://127.0.0.1:8001/read"
+    url = f"http://127.0.0.1:{PORT}/read"
     print("[CLI] 正在将净化后的文本投喂给 QwenTTS-App 进行播放...")
 
     payload: dict[str, Any] = {"text": text, "source": source}
@@ -34,7 +35,7 @@ def save_to_qwentts(
     title: str | None = None,
 ) -> None:
     if do_save:
-        url = "http://127.0.0.1:8001/save_for_later"
+        url = f"http://127.0.0.1:{PORT}/save_for_later"
         print("[CLI] 正在将净化后的文本保存到 QwenTTS-App 稍后朗读列表中...")
         payload: dict[str, Any] = {"text": text, "source": source}
         if voice:
@@ -51,7 +52,7 @@ def save_to_qwentts(
             print(f"[Error] 无法连接到 QwenTTS-App 服务: {e}")
 
     if do_podcast:
-        podcast_url = "http://127.0.0.1:8001/generate_single_podcast"
+        podcast_url = f"http://127.0.0.1:{PORT}/generate_single_podcast"
         payload: dict[str, Any] = {"text": text, "source": source}
         if voice:
             payload["voice"] = voice

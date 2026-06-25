@@ -124,13 +124,86 @@ def defuddle_file(html_file_path: str) -> str:
 
 
 def extract_title(text: str) -> str:
+    non_title_headings = {
+        "references",
+        "bibliography",
+        "works cited",
+        "参考文献",
+        "参考资料",
+        "参考书目",
+        "引用文献",
+    }
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("# "):
-            return line[2:].strip()
+            title = line[2:].strip()
+            if title.lower() not in non_title_headings:
+                return title
         if line.startswith("## "):
-            return line[3:].strip()
+            title = line[3:].strip()
+            if title.lower() not in non_title_headings:
+                return title
     return ""
+
+
+def clean_markdown_content(text: str) -> str:
+    """Remove web extraction noise before Gemini/TTS sees the article body."""
+    if not text:
+        return ""
+
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\xa0", " ").replace("&nbsp;", " ").replace("&amp;", "&")
+
+    # Drop embedded widgets and raw HTML blocks that Defuddle may keep.
+    text = re.sub(
+        r"<(?:iframe|script|style|noscript)\b[\s\S]*?</(?:iframe|script|style|noscript)>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"<iframe\b[\s\S]*?>", "", text, flags=re.IGNORECASE)
+
+    # Cut bibliography/reference tails in both English and Chinese. Match exact headings only.
+    reference_heading = re.compile(
+        r"^\s*(?:#{1,6}\s*|\*\*\s*)?"
+        r"(?:References|Bibliography|Works\s+Cited|参考文献|参考资料|参考书目|引用文献)"
+        r"(?:\s*\*\*)?\s*[:：]?\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    match = reference_heading.search(text)
+    if match:
+        text = text[: match.start()]
+
+    # Remove footnote/link definitions and citation markers.
+    text = re.sub(
+        r"^\s*\[\^[^\]]+\]:\s+.*(?:\n(?:[ \t]+|\t).*)*",
+        "",
+        text,
+        flags=re.MULTILINE,
+    )
+    text = re.sub(
+        r"^\s*\[[^\]]+\]:\s+https?://\S+.*$",
+        "",
+        text,
+        flags=re.MULTILINE,
+    )
+    text = re.sub(r"\[\^\d+\]|\[\^[^\]]+\]", "", text)
+    text = re.sub(r"\[\d+(?:\s*[-,]\s*\d+)*\]", "", text)
+
+    # Keep visible link text, drop URL payloads and standalone URLs.
+    text = re.sub(r"!\[[\s\S]*?\]\([\s\S]*?\)", "", text)
+    text = re.sub(r"\[([^\]]+)\]\(\s*https?://[^\)]*\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\(\s*#[^\)]*\)", r"\1", text)
+    text = re.sub(r"[\(（]\s*https?://[^\s\)）]+[\)）]", "", text)
+    text = re.sub(r"https?://\S+", "", text)
+
+    # Drop remaining raw HTML tags, but keep their text content.
+    text = re.sub(r"</?[^>\n]+>", "", text)
+
+    # Normalize noisy blank lines and trailing spaces without flattening paragraphs.
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def title_for_mode(mode: str, title: str) -> str:
@@ -200,18 +273,21 @@ def process_url_job(
 
     if markdown_content is None:
         callback("fetching", {"source": source_type, "has_html": bool(html)})
-        if html.strip():
-            callback("parsing", {"method": "uploaded_html"})
-            markdown_content = defuddle_html(html)
-        elif is_youtube and video_id:
+        if is_youtube and video_id:
             callback("fetching", {"method": "youtube_transcript"})
             markdown_content = get_youtube_transcript(video_id)
+        elif html.strip():
+            callback("parsing", {"method": "uploaded_html"})
+            markdown_content = defuddle_html(html)
         else:
             callback("fetching", {"method": "network"})
             fetched_html = fetch_html_with_proxy_fallback(url)
             callback("parsing", {"method": "network_html"})
             markdown_content = defuddle_html(fetched_html)
+        markdown_content = clean_markdown_content(markdown_content)
         write_cache(source_cache_path, markdown_content)
+    else:
+        markdown_content = clean_markdown_content(markdown_content)
 
     if not markdown_content.strip():
         raise RuntimeError("抓取到的内容为空")
@@ -225,11 +301,12 @@ def process_url_job(
         processed_cache_path = os.path.join(cache_dir, f"{mode}_{processed_key}.md")
         cached_processed = read_cache(processed_cache_path)
         if cached_processed is not None:
-            processed_content = cached_processed
+            processed_content = clean_markdown_content(cached_processed)
             from_cache = True
         else:
             callback("gemini", {"mode": mode})
             processed_content = process_with_gemini(markdown_content, mode)
+            processed_content = clean_markdown_content(processed_content)
             write_cache(processed_cache_path, processed_content)
 
         temp_translated_path = os.path.join(base_dir, "temp_translated.md")

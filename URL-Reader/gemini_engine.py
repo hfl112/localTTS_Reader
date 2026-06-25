@@ -19,7 +19,7 @@ class TokenLimitError(Exception): pass
 SCRIPT_DIR: str = os.path.dirname(os.path.abspath(__file__))
 
 # 优先从 Obsidian Vault .env 以及同级目录的 .env 加载
-vault_dotenv: str = "/Users/funanhe/Obsidian/DailyInsight/.env"
+vault_dotenv: str = os.environ.get("OBSIDIAN_ENV_PATH", os.path.expanduser("~/Obsidian/DailyInsight/.env"))
 if os.path.exists(vault_dotenv):
     load_dotenv(vault_dotenv)
 load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
@@ -221,19 +221,21 @@ def generate_podcast_discussion(text: str) -> str:
 
 def generate_podcast_translation(text: str) -> str:
     """
-    将输入的原文内容翻译成由 [Serena] (提问/引导者) 和 [Ryan] (翻译/解答者) 之间进行一问一答的多轮翻译对话。
+    将输入的英文双人播客/访谈原文（例如缺少说话人标签的 YouTube 字幕）翻译成中文，并正确分配给 [Serena] 和 [Ryan] 两个声音进行朗读。
     """
     prompt: str = (
-        "你是一个播客翻译和编辑专家。请将以下输入的内容，以双人对谈翻译（一问一答）的形式翻译并改编为中文播客脚本。\n"
+        "你是一个专业的播客翻译和剧本编辑专家。请将以下输入的英文播客、访谈原文或视频字幕，精准翻译成中文对话剧本。\n"
         "要求：\n"
-        "1. 播客有两个角色：[Serena] (负责用中文进行提问、引出段落主题或承上启下) 和 [Ryan] (负责对原文的具体内容进行直译、解释与解答)。\n"
-        "2. 你需要梳理文章脉络，如果是访谈记录，则直接对应翻译；如果是单人文章，请将其解构为 [Serena] 提问/引导、[Ryan] 翻译/具体阐述的交替对话形式。\n"
-        "3. 输出格式必须严格遵循以下格式（中英文冒号均可，但每行必须以 [Serena]: 或 [Ryan]: 开头）：\n"
-        "   [Serena]: [用中文提问或引导]\n"
-        "   [Ryan]: [对应的中文翻译与具体解释内容]\n"
-        "4. 所有的对话和回答均使用中文进行。\n"
-        "5. 仅输出最终的对话内容，绝对不能包含任何 ```markdown、多余的前言、后记或解释性段落。\n\n"
-        f"待翻译并解构的原文内容如下：\n{text}"
+        "1. 输入的文本通常是一份缺失说话人标签的 YouTube 自动生成字幕。你需要根据语境、语气和上下文的来回切换，聪明地判断出说话人的更替。\n"
+        "2. 请将原对话中的两位主要说话人，分别固定映射为 [Serena] (女声) 和 [Ryan] (男声)。\n"
+        "   - 例如，你可以判定主持人为 [Serena]，嘉宾为 [Ryan]，或者反之，但请务必保持整篇剧本角色映射的连贯和一致。\n"
+        "3. 核心任务是【准确翻译原文对话】，不要对原文进行大幅度的总结概括或删减，也不要添加多余的解说词。保留原有的对话感、口语化表达和播客风格。\n"
+        "4. 输出格式必须严格遵循以下格式（中英文冒号均可，且每行必须以这两个角色之一开头）：\n"
+        "   [Serena]: [翻译的中文内容]\n"
+        "   [Ryan]: [翻译的中文内容]\n"
+        "5. 输出内容必须是全中文。\n"
+        "6. 仅输出最终的对话内容，绝对不能包含任何 ```markdown、多余的前言、后记或解释性段落。\n\n"
+        f"待翻译的原文内容如下：\n{text}"
     )
     return call_gemini(prompt, task_level="standard", step_name="PodcastTranslation")
 
