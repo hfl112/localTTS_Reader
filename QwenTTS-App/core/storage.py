@@ -3,13 +3,14 @@ import os
 import sqlite3
 import time
 from typing import Any
+from core.paths import runtime_paths
 
 class Storage:
-    def __init__(self, data_dir: str = "data") -> None:
-        self.data_dir = data_dir
-        self.config_path = os.path.join(data_dir, "config.json")
-        self.state_path = os.path.join(data_dir, "state.json")
-        self.db_path = os.path.join(data_dir, "cache.db")
+    def __init__(self, data_dir: str | None = None) -> None:
+        self.data_dir = data_dir or runtime_paths.data_path
+        self.config_path = os.path.join(self.data_dir, "config.json")
+        self.state_path = os.path.join(self.data_dir, "state.json")
+        self.db_path = os.path.join(self.data_dir, "cache.db")
         
         # 默认设置
         self.default_config = {
@@ -18,7 +19,8 @@ class Storage:
             "top_p": 0.5,
             "seed": 42,
             "repetition_penalty": 1.1,
-            "lang_code": "zh"
+            "lang_code": "zh",
+            "battery_podcast_policy": "pause",
         }
         
         # 默认运行状态（断点续传）
@@ -58,9 +60,22 @@ class Storage:
         with open(self.config_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
+    def _atomic_save_json(self, file_path: str, data: dict) -> None:
+        temp_path = file_path + ".tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(temp_path, file_path)
+        except Exception as error:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+            raise error
+
     def save_config(self, config: dict) -> None:
-        with open(self.config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+        self._atomic_save_json(self.config_path, config)
 
     def load_state(self) -> dict:
         if not os.path.exists(self.state_path):
@@ -69,8 +84,8 @@ class Storage:
             return json.load(f)
 
     def save_state(self, state: dict) -> None:
-        with open(self.state_path, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, ensure_ascii=False)
+        self._atomic_save_json(self.state_path, state)
+
 
     def add_cache_metadata(self, md5: str, text: str, model: str, voice: str, duration: float, file_path: str) -> None:
         conn = sqlite3.connect(self.db_path)

@@ -4,11 +4,12 @@ import os
 import threading
 import time
 from typing import Any
+from core.paths import runtime_paths
 
 
 class SavedItemsService:
-    def __init__(self, base_dir: str) -> None:
-        self.save_file = os.path.join(base_dir, "data", "saved_for_later.json")
+    def __init__(self, data_path: str | None = None) -> None:
+        self.save_file = os.path.join(data_path or runtime_paths.data_path, "saved_for_later.json")
         self._lock = threading.Lock()
 
     def load(self) -> list[dict[str, Any]]:
@@ -24,8 +25,19 @@ class SavedItemsService:
     def write(self, items: list[dict[str, Any]]) -> None:
         with self._lock:
             os.makedirs(os.path.dirname(self.save_file), exist_ok=True)
-            with open(self.save_file, "w", encoding="utf-8") as f:
-                json.dump(items, f, ensure_ascii=False, indent=2)
+            temp_file = self.save_file + ".tmp"
+            try:
+                with open(temp_file, "w", encoding="utf-8") as f:
+                    json.dump(items, f, ensure_ascii=False, indent=2)
+                os.replace(temp_file, self.save_file)
+            except Exception as error:
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except Exception:
+                        pass
+                raise error
+
 
     def save(
         self,

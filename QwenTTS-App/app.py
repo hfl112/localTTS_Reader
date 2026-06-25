@@ -1,4 +1,5 @@
 import os
+import secrets
 
 os.environ["TQDM_DISABLE"] = "1"
 
@@ -17,6 +18,20 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
+WORKSPACE_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
+LEGACY_RUNTIME_ENV = {
+    "TTS_APP_SUPPORT_PATH": os.path.join(BASE_DIR, "data"),
+    "TTS_DATA_PATH": os.path.join(BASE_DIR, "data"),
+    "TTS_CACHE_PATH": os.path.join(BASE_DIR, "data", "cache"),
+    "TTS_PODCASTS_PATH": os.path.join(WORKSPACE_DIR, "podcasts"),
+    "TTS_MODELS_PATH": os.path.join(WORKSPACE_DIR, "mlx_audio", "models"),
+    "TTS_REFERENCE_PATH": os.path.join(WORKSPACE_DIR, "reference"),
+    "TTS_LOGS_PATH": os.path.join(BASE_DIR, "data", "logs"),
+    "MLX_AUDIO_PATH": os.path.join(WORKSPACE_DIR, "mlx_audio"),
+}
+for env_name, env_value in LEGACY_RUNTIME_ENV.items():
+    os.environ.setdefault(env_name, env_value)
+
 from core.storage import Storage
 
 
@@ -30,10 +45,18 @@ class QwenTTSApp(rumps.App):
         self.config = self.storage.load_config()
 
         # 后端配置
-        self.backend_url = "http://127.0.0.1:8001"
+        port = int(os.environ.get("TTS_BACKEND_PORT", 8001))
+        self.backend_url = f"http://127.0.0.1:{port}"
         self.backend_process = None
         self.python_exe = sys.executable
+        # Legacy rumps app owns the backend it starts.  Use a per-launch
+        # management token so its local requests remain compatible with the
+        # authenticated backend used by the native AppKit client.
+        self.management_token = secrets.token_urlsafe(32)
         self.session = requests.Session()  # 复用 TCP 连接以减少本地 CPU 开销
+        self.session.headers.update(
+            {"x-management-token": self.management_token}
+        )
 
         # 启动持久化后端
         self.start_backend_service()
@@ -114,39 +137,92 @@ class QwenTTSApp(rumps.App):
         # 启动时执行一次清空临时资产
         self.clean_assets()
 
+    def _terminate_process_tree(self, proc: psutil.Process, timeout: float = 2.0) -> None:
+        try:
+            children = proc.children(recursive=True)
+        except psutil.Error:
+            children = []
+
+        targets = children + [proc]
+        for target in targets:
+            try:
+                target.terminate()
+            except psutil.Error:
+                pass
+
+        gone, alive = psutil.wait_procs(targets, timeout=timeout)
+        for target in alive:
+            try:
+                target.kill()
+            except psutil.Error:
+                pass
+        if alive:
+            psutil.wait_procs(alive, timeout=timeout)
+
+    def _cleanup_backend_processes(self) -> None:
+        backend_script = os.path.join(BASE_DIR, "core", "backend.py")
+        current_pid = os.getpid()
+
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                if proc.pid == current_pid:
+                    continue
+                cmdline = proc.info.get("cmdline") or []
+                if backend_script in cmdline:
+                    print(f"[App] 清理旧后端进程树 PID: {proc.pid}")
+                    self._terminate_process_tree(proc)
+            except psutil.Error:
+                pass
+
+        try:
+            port = int(os.environ.get("TTS_BACKEND_PORT", 8001))
+            output = subprocess.check_output(["lsof", "-t", f"-i:{port}"], stderr=subprocess.DEVNULL)
+            for raw_pid in output.decode("utf-8").strip().split("\n"):
+                if not raw_pid:
+                    continue
+                try:
+                    proc = psutil.Process(int(raw_pid))
+                    print(f"[App] 检测到 {port} 端口残留进程 PID: {proc.pid}，正在清理进程树...")
+                    self._terminate_process_tree(proc)
+                except (ValueError, psutil.Error):
+                    pass
+        except Exception:
+            pass
+
     def start_backend_service(self):
         print("[App] 正在清理旧的后端进程...")
-        
-        # 1. 强杀所有包含 backend.py 命名的残留进程
-        try:
-            subprocess.run(["pkill", "-9", "-f", "backend.py"], stderr=subprocess.DEVNULL)
-        except:
-            pass
-            
-        # 2. 物理释放 8001 端口占用，斩草除根
-        try:
-            output = subprocess.check_output(["lsof", "-t", "-i:8001"], stderr=subprocess.DEVNULL)
-            pids = output.decode("utf-8").strip().split("\n")
-            for pid in pids:
-                pid = pid.strip()
-                if pid:
-                    print(f"[App] 检测到 8001 端口残留僵尸进程 PID: {pid}，正在执行强杀...")
-                    subprocess.run(["kill", "-9", pid], stderr=subprocess.DEVNULL)
-        except:
-            pass
-            
+        self._cleanup_backend_processes()
+
         time.sleep(0.5)
 
         print("[App] 正在启动后台引擎进程...")
         backend_script = os.path.join(BASE_DIR, "core", "backend.py")
+        child_env = os.environ.copy()
+        child_env.update(LEGACY_RUNTIME_ENV)
+        child_env["TTS_MANAGEMENT_TOKEN"] = self.management_token
+        # The legacy Chrome extension predates backend authentication and only
+        # talks to 127.0.0.1.  Enable compatibility for this backend instance;
+        # the native macOS app does not set this flag and remains authenticated.
+        child_env["TTS_LEGACY_LOOPBACK_CLIENTS"] = "1"
         self.backend_process = subprocess.Popen(
-            [self.python_exe, backend_script], stdout=sys.stdout, stderr=sys.stderr
+            [self.python_exe, backend_script],
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            start_new_session=True,
+            env=child_env,
         )
 
     def _safe_post_async(self, endpoint: str, json_data: dict = None) -> None:
         def run():
             try:
-                self.session.post(f"{self.backend_url}{endpoint}", json=json_data, timeout=5)
+                response = self.session.post(
+                    f"{self.backend_url}{endpoint}", json=json_data, timeout=5
+                )
+                if response.status_code >= 400:
+                    print(
+                        f"[App] POST {endpoint} 失败: "
+                        f"HTTP {response.status_code} {response.text}"
+                    )
             except Exception as e:
                 print(f"[App] 异步 POST 通信错误 {endpoint}: {e}")
         threading.Thread(target=run, daemon=True).start()
@@ -451,8 +527,10 @@ class QwenTTSApp(rumps.App):
                 time.sleep(0.5)  # 等待 8192 帧（~340ms）的硬件缓冲区被静音数据覆盖
             except:
                 pass
-            self.backend_process.terminate()
-            self.backend_process.wait()
+            try:
+                self._terminate_process_tree(psutil.Process(self.backend_process.pid))
+            except psutil.Error:
+                pass
         try:
             self.clean_assets()
         except:

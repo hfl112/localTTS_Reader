@@ -18,6 +18,7 @@ from core.api_models import (
     ReadUrlRequest,
 )
 from core.services.performance import get_performance_profile
+from core.services import podcast_service as podcast_service_module
 from core.services.saved_items_service import SavedItemsService
 from core.services.podcast_service import PodcastService
 from core.services.podcast_jobs import PodcastJobStore
@@ -25,7 +26,7 @@ from core.services.runtime_log import RuntimeEventLog
 from core.services.playback_service import PlaybackController
 from core.services.url_jobs import UrlJobStore
 from core.state.runtime_state import RuntimeState
-from reader_service import cache_key, title_for_mode
+from reader_service import cache_key, clean_markdown_content, extract_title, title_for_mode
 
 
 def test_performance_profile_defaults_to_balanced():
@@ -123,6 +124,84 @@ def test_podcast_pause_state_blocks_active_frontend():
         should_pause, reason = service._pause_state()
         assert should_pause is True
         assert reason == "frontend_active"
+
+
+def test_podcast_pause_state_ignores_device_switching():
+    with tempfile.TemporaryDirectory() as tmp:
+        state = RuntimeState()
+        state.last_active_time = time.time() - 10
+        service = PodcastService(
+            podcasts_dir=os.path.join(tmp, "podcasts"),
+            podcast_chunk_dir=os.path.join(tmp, "chunks"),
+            runtime_state=state,
+            active_url_tasks={},
+            is_frontend_active=lambda: True,
+            is_device_switching=lambda: True,
+        )
+
+        should_pause, reason = service._pause_state()
+        assert should_pause is False
+        assert reason == "device_switching"
+
+
+def test_podcast_battery_policy_pause_blocks_on_battery(monkeypatch):
+    monkeypatch.setattr(podcast_service_module, "is_on_battery_power", lambda: True)
+    with tempfile.TemporaryDirectory() as tmp:
+        state = RuntimeState()
+        state.last_active_time = time.time() - 180
+        service = PodcastService(
+            podcasts_dir=os.path.join(tmp, "podcasts"),
+            podcast_chunk_dir=os.path.join(tmp, "chunks"),
+            runtime_state=state,
+            active_url_tasks={},
+            get_battery_policy=lambda: "pause",
+        )
+
+        should_pause, reason = service._pause_state()
+        assert should_pause is True
+        assert reason == "battery"
+
+
+def test_podcast_battery_policy_quiet_allows_and_forces_quiet(monkeypatch):
+    monkeypatch.setattr(podcast_service_module, "is_on_battery_power", lambda: True)
+    with tempfile.TemporaryDirectory() as tmp:
+        state = RuntimeState()
+        state.last_active_time = time.time() - 180
+        service = PodcastService(
+            podcasts_dir=os.path.join(tmp, "podcasts"),
+            podcast_chunk_dir=os.path.join(tmp, "chunks"),
+            runtime_state=state,
+            active_url_tasks={},
+            get_battery_policy=lambda: "quiet",
+        )
+
+        should_pause, reason = service._pause_state()
+        assert should_pause is False
+        assert reason == "none"
+
+        config = service._apply_battery_policy_to_config(
+            {"performance_profile": "fast", "model": "Qwen3-TTS-1.7B-8bit"}
+        )
+        assert config["performance_profile"] == "quiet"
+        assert config["model"] == "Qwen3-TTS-0.6B"
+
+
+def test_podcast_battery_policy_allow_does_not_pause(monkeypatch):
+    monkeypatch.setattr(podcast_service_module, "is_on_battery_power", lambda: True)
+    with tempfile.TemporaryDirectory() as tmp:
+        state = RuntimeState()
+        state.last_active_time = time.time() - 180
+        service = PodcastService(
+            podcasts_dir=os.path.join(tmp, "podcasts"),
+            podcast_chunk_dir=os.path.join(tmp, "chunks"),
+            runtime_state=state,
+            active_url_tasks={},
+            get_battery_policy=lambda: "allow",
+        )
+
+        should_pause, reason = service._pause_state()
+        assert should_pause is False
+        assert reason == "none"
 
 
 def test_runtime_event_log_recent_events():
@@ -249,3 +328,41 @@ def test_reader_service_helpers_are_stable():
     assert cache_key("a", "bc") != cache_key("ab", "c")
     assert title_for_mode("translate", "Title") == "[中文翻译]Title"
     assert title_for_mode("original", "Title") == "Title"
+
+
+def test_reader_service_cleans_references_and_web_links():
+    raw = """# Title
+
+Useful [article link](https://example.com/a?x=1) text.
+
+<iframe src="https://tracker.example/embed"></iframe>
+
+Bare URL https://tracking.example/path should go.
+
+## References
+
+[^1]: A long citation https://doi.org/example
+"""
+    cleaned = clean_markdown_content(raw)
+    assert "Useful article link text." in cleaned
+    assert "iframe" not in cleaned
+    assert "https://" not in cleaned
+    assert "References" not in cleaned
+    assert "long citation" not in cleaned
+
+    zh_cleaned = clean_markdown_content("正文\n\n## 参考文献\n\n[文章](https://example.com)")
+    assert zh_cleaned == "正文"
+
+
+def test_reader_service_does_not_use_references_as_title():
+    raw = """![image](https://example.com/image.jpg)
+
+Short article body.
+
+## References
+
+[^1]: Citation.
+"""
+    assert extract_title(raw) == ""
+    assert extract_title(clean_markdown_content(raw)) == ""
+    assert title_for_mode("translate", extract_title(clean_markdown_content(raw))) == ""

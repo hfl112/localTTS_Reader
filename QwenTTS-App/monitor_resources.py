@@ -35,8 +35,8 @@ def monitor_loop() -> None:
     print("=" * 60)
     print(" QwenTTS 资源与运行状态实时监控面板 ".center(60, "="))
     print("=" * 60)
-    
-    url = "http://127.0.0.1:8001/status"
+    port = int(os.environ.get("TTS_BACKEND_PORT", 8001))
+    url = f"http://127.0.0.1:{port}/status"
     
     # 初始化 CPU 百分比计算
     psutil.cpu_percent(interval=None)
@@ -106,7 +106,7 @@ def monitor_loop() -> None:
                 title = title[:27] + "..."
             print(f"  └─ 文章标题:            {title}")
         else:
-            print("  (FastAPI 服务未启动在 8001 端口)")
+            print(f"  (FastAPI 服务未启动在 {port} 端口)")
             
         print("-" * 60)
         print("进程级资源监控:")

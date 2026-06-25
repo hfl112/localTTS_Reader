@@ -1,8 +1,11 @@
+import os
 import re
+from core.paths import runtime_paths
 
 class TextProcessor:
     def __init__(self, max_length: int = 80) -> None:
         self.max_length: int = max_length
+
 
     def filter_references(self, text: str) -> str:
         """
@@ -188,13 +191,13 @@ class TextProcessor:
         return [c for c in chunks if c.strip()]
 
     def parse_dialogue_or_text(self, text: str, performance_profile: str | None = None) -> list:
-        # 定义 Serena 和 Ryan 的参考路径
-        base_ref_path = "/Users/funanhe/00_MyCode/TTS/reference"
-        serena_ref_audio = f"{base_ref_path}/bbc_news.wav"
+        base_ref_path = runtime_paths.reference_path
+        serena_ref_audio = os.path.join(base_ref_path, "bbc_news.wav")
         serena_ref_text = "This is the research headquarters for one of the oldest companies in tech, IBM."
-        
-        ryan_ref_audio = f"{base_ref_path}/ref_ryan.wav"
+
+        ryan_ref_audio = os.path.join(base_ref_path, "ref_ryan.wav")
         ryan_ref_text = "各位听众大家好，欢迎收听本期的新闻快报，我是男主持瑞恩。"
+
         
         # 1. 识别对话标识，例如:
         # [Serena]: Hello

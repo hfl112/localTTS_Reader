@@ -100,6 +100,25 @@ class PlaybackService:
         self.get_performance_profile = get_performance_profile
         self.event_log = event_log
         self.controller = PlaybackController(shared_state, player)
+        self._shutdown_event = threading.Event()
+        self._thread_lock = threading.Lock()
+        self._threads: set[threading.Thread] = set()
+
+    def _start_thread(self, target: Callable, args: tuple[Any, ...], name: str) -> None:
+        if self._shutdown_event.is_set():
+            raise RuntimeError("playback service is shutting down")
+
+        def run() -> None:
+            try:
+                target(*args)
+            finally:
+                with self._thread_lock:
+                    self._threads.discard(threading.current_thread())
+
+        thread = threading.Thread(target=run, name=name, daemon=True)
+        with self._thread_lock:
+            self._threads.add(thread)
+        thread.start()
 
     def start_new_session(self) -> tuple[int, int]:
         session_id, task_id = self.controller.start_new_session()
@@ -139,11 +158,11 @@ class PlaybackService:
         state: dict[str, Any],
         is_podcast: bool = False,
     ) -> None:
-        threading.Thread(
-            target=self._shared_task_loop,
-            args=(session_id, task_id, start_idx, chunks, config, state, is_podcast),
-            daemon=True,
-        ).start()
+        self._start_thread(
+            self._shared_task_loop,
+            (session_id, task_id, start_idx, chunks, config, state, is_podcast),
+            "tts-playback",
+        )
         self._record_event(
             "tts_thread_started",
             session_id=session_id,
@@ -169,11 +188,11 @@ class PlaybackService:
             filename=filename,
             filepath=filepath,
         )
-        threading.Thread(
-            target=self._play_wav_thread,
-            args=(filepath, session_id, task_id),
-            daemon=True,
-        ).start()
+        self._start_thread(
+            self._play_wav_thread,
+            (filepath, session_id, task_id),
+            "wav-playback",
+        )
 
     def _shared_task_loop(
         self,
@@ -193,7 +212,9 @@ class PlaybackService:
                 self.player.start()
             self.shared_state.set_status("BUSY")
             for i in range(start_idx, len(chunks)):
-                if not self.controller.can_feed_audio(session_id, task_id):
+                if self._shutdown_event.is_set() or not self.controller.can_feed_audio(
+                    session_id, task_id
+                ):
                     break
                 self.runtime_state.set_main(progress=f"{i+1}/{len(chunks)}")
                 chunk_text = chunks[i]
@@ -225,6 +246,7 @@ class PlaybackService:
                     self.shared_state.set_status("COOLING")
                     while (
                         self.player.get_queue_duration() > buffer_low_sec
+                        and not self._shutdown_event.is_set()
                         and self.controller.can_feed_audio(session_id, task_id)
                     ):
                         time.sleep(1.0)
@@ -257,11 +279,14 @@ class PlaybackService:
 
             self.player.start()
             for i in range(0, len(float_data), chunk_size):
-                if not self.controller.can_feed_audio(session_id, task_id):
+                if self._shutdown_event.is_set() or not self.controller.can_feed_audio(
+                    session_id, task_id
+                ):
                     break
 
                 while (
                     self.player.audio_queue.qsize() > 5
+                    and not self._shutdown_event.is_set()
                     and self.controller.can_feed_audio(session_id, task_id)
                 ):
                     time.sleep(0.5)
@@ -290,6 +315,23 @@ class PlaybackService:
                 task_id=task_id,
                 is_current=self.controller.is_current(session_id, task_id),
             )
+
+    def begin_shutdown(self) -> None:
+        if self._shutdown_event.is_set():
+            return
+        self._shutdown_event.set()
+        self.controller.stop_current_session()
+        if self.player is not None:
+            self.player.playback_finished_event.set()
+
+    def shutdown(self, join_timeout: float = 2.0) -> None:
+        self.begin_shutdown()
+
+        with self._thread_lock:
+            threads = list(self._threads)
+        for thread in threads:
+            if thread is not threading.current_thread():
+                thread.join(join_timeout)
 
     def _record_event(self, event: str, **fields: Any) -> None:
         if self.event_log:

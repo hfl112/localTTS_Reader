@@ -115,7 +115,8 @@ class TTSEngine:
 
         # Global ICL auto-injection mechanism to prevent voice drift in zero-shot mode
         if "ref_audio" not in generate_kwargs:
-            base_ref_path = "/Users/funanhe/00_MyCode/TTS/reference"
+            project_root = os.path.dirname(self.base_dir)
+            base_ref_path = os.path.join(project_root, "reference")
             
             serena_zh_audio = f"{base_ref_path}/ref_serena_zh.wav"
             serena_zh_text = "欢迎收听本期播客，我是女主持塞蕾娜。"
@@ -150,7 +151,8 @@ class TTSEngine:
         ref_text = generate_kwargs.get("ref_text", "")
         current_lang = generate_kwargs.get("lang_code", "zh")
         current_voice = generate_kwargs.get("voice", "Serena")
-        base_ref_path = "/Users/funanhe/00_MyCode/TTS/reference"
+        project_root = os.path.dirname(self.base_dir)
+        base_ref_path = os.path.join(project_root, "reference")
         
         if ref_text and current_lang:
             has_chinese_ref = any('\u4e00' <= char <= '\u9fff' for char in ref_text)

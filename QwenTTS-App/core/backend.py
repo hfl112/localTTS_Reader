@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from typing import List, Dict, Any
 import threading
 import multiprocessing as mp
 import mlx.core as mx
@@ -19,9 +20,15 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
-# 统一的播客目录（指向根目录下的 podcasts/ 目录）
-PODCASTS_DIR = os.path.abspath(os.path.join(os.path.dirname(BASE_DIR), "podcasts"))
-os.makedirs(PODCASTS_DIR, exist_ok=True)
+from core.paths import runtime_paths
+
+PODCASTS_DIR = runtime_paths.podcasts_path
+CACHE_DIR = runtime_paths.cache_path
+PODCAST_CHUNK_DIR = os.path.join(runtime_paths.app_support_path, "PodcastChunks")
+os.makedirs(PODCAST_CHUNK_DIR, exist_ok=True)
+RUNTIME_EVENTS_FILE = os.path.join(runtime_paths.data_path, "runtime_events.jsonl")
+PODCAST_JOBS_FILE = os.path.join(runtime_paths.data_path, "podcast_jobs.json")
+URL_JOBS_FILE = os.path.join(runtime_paths.data_path, "url_jobs.json")
 
 from core.tts_engine import TTSEngine
 from core.api_models import (
@@ -34,6 +41,7 @@ from core.api_models import (
     ReadUrlRequest,
     SaveForLaterRequest,
     SeekRequest,
+    SettingsUpdateRequest,
 )
 from core.player import PCMPlayer
 from core.processor import TextProcessor
@@ -45,23 +53,19 @@ from core.services.performance import get_performance_profile
 from core.services.saved_items_service import SavedItemsService
 from core.services.cache_service import CacheService
 from core.services.runtime_log import RuntimeEventLog
+from core.services.runtime_supervisor import RuntimeSupervisor
 from core.services.url_jobs import UrlJobStore
 
-CACHE_DIR = os.path.join(BASE_DIR, "data", "cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
-PODCAST_CHUNK_DIR = os.path.join(BASE_DIR, "data", "podcast_chunks")
-os.makedirs(PODCAST_CHUNK_DIR, exist_ok=True)
-RUNTIME_EVENTS_FILE = os.path.join(BASE_DIR, "data", "runtime_events.jsonl")
-PODCAST_JOBS_FILE = os.path.join(BASE_DIR, "data", "podcast_jobs.json")
-URL_JOBS_FILE = os.path.join(BASE_DIR, "data", "url_jobs.json")
 
 # 终极同步信号：必须是字符串，确保跨进程一致
 GLOBAL_SENTINEL = "PIPELINE_END_STRICT_V1"
+INSTANCE_ID = str(uuid.uuid4())
+
 
 def get_text_hash(text):
     return hashlib.md5(text.encode('utf-8')).hexdigest()
 
-def manage_cache_limit(max_items=10):
+def manage_cache_limit(max_items=10, storage_obj=None):
     try:
         files = [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR) if f.endswith('.npy')]
         if len(files) <= max_items: return
@@ -69,13 +73,11 @@ def manage_cache_limit(max_items=10):
         for f in files[:-max_items]:
             os.remove(f)
             md5_val = os.path.basename(f).replace('.npy', '')
-            try:
-                storage.delete_cache_by_md5(md5_val)
-            except: pass
+            if storage_obj is not None:
+                try:
+                    storage_obj.delete_cache_by_md5(md5_val)
+                except: pass
     except: pass
-
-def clear_all_cache():
-    cache_service.clear()
 
 # ==========================================
 # 1. 跨进程共享状态
@@ -103,7 +105,11 @@ class SharedState:
 def inference_worker(shared_state):
     print(f"[InferenceProcess] 启动成功, PID: {os.getpid()}")
     engine = None
+    # The application bundle is read-only after installation.  Worker metadata
+    # must live in Application Support just like the main process metadata.
+    worker_storage = Storage(data_dir=runtime_paths.data_path)
     last_active_time = time.time()
+    metal_warning_reported = False
     
     def handle_signal(sig, frame):
         sys.exit(0)
@@ -111,7 +117,17 @@ def inference_worker(shared_state):
 
     while True:
         try:
-            shared_state.vram_mb.value = mx.get_active_memory() / 1024 / 1024
+            try:
+                shared_state.vram_mb.value = mx.get_active_memory() / 1024 / 1024
+                metal_warning_reported = False
+            except RuntimeError as error:
+                # Querying Metal while idle is diagnostic-only.  A missing or
+                # temporarily unavailable device must not create a hot error
+                # loop that consumes a CPU core and floods the logs.
+                shared_state.vram_mb.value = 0.0
+                if not metal_warning_reported:
+                    print(f"[InferenceProcess] Metal memory query unavailable: {error}")
+                    metal_warning_reported = True
             
             try:
                 task = shared_state.text_q.get(timeout=2)
@@ -142,14 +158,20 @@ def inference_worker(shared_state):
             config = task['config']
             profile = get_performance_profile(config.get("performance_profile"))
             target_model_name = config.get("model", "Qwen3-TTS-1.7B-8bit")
-            target_path = f"models/{target_model_name}"
+            target_path = os.path.join(runtime_paths.models_path, target_model_name)
 
             if engine is None:
-                engine = TTSEngine(model_path=target_path, mlx_audio_path="../../mlx_audio")
+                engine = TTSEngine(
+                    model_path=target_path,
+                    mlx_audio_path=runtime_paths.mlx_audio_path,
+                )
             
             if engine.abs_model_path != os.path.abspath(os.path.join(engine.base_dir, target_path)):
                 print(f"[InferenceProcess] 模型切换 -> {target_model_name}")
-                engine = TTSEngine(model_path=target_path, mlx_audio_path="../../mlx_audio")
+                engine = TTSEngine(
+                    model_path=target_path,
+                    mlx_audio_path=runtime_paths.mlx_audio_path,
+                )
             
             if engine.model is None:
                 engine.ensure_model_loaded()
@@ -192,7 +214,7 @@ def inference_worker(shared_state):
                     np.save(cache_file, concat_audio)
                     duration = len(concat_audio) / 24000.0
                     try:
-                        storage.add_cache_metadata(
+                        worker_storage.add_cache_metadata(
                             md5=text_hash,
                             text=text,
                             model=target_model_name,
@@ -202,7 +224,7 @@ def inference_worker(shared_state):
                         )
                     except Exception as db_err:
                         print(f"[InferenceProcess] Failed to save cache metadata: {db_err}")
-                    manage_cache_limit(10)
+                    manage_cache_limit(10, worker_storage)
                 except Exception as save_err:
                     print(f"[InferenceProcess] Save cache failed: {save_err}")
             
@@ -212,45 +234,101 @@ def inference_worker(shared_state):
         except Exception as e:
             print(f"[InferenceProcess] 异常: {e}")
             traceback.print_exc()
+            time.sleep(1.0)
 
 # ==========================================
 # 3. 主进程逻辑
 # ==========================================
-S = SharedState()
-storage = Storage(data_dir=os.path.join(BASE_DIR, "data"))
-# 强制播放器的 SENTINEL 与全局一致，只在主进程中初始化播放器，子进程（InferenceProcess）不加载 CoreAudio 硬件驱动
-import multiprocessing
-if multiprocessing.parent_process() is None:
+S: SharedState | None = None
+storage: Storage | None = None
+player: PCMPlayer | None = None
+processor: TextProcessor | None = None
+runtime_state: RuntimeState | None = None
+saved_items_service: SavedItemsService | None = None
+cache_service: CacheService | None = None
+event_log: RuntimeEventLog | None = None
+url_job_store: UrlJobStore | None = None
+playback_service: PlaybackService | None = None
+podcast_service: PodcastService | None = None
+runtime_supervisor: RuntimeSupervisor | None = None
+ACTIVE_URL_TASKS: dict[str, dict] = {}
+
+
+def init_runtime_services() -> None:
+    global S
+    global storage
+    global player
+    global processor
+    global runtime_state
+    global saved_items_service
+    global cache_service
+    global event_log
+    global url_job_store
+    global playback_service
+    global podcast_service
+    global runtime_supervisor
+
+    if S is not None:
+        return
+
+    S = SharedState()
+    storage = Storage()
     player = PCMPlayer(sample_rate=24000)
     player.SENTINEL = GLOBAL_SENTINEL
-else:
-    player = None
+    processor = TextProcessor()
+    runtime_state = RuntimeState()
+    saved_items_service = SavedItemsService()
 
-processor = TextProcessor()
-runtime_state = RuntimeState()
-saved_items_service = SavedItemsService(BASE_DIR)
-cache_service = CacheService(storage, CACHE_DIR, PODCASTS_DIR)
-event_log = RuntimeEventLog(RUNTIME_EVENTS_FILE)
-url_job_store = UrlJobStore(URL_JOBS_FILE)
-url_job_store.mark_unfinished_failed("backend restarted before URL job completed")
+    cache_service = CacheService(storage, CACHE_DIR, PODCASTS_DIR)
+    event_log = RuntimeEventLog(RUNTIME_EVENTS_FILE)
+    url_job_store = UrlJobStore(URL_JOBS_FILE)
+    url_job_store.mark_unfinished_failed("backend restarted before URL job completed")
 
-playback_service = PlaybackService(
-    shared_state=S,
-    player=player,
-    storage=storage,
-    runtime_state=runtime_state,
-    sentinel=GLOBAL_SENTINEL,
-    get_text_hash=get_text_hash,
-    get_performance_profile=get_performance_profile,
-    event_log=event_log,
-)
+    playback_service = PlaybackService(
+        shared_state=S,
+        player=player,
+        storage=storage,
+        runtime_state=runtime_state,
+        sentinel=GLOBAL_SENTINEL,
+        get_text_hash=get_text_hash,
+        get_performance_profile=get_performance_profile,
+        event_log=event_log,
+    )
 
-def performance_monitor_thread():
+    podcast_service = PodcastService(
+        podcasts_dir=PODCASTS_DIR,
+        podcast_chunk_dir=PODCAST_CHUNK_DIR,
+        runtime_state=runtime_state,
+        active_url_tasks=ACTIVE_URL_TASKS,
+        jobs_file=PODCAST_JOBS_FILE,
+        event_log=event_log,
+        is_frontend_active=lambda: (
+            runtime_state.snapshot()["main_is_playing"]
+            and player is not None
+            and not player.is_paused
+        ),
+        is_device_switching=lambda: bool(player is not None and player.is_device_switching()),
+        get_battery_policy=lambda: storage.load_config().get("battery_podcast_policy", "pause"),
+    )
+
+    runtime_supervisor = RuntimeSupervisor(
+        shared_state=S,
+        player=player,
+        playback_service=playback_service,
+        podcast_service=podcast_service,
+        url_job_store=url_job_store,
+        active_url_tasks=ACTIVE_URL_TASKS,
+        event_log=event_log,
+    )
+
+def performance_monitor_thread(shutdown_event: threading.Event):
+    if S is None or player is None or runtime_state is None:
+        return
     import psutil
     process = psutil.Process(os.getpid())
     print("[Monitor] 性能监控就绪")
     last_status = "IDLE"
-    while True:
+    while not shutdown_event.is_set():
         try:
             st = S.get_status()
             if runtime_state.main_is_playing and st == "IDLE": st = "PLAYING"
@@ -260,7 +338,7 @@ def performance_monitor_thread():
             
             last_status = st
             if st == "IDLE":
-                time.sleep(2)
+                shutdown_event.wait(2)
                 continue
 
             cpu = process.cpu_percent(interval=None) 
@@ -272,11 +350,14 @@ def performance_monitor_thread():
                 f"------------------\n"
             )
             print(log_msg)
-            time.sleep(5)
-        except: time.sleep(5)
+            shutdown_event.wait(5)
+        except Exception:
+            shutdown_event.wait(5)
 
-def audio_feeder_thread():
-    while True:
+def audio_feeder_thread(shutdown_event: threading.Event):
+    if S is None or player is None or runtime_state is None:
+        return
+    while not shutdown_event.is_set():
         try:
             item = S.audio_q.get()
             if item is None: break
@@ -307,28 +388,104 @@ def audio_feeder_thread():
                         runtime_state.append_podcast_audio(samples)
                     else:
                         player.play_chunk(samples)
-        except: pass
+        except Exception:
+            if shutdown_event.is_set():
+                break
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    clear_all_cache()
+    import shutil
+    configured_ffmpeg = runtime_paths.ffmpeg_path
+    if not (configured_ffmpeg and os.path.isfile(configured_ffmpeg)) and shutil.which("ffmpeg") is None:
+        print("\n" + "="*80)
+        print("[Warning] 系统中未检测到 ffmpeg 命令行工具！播客音频合成功能可能无法正常运作。")
+        print("请确保已通过 brew install ffmpeg 安装，并将其添加至系统的 PATH 中。")
+        print("="*80 + "\n")
+
     mp.set_start_method('spawn', force=True)
-    p = mp.Process(target=inference_worker, args=(S,), daemon=True)
-    p.start()
-    threading.Thread(target=audio_feeder_thread, daemon=True).start()
-    threading.Thread(target=performance_monitor_thread, daemon=True).start()
-    yield
-    print("[Backend] lifespan正在进行资源清理并终止播放器...")
-    p.terminate()
-    if player is not None:
-        try:
-            player.close()
-        except Exception as e:
-            print(f"[Backend] 关闭播放器异常: {e}")
-    clear_all_cache()
-    S.text_q.put(None)
+    try:
+        init_runtime_services()
+        if S is None or runtime_supervisor is None:
+            raise RuntimeError("runtime shared state failed to initialize")
+        runtime_supervisor.start_watchdog(asyncio.get_running_loop())
+        runtime_supervisor.start_inference(inference_worker, (S,))
+        runtime_supervisor.start_thread(audio_feeder_thread, name="audio-feeder")
+        runtime_supervisor.start_thread(
+            performance_monitor_thread,
+            name="performance-monitor",
+        )
+        yield
+    finally:
+        print("[Backend] lifespan 正在执行统一资源清理...")
+        if runtime_supervisor is not None:
+            await runtime_supervisor.shutdown()
+        else:
+            if podcast_service is not None:
+                podcast_service.shutdown()
+            if player is not None:
+                player.close()
 
 app = FastAPI(lifespan=lifespan)
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.middleware("http")
+async def management_token_middleware(request: Request, call_next) -> Any:
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    token: str | None = os.environ.get("TTS_MANAGEMENT_TOKEN")
+    path: str = request.url.path
+
+    # Compatibility is opt-in and restricted to the loopback interface.  It is
+    # used only when app.py owns the backend so the existing extension can keep
+    # working while the authenticated native client is developed separately.
+    legacy_loopback_clients = (
+        os.environ.get("TTS_LEGACY_LOOPBACK_CLIENTS") == "1"
+        and request.client is not None
+        and request.client.host in {"127.0.0.1", "::1", "localhost", "testclient"}
+    )
+    if legacy_loopback_clients:
+        return await call_next(request)
+    
+    # 1. 检查管理端令牌 (AppKit 独占接口)
+    is_control_or_stop: bool = path.startswith("/control/") or path == "/stop"
+    is_settings_write: bool = path == "/settings" and request.method == "PATCH"
+    if token and (is_control_or_stop or is_settings_write):
+        x_token: str | None = request.headers.get("x-management-token")
+        if x_token != token:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized: invalid management token"}
+            )
+            
+    # 2. 检查普通写操作接口 (允许管理令牌或扩展配对令牌)
+    write_endpoints: List[str] = [
+        "/read", "/read_url", "/save_for_later", "/play_saved", "/delete_saved",
+        "/podcasts/play", "/podcasts/delete", "/podcasts/toggle_pin", "/podcasts/clear",
+        "/cache/play", "/cache/export", "/cache/delete", "/cache/clear",
+        "/saved_items/clear", "/generate_single_podcast", "/generate_podcast"
+    ]
+    if path in write_endpoints:
+        x_token = request.headers.get("x-management-token")
+        x_ext_token: str | None = request.headers.get("x-extension-token")
+        
+        if token and x_token == token:
+            return await call_next(request)
+            
+        config: Dict[str, Any] = storage.load_config() if storage else {}
+        pairing_token: str | None = config.get("extension_pairing_token")
+        
+        if not pairing_token or x_ext_token != pairing_token:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized: invalid extension token or pairing required"}
+            )
+            
+    return await call_next(request)
+
+
 
 @app.post("/read")
 async def read_text(data: ReadRequest):
@@ -402,6 +559,18 @@ async def stop_read():
 
 @app.get("/status")
 async def get_status():
+    if runtime_state is None or player is None or S is None:
+        return {
+            "is_playing": False,
+            "is_paused": False,
+            "current_podcast_file": None,
+            "current_playing_md5": None,
+            "title": "",
+            "progress": "",
+            "buffer_sec": 0,
+            "status_code": "STARTING",
+            "generating_title": "",
+        }
     runtime_snapshot = runtime_state.snapshot()
     generating_title = ""
     if os.path.exists(PODCASTS_DIR):
@@ -513,19 +682,6 @@ async def seek_playback(data: SeekRequest):
 
 import asyncio
 
-ACTIVE_URL_TASKS: dict[str, dict] = {}
-podcast_service = PodcastService(
-    podcasts_dir=PODCASTS_DIR,
-    podcast_chunk_dir=PODCAST_CHUNK_DIR,
-    runtime_state=runtime_state,
-    active_url_tasks=ACTIVE_URL_TASKS,
-    jobs_file=PODCAST_JOBS_FILE,
-    event_log=event_log,
-    is_frontend_active=lambda: bool(
-        runtime_state.snapshot()["main_is_playing"] and player is not None and not player.is_paused
-    ),
-)
-
 @app.post("/read_url")
 async def read_url(payload: ReadUrlRequest) -> dict:
     global ACTIVE_URL_TASKS
@@ -626,7 +782,16 @@ async def read_url(payload: ReadUrlRequest) -> dict:
         finally:
             ACTIVE_URL_TASKS.pop(url, None)
             
-    asyncio.create_task(run_cli_task())
+    if runtime_supervisor is None:
+        ACTIVE_URL_TASKS.pop(url, None)
+        url_job_store.update(
+            job_id,
+            status="failed",
+            stage="failed",
+            error="runtime supervisor is not ready",
+        )
+        return {"status": "error", "message": "Backend is not ready"}
+    runtime_supervisor.create_task(run_cli_task(), job_id=job_id)
     return {"status": "ok", "job_id": job_id, "message": "Read URL task dispatched"}
 
 @app.get("/url_jobs")
@@ -775,11 +940,12 @@ async def get_saved_items():
     current_time = time.time()
     for url, info in list(ACTIVE_URL_TASKS.items()):
         if not info.get("is_podcast", False) and current_time - info["timestamp"] < 60:
+            is_yt = "youtube.com" in url or "youtu.be" in url
             saved_items.insert(0, {
                 "timestamp": info["timestamp"],
                 "text": url,
                 "title": "⏳ 正在抓取网页正文...",
-                "source": "web",
+                "source": "video" if is_yt else "web",
                 "is_exported": False,
                 "is_pending": True
             })
@@ -831,5 +997,77 @@ async def clear_cache_endpoint():
     cache_service.clear()
     return {"status": "ok"}
 
+
+@app.get("/health")
+async def get_health():
+    return {
+        "status": "ready",
+        "instance_id": INSTANCE_ID,
+        "pid": os.getpid(),
+        "managed": os.environ.get("TTS_WATCHDOG_FD") is not None,
+        "accepting_requests": runtime_supervisor.accepting_requests if runtime_supervisor else True
+    }
+
+
+@app.get("/snapshot")
+async def get_snapshot():
+    runtime_snapshot = runtime_state.snapshot() if runtime_state else {}
+    playback_snap = playback_service.snapshot() if playback_service else {}
+    podcast_snap = podcast_service.snapshot() if podcast_service else {}
+    return {
+        **playback_snap,
+        "status_code": S.get_status() if S else "IDLE",
+        **runtime_snapshot,
+        **podcast_snap,
+        "active_url_tasks": list(ACTIVE_URL_TASKS.keys()),
+        "instance_id": INSTANCE_ID,
+    }
+
+
+@app.get("/settings")
+async def get_settings():
+    if storage is None:
+        return {"error": "Storage not initialized"}
+    return storage.load_config()
+
+
+@app.patch("/settings")
+async def patch_settings(update_data: SettingsUpdateRequest):
+    if storage is None:
+        return {"error": "Storage not initialized"}
+    config = storage.load_config()
+    # 过滤掉 None 值，仅更新传入的字段
+    update_dict = {k: v for k, v in update_data.model_dump().items() if v is not None}
+    config.update(update_dict)
+    storage.save_config(config)
+    return {"status": "ok", "config": config}
+
+
+@app.post("/control/heartbeat")
+async def post_heartbeat():
+    if runtime_state:
+        runtime_state.touch_activity()
+    return {"status": "ok"}
+
+
+@app.post("/control/shutdown")
+async def post_shutdown():
+    import signal
+    
+    def trigger_sigterm():
+        time.sleep(0.1)
+        if "pytest" not in sys.modules:
+            os.kill(os.getpid(), signal.SIGTERM)
+        else:
+            print("[Backend] Pytest environment detected via sys.modules. Skipping self-kill.")
+        
+    threading.Thread(target=trigger_sigterm, daemon=True).start()
+    return {"status": "shutting_down"}
+
+
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="error")
+    port = int(os.environ.get("TTS_BACKEND_PORT", 8001))
+    host = os.environ.get("TTS_BACKEND_HOST", "127.0.0.1")
+    uvicorn.run(app, host=host, port=port, log_level="error")

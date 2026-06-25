@@ -64,3 +64,16 @@ class PlaySavedRequest(BaseModel):
 
 class Md5Request(BaseModel):
     md5: str | None = None
+
+
+class SettingsUpdateRequest(BaseModel):
+    voice: str | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    seed: int | None = None
+    repetition_penalty: float | None = None
+    lang_code: str | None = None
+    battery_podcast_policy: str | None = None
+    performance_profile: str | None = None
+    extension_pairing_token: str | None = None
+

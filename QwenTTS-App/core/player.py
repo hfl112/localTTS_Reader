@@ -73,14 +73,21 @@ class PCMPlayer:
         
         self.current_device_id: int = 0
         self.device_is_changing: bool = False
+        self._last_device_change_time: float = 0.0
         self.device_changed_event: threading.Event = threading.Event()
+        self._shutdown_event = threading.Event()
         
         self._lock: threading.Lock = threading.Lock()
         
         self._ensure_stream_started()
         self._register_device_change_listener()
         
-        threading.Thread(target=self._device_monitor_loop, daemon=True).start()
+        self._device_monitor_thread = threading.Thread(
+            target=self._device_monitor_loop,
+            name="audio-device-monitor",
+            daemon=True,
+        )
+        self._device_monitor_thread.start()
 
     def _register_device_change_listener(self) -> None:
         if not _coreaudio:
@@ -106,6 +113,7 @@ class PCMPlayer:
     def _on_device_changed(self, obj_id: int, n_addresses: int, addresses: c_void_p, client_data: c_void_p) -> int:
         with self._lock:
             self.device_is_changing = True
+            self._last_device_change_time = time.time()
         self.device_changed_event.set()
         return 0
 
@@ -150,11 +158,14 @@ class PCMPlayer:
             print("[PCMPlayer] 所有重试均失败，音频流未能启动")
 
     def _device_monitor_loop(self) -> None:
-        while True:
+        while not self._shutdown_event.is_set():
             self.device_changed_event.wait()
             self.device_changed_event.clear()
+            if self._shutdown_event.is_set():
+                break
             # 等待 1.5s 让 CoreAudio 完成设备图重建，防止在切换抖动期间立即开流
-            time.sleep(1.5)
+            if self._shutdown_event.wait(1.5):
+                break
             self.device_changed_event.clear()
 
             try:
@@ -162,6 +173,8 @@ class PCMPlayer:
                 print(f"[DeviceMonitor] 切换检测: {self.current_device_id} -> {default_device_id}", flush=True)
                 if default_device_id != 0 and self.current_device_id != 0 and self.current_device_id != default_device_id:
                     self.current_device_id = default_device_id
+                    with self._lock:
+                        self._last_device_change_time = time.time()
                     
                     with self._lock:
                         self.device_is_changing = True
@@ -240,6 +253,7 @@ class PCMPlayer:
         print("[PCMPlayer] 手动重启音频流并刷新设备列表...")
         with self._lock:
             self.device_is_changing = True
+            self._last_device_change_time = time.time()
             stream_to_close = self.stream
             self.stream = None
             
@@ -259,7 +273,16 @@ class PCMPlayer:
             
         self._ensure_stream_started()
 
+    def is_device_switching(self, grace_sec: float = 5.0) -> bool:
+        with self._lock:
+            return self.device_is_changing or (
+                time.time() - self._last_device_change_time < grace_sec
+            )
+
     def close(self) -> None:
+        self._shutdown_event.set()
+        self.device_changed_event.set()
+        self.playback_finished_event.set()
         self.remove_listener()
         with self._lock:
             self.is_active = False
@@ -277,6 +300,11 @@ class PCMPlayer:
                 print("[PCMPlayer] PortAudio 已终止")
             except:
                 pass
+        if (
+            hasattr(self, "_device_monitor_thread")
+            and self._device_monitor_thread is not threading.current_thread()
+        ):
+            self._device_monitor_thread.join(2.0)
 
     def remove_listener(self) -> None:
         if hasattr(self, '_c_listener') and _coreaudio:
@@ -408,6 +436,7 @@ class PCMPlayer:
                     self.audio_queue.get_nowait()
                 except:
                     break
+        self.playback_finished_event.set()
 
     def is_running(self) -> bool:
         return not self.playback_finished_event.is_set()

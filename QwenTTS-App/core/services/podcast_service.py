@@ -15,7 +15,10 @@ import scipy.io.wavfile
 from core.processor import TextProcessor
 from core.services.podcast_jobs import PodcastJobStore
 from core.services.performance import estimate_reading_minutes, get_performance_profile
+from core.services.runtime_supervisor import stop_process
 from core.services.runtime_log import RuntimeEventLog
+
+BATTERY_PODCAST_POLICIES = {"pause", "quiet", "allow"}
 
 
 def is_on_battery_power() -> bool:
@@ -38,15 +41,19 @@ def prepare_podcast_config(
 ) -> dict[str, Any]:
     podcast_config = config.copy()
     podcast_config["performance_profile"] = podcast_config.get("performance_profile", "quiet")
+    if podcast_config.get("force_battery_quiet"):
+        podcast_config["performance_profile"] = "quiet"
+        podcast_config["model"] = "Qwen3-TTS-0.6B"
     profile = get_performance_profile(podcast_config["performance_profile"])
     if force_small_model or estimate_reading_minutes(text) >= 20.0:
         podcast_config["model"] = profile.get("model") or "Qwen3-TTS-0.6B"
     return podcast_config
 
 
-def wait_for_podcast_slot(pause_event, poll_sec: float) -> None:
+def wait_for_podcast_slot(pause_event, shutdown_event, poll_sec: float) -> None:
     while pause_event.is_set():
-        time.sleep(poll_sec)
+        if shutdown_event.wait(poll_sec):
+            raise RuntimeError("podcast generation canceled")
 
 
 def generate_podcast_chunks(
@@ -55,6 +62,7 @@ def generate_podcast_chunks(
     config: dict[str, Any],
     chunk_dir: str,
     pause_event,
+    shutdown_event,
 ) -> list[str]:
     profile = get_performance_profile(config.get("performance_profile"))
     os.makedirs(chunk_dir, exist_ok=True)
@@ -66,12 +74,18 @@ def generate_podcast_chunks(
     progress_path = os.path.join(chunk_dir, "progress.json")
 
     for idx, chunk in enumerate(chunks):
+        if shutdown_event.is_set():
+            raise RuntimeError("podcast generation canceled")
         chunk_file = os.path.join(chunk_dir, f"chunk_{idx:05d}.npy")
         chunk_files.append(chunk_file)
         if os.path.exists(chunk_file):
             continue
 
-        wait_for_podcast_slot(pause_event, profile["podcast_pause_poll_sec"])
+        wait_for_podcast_slot(
+            pause_event,
+            shutdown_event,
+            profile["podcast_pause_poll_sec"],
+        )
         if isinstance(chunk, dict):
             chunk_config = config.copy()
             chunk_config.update(chunk.get("config", {}))
@@ -82,8 +96,11 @@ def generate_podcast_chunks(
 
         parts = []
         for samples in engine.generate_stream(actual_text, chunk_config):
+            if shutdown_event.is_set():
+                raise RuntimeError("podcast generation canceled")
             parts.append(samples)
-            time.sleep(profile["chunk_sleep"])
+            if shutdown_event.wait(profile["chunk_sleep"]):
+                raise RuntimeError("podcast generation canceled")
 
         if parts:
             np.save(chunk_file, np.concatenate(parts).astype(np.float32))
@@ -94,7 +111,8 @@ def generate_podcast_chunks(
                     ensure_ascii=False,
                     indent=2,
                 )
-        time.sleep(profile["sentence_sleep"])
+        if shutdown_event.wait(profile["sentence_sleep"]):
+            raise RuntimeError("podcast generation canceled")
 
     return chunk_files
 
@@ -130,6 +148,7 @@ def run_single_podcast_generation_thread(
     md5: str,
     source: str,
     pause_event,
+    shutdown_event,
     gpu_lock,
     podcasts_dir: str,
     podcast_chunk_dir: str,
@@ -171,7 +190,14 @@ def run_single_podcast_generation_thread(
             )
             engine.ensure_model_loaded()
             chunk_dir = os.path.join(podcast_chunk_dir, f"single_{md5[:12]}")
-            chunk_files = generate_podcast_chunks(engine, text, config, chunk_dir, pause_event)
+            chunk_files = generate_podcast_chunks(
+                engine,
+                text,
+                config,
+                chunk_dir,
+                pause_event,
+                shutdown_event,
+            )
             out_name = f"podcast_单篇_{source}_{safe_title}_{md5[:8]}_{int(time.time())}.wav"
             output_path = os.path.join(podcasts_dir, out_name)
             if not write_podcast_wav_from_chunks(chunk_files, output_path):
@@ -195,6 +221,7 @@ def run_podcast_generation_thread(
     text: str,
     config: dict[str, Any],
     pause_event,
+    shutdown_event,
     gpu_lock,
     podcast_chunk_dir: str,
     jobs_file: str,
@@ -224,7 +251,14 @@ def run_podcast_generation_thread(
             engine.ensure_model_loaded()
             batch_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
             chunk_dir = os.path.join(podcast_chunk_dir, f"batch_{batch_hash[:12]}")
-            chunk_files = generate_podcast_chunks(engine, text, config, chunk_dir, pause_event)
+            chunk_files = generate_podcast_chunks(
+                engine,
+                text,
+                config,
+                chunk_dir,
+                pause_event,
+                shutdown_event,
+            )
             if not write_podcast_wav_from_chunks(chunk_files, filename):
                 raise RuntimeError("no generated podcast chunks")
             job_store.update(job_id, status="done", output_path=filename, error=None)
@@ -251,12 +285,16 @@ class PodcastService:
         jobs_file: str | None = None,
         event_log: RuntimeEventLog | None = None,
         is_frontend_active: Callable[[], bool] | None = None,
+        is_device_switching: Callable[[], bool] | None = None,
+        get_battery_policy: Callable[[], str] | None = None,
     ) -> None:
         self.podcasts_dir = podcasts_dir
         self.podcast_chunk_dir = podcast_chunk_dir
         self.runtime_state = runtime_state
         self.active_url_tasks = active_url_tasks
         self.is_frontend_active = is_frontend_active
+        self.is_device_switching = is_device_switching
+        self.get_battery_policy = get_battery_policy
         self.job_store = PodcastJobStore(
             jobs_file
             or os.path.join(os.path.dirname(self.podcast_chunk_dir), "podcast_jobs.json")
@@ -264,15 +302,23 @@ class PodcastService:
         self.job_store.mark_unfinished_failed("backend restarted before job completed")
         self.event_log = event_log
         self.pause_event = mp.Event()
+        self.worker_shutdown_event = mp.Event()
         self.gpu_lock = mp.Lock()
         self.active_procs: list[mp.Process] = []
         self.active_tasks: dict[str, mp.Process] = {}
         self.active_job_ids: dict[str, str] = {}
         self.last_pause_reason = "recent_activity"
-        threading.Thread(target=self._manager_loop, daemon=True).start()
+        self.last_battery_policy = "pause"
+        self._shutdown_event = threading.Event()
+        self._manager_thread = threading.Thread(
+            target=self._manager_loop,
+            name="podcast-manager",
+            daemon=True,
+        )
+        self._manager_thread.start()
 
     def _manager_loop(self) -> None:
-        while True:
+        while not self._shutdown_event.is_set():
             should_pause, reason = self._pause_state()
 
             if should_pause:
@@ -285,7 +331,7 @@ class PodcastService:
                 if self.pause_event.is_set():
                     self.pause_event.clear()
                     self._record_event("podcast_generation_resumed")
-            time.sleep(2)
+            self._shutdown_event.wait(2)
 
     def _frontend_active(self) -> bool:
         if self.is_frontend_active is not None:
@@ -296,8 +342,17 @@ class PodcastService:
         return bool(self.runtime_state.snapshot()["main_is_playing"])
 
     def _pause_state(self) -> tuple[bool, str]:
+        if self.is_device_switching is not None:
+            try:
+                if self.is_device_switching():
+                    return False, "device_switching"
+            except Exception:
+                pass
+
         frontend_active = self._frontend_active()
         url_active = len(self.active_url_tasks) > 0
+        battery_policy = self._battery_policy()
+        self.last_battery_policy = battery_policy
         self.runtime_state.update_activity_if_busy(frontend_active or url_active)
         runtime_snapshot = self.runtime_state.snapshot()
 
@@ -307,13 +362,36 @@ class PodcastService:
             return True, "url_active"
         if time.time() - runtime_snapshot["last_active_time"] < 120:
             return True, "recent_activity"
-        if is_on_battery_power():
+        if is_on_battery_power() and battery_policy == "pause":
             return True, "battery"
         return False, "none"
+
+    def _battery_policy(self) -> str:
+        if self.get_battery_policy is None:
+            return "pause"
+        try:
+            policy = self.get_battery_policy()
+        except Exception:
+            return "pause"
+        return policy if policy in BATTERY_PODCAST_POLICIES else "pause"
+
+    def _apply_battery_policy_to_config(self, config: dict[str, Any]) -> dict[str, Any]:
+        config = config.copy()
+        policy = self._battery_policy()
+        if is_on_battery_power() and policy == "quiet":
+            config["performance_profile"] = "quiet"
+            config["model"] = "Qwen3-TTS-0.6B"
+            config["force_battery_quiet"] = True
+            self._record_event("battery_quiet_policy_applied")
+        return config
 
     def cleanup_finished(self) -> None:
         for md5, proc in list(self.active_tasks.items()):
             if not proc.is_alive():
+                try:
+                    proc.join(0)
+                except (AssertionError, OSError, ValueError):
+                    pass
                 job_id = self.active_job_ids.pop(md5, None)
                 if proc.exitcode not in (0, None):
                     self.job_store.update(
@@ -328,7 +406,16 @@ class PodcastService:
                         exitcode=proc.exitcode,
                     )
                 self.active_tasks.pop(md5, None)
-        self.active_procs = [proc for proc in self.active_procs if proc.is_alive()]
+        live_processes = []
+        for proc in self.active_procs:
+            if proc.is_alive():
+                live_processes.append(proc)
+            else:
+                try:
+                    proc.join(0)
+                except (AssertionError, OSError, ValueError):
+                    pass
+        self.active_procs = live_processes
 
     def is_generating(self, md5: str) -> bool:
         self.cleanup_finished()
@@ -343,7 +430,10 @@ class PodcastService:
         source: str,
         title: str | None,
     ) -> None:
+        if self._shutdown_event.is_set():
+            raise RuntimeError("podcast service is shutting down")
         self.cleanup_finished()
+        config = self._apply_battery_policy_to_config(config)
         safe_title = title if title else (text[:20].replace("\n", " ") + "...")
         job_id = f"single_{md5[:12]}_{uuid.uuid4().hex[:8]}"
         self.job_store.create(
@@ -369,6 +459,7 @@ class PodcastService:
                 md5,
                 source,
                 self.pause_event,
+                self.worker_shutdown_event,
                 self.gpu_lock,
                 self.podcasts_dir,
                 self.podcast_chunk_dir,
@@ -392,7 +483,10 @@ class PodcastService:
         config: dict[str, Any],
         md5: str,
     ) -> None:
+        if self._shutdown_event.is_set():
+            raise RuntimeError("podcast service is shutting down")
         self.cleanup_finished()
+        config = self._apply_battery_policy_to_config(config)
         job_id = f"batch_{md5[:12]}_{uuid.uuid4().hex[:8]}"
         self.job_store.create(
             job_id=job_id,
@@ -416,6 +510,7 @@ class PodcastService:
                 text,
                 config,
                 self.pause_event,
+                self.worker_shutdown_event,
                 self.gpu_lock,
                 self.podcast_chunk_dir,
                 self.job_store.path,
@@ -429,18 +524,39 @@ class PodcastService:
         self.active_tasks[md5] = p
         self.active_job_ids[md5] = job_id
 
-    def cancel_all(self) -> None:
-        for proc in self.active_procs:
-            if proc.is_alive():
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+    def cancel_all(
+        self,
+        *,
+        graceful_timeout: float = 0.0,
+        terminate_timeout: float = 2.0,
+    ) -> None:
+        for proc in list(self.active_procs):
+            stop_process(
+                proc,
+                graceful_timeout=graceful_timeout,
+                terminate_timeout=terminate_timeout,
+            )
         self.active_procs.clear()
         self.active_tasks.clear()
         self.active_job_ids.clear()
         self.job_store.cancel_active()
         self._record_event("podcast_jobs_canceled")
+
+    def shutdown(
+        self,
+        *,
+        graceful_timeout: float = 0.0,
+        terminate_timeout: float = 2.0,
+    ) -> None:
+        self._shutdown_event.set()
+        self.worker_shutdown_event.set()
+        self.pause_event.clear()
+        self.cancel_all(
+            graceful_timeout=graceful_timeout,
+            terminate_timeout=terminate_timeout,
+        )
+        if self._manager_thread is not threading.current_thread():
+            self._manager_thread.join(terminate_timeout)
 
     def cleanup_pending_files(self) -> None:
         if not os.path.exists(self.podcasts_dir):
@@ -457,6 +573,7 @@ class PodcastService:
         return {
             "podcast_generation_paused": self.pause_event.is_set(),
             "podcast_generation_pause_reason": self.last_pause_reason,
+            "battery_podcast_policy": self.last_battery_policy,
             "on_battery_power": is_on_battery_power(),
             "active_podcast_processes": sum(1 for p in self.active_procs if p.is_alive()),
             "podcast_jobs": self.job_store.list()[:20],
