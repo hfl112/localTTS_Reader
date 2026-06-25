@@ -29,11 +29,28 @@ const callBackend = async (endpoint: string, method: string = "GET", data: any =
 // ==========================================
 // 2. 最近收藏 (Saved Items)
 // ==========================================
+let lastSavedItemsData = "";
+const fetchSavedItemsQuietly = async () => {
+  try {
+    const response = await callBackend("/saved_items");
+    if (response && !response.error && Array.isArray(response)) {
+      const currentData = JSON.stringify(response);
+      if (currentData !== lastSavedItemsData) {
+        lastSavedItemsData = currentData;
+        renderSavedList(response);
+      }
+    }
+  } catch (err) {
+    // ignore quietly
+  }
+};
+
 const fetchSavedItems = async () => {
   savedList.innerHTML = '<div class="loading-state">加载中...</div>';
   try {
     const response = await callBackend("/saved_items");
     if (response && !response.error && Array.isArray(response)) {
+      lastSavedItemsData = JSON.stringify(response);
       renderSavedList(response);
     } else {
       savedList.innerHTML = '<div class="empty-state">暂无收藏内容</div>';
@@ -80,26 +97,32 @@ const renderSavedList = (items: any[]) => {
     const itemEl = document.createElement('div');
     itemEl.className = 'cache-item';
     itemEl.setAttribute('data-md5', item.md5);
-    
+
     // 根据来源 source 生成指示标签
-    let sourceTag = "";
+    let sourceLabel = "[剪贴]";
+    let sourceClass = "source-clipboard";
     if (item.source === "video") {
-      sourceTag = `<span style="color: #3b82f6; font-weight: bold; margin-right: 4px;">[视频]</span>`;
+      sourceLabel = "[视频]";
+      sourceClass = "source-video";
     } else if (item.source === "web") {
-      sourceTag = `<span style="color: #8b5cf6; font-weight: bold; margin-right: 4px;">[网页]</span>`;
+      sourceLabel = "[网页]";
+      sourceClass = "source-web";
     } else if (item.source === "clipboard") {
-      sourceTag = `<span style="color: #10b981; font-weight: bold; margin-right: 4px;">[剪贴]</span>`;
+      sourceLabel = "[剪贴]";
+      sourceClass = "source-clipboard";
     } else {
       const isUrl = item.text.trim().startsWith("http://") || item.text.trim().startsWith("https://");
       if (isUrl) {
-        sourceTag = `<span style="color: #8b5cf6; font-weight: bold; margin-right: 4px;">[网页]</span>`;
+        sourceLabel = "[网页]";
+        sourceClass = "source-web";
       } else {
-        sourceTag = `<span style="color: #10b981; font-weight: bold; margin-right: 4px;">[剪贴]</span>`;
+        sourceLabel = "[剪贴]";
+        sourceClass = "source-clipboard";
       }
     }
 
     // Snip text to fit
-    let displayTitle = item.title || item.text.trim();
+    let displayTitle = (item.title || item.text.trim()).replace(/\s+/g, ' ').trim();
     if (displayTitle.length > 28) displayTitle = displayTitle.slice(0, 26) + '...';
 
     let actionsHtml = '';
@@ -121,7 +144,7 @@ const renderSavedList = (items: any[]) => {
 
     itemEl.innerHTML = `
       <div class="cache-info" style="${item.is_pending ? 'opacity: 0.7;' : ''}">
-        <div class="cache-text" title="${item.text}">${sourceTag}${displayTitle}</div>
+        <div class="cache-text"></div>
         <div class="cache-meta">
           <span>${item.is_pending ? '等待完成' : new Date(item.timestamp * 1000).toLocaleString()}</span>
           ${item.is_pending ? '' : `<span>·</span><span>${estimateReadingTime(item.text)}</span>`}
@@ -131,6 +154,16 @@ const renderSavedList = (items: any[]) => {
         ${actionsHtml}
       </div>
     `;
+
+    const textEl = itemEl.querySelector('.cache-text') as HTMLDivElement;
+    textEl.title = item.text || '';
+    const sourceEl = document.createElement('span');
+    sourceEl.className = `cache-source-tag ${sourceClass}`;
+    sourceEl.textContent = sourceLabel;
+    const titleEl = document.createElement('span');
+    titleEl.className = 'cache-title';
+    titleEl.textContent = displayTitle;
+    textEl.append(sourceEl, titleEl);
 
     if (!item.is_pending) {
       // Bind click on text area to play
@@ -283,11 +316,28 @@ if (btnClearSaved) {
 // ==========================================
 // 3. 我的播客 (Generated Podcasts)
 // ==========================================
+let lastPodcastsData = "";
+const fetchPodcastsQuietly = async () => {
+  try {
+    const response = await callBackend("/podcasts/list");
+    if (response && !response.error && Array.isArray(response)) {
+      const currentData = JSON.stringify(response);
+      if (currentData !== lastPodcastsData) {
+        lastPodcastsData = currentData;
+        renderPodcastList(response);
+      }
+    }
+  } catch (err) {
+    // ignore quietly
+  }
+};
+
 const fetchPodcasts = async () => {
   podcastList.innerHTML = '<div class="loading-state">加载中...</div>';
   try {
     const response = await callBackend("/podcasts/list");
     if (response && !response.error && Array.isArray(response)) {
+      lastPodcastsData = JSON.stringify(response);
       renderPodcastList(response);
     } else {
       podcastList.innerHTML = '<div class="empty-state">暂无生成播客</div>';
@@ -469,11 +519,28 @@ if (btnClearPodcasts) {
 // ==========================================
 // 4. 本地音频缓存 (SQLite)
 // ==========================================
+let lastCachesData = "";
+const fetchCachesQuietly = async () => {
+  try {
+    const response = await callBackend("/cache/items");
+    if (response && !response.error && Array.isArray(response)) {
+      const currentData = JSON.stringify(response);
+      if (currentData !== lastCachesData) {
+        lastCachesData = currentData;
+        renderCacheList(response);
+      }
+    }
+  } catch (err) {
+    // ignore quietly
+  }
+};
+
 const fetchCaches = async () => {
   cacheList.innerHTML = '<div class="loading-state">加载中...</div>';
   try {
     const response = await callBackend("/cache/items");
     if (response && !response.error && Array.isArray(response)) {
+      lastCachesData = JSON.stringify(response);
       renderCacheList(response);
     } else {
       cacheList.innerHTML = '<div class="empty-state">暂无缓存元数据</div>';
@@ -631,7 +698,7 @@ btnClearCache.onclick = async () => {
 const autoFillCurrentUrl = async () => {
   let tabs;
   try {
-    tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    tabs = await (globalThis as any).chrome.tabs.query({ active: true, currentWindow: true });
   } catch (err) {
     try {
       tabs = await browser.tabs.query({ active: true, currentWindow: true });
@@ -653,7 +720,7 @@ const getActiveTabHtml = async (targetUrl: string): Promise<string | null> => {
   try {
     let tabs;
     try {
-      tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      tabs = await (globalThis as any).chrome.tabs.query({ active: true, currentWindow: true });
     } catch {
       tabs = await browser.tabs.query({ active: true, currentWindow: true });
     }
@@ -982,7 +1049,16 @@ btnStop.onclick = async () => {
 
 // 定时 1Hz 轮询更新状态
 const startStatusPolling = () => {
+  let pollTick = 0;
   setInterval(async () => {
+    pollTick++;
+    if (pollTick % 2 === 0) {
+      // Quietly check for list updates every 2 seconds
+      fetchSavedItemsQuietly();
+      fetchPodcastsQuietly();
+      fetchCachesQuietly();
+    }
+
     try {
       // 如果最近 1.5 秒内有用户操作，则跳过这轮的状态更新，防止过渡期的状态闪烁覆盖
       if (Date.now() - lastActionTime < 1500) {
@@ -1028,6 +1104,35 @@ const startStatusPolling = () => {
   }, 1000);
 };
 
+// ==========================================
+// 后端配对码 (Pairing token)
+// ==========================================
+const txtPairingToken = document.getElementById('txtPairingToken') as HTMLInputElement | null;
+const btnSavePairing = document.getElementById('btnSavePairing') as HTMLButtonElement | null;
+const pairingHint = document.getElementById('pairingHint');
+
+const loadPairingToken = async () => {
+  try {
+    const res = await browser.runtime.sendMessage({ type: "GET_PAIRING_TOKEN" });
+    if (txtPairingToken && res?.token) txtPairingToken.value = res.token;
+  } catch {}
+};
+
+if (btnSavePairing && txtPairingToken) {
+  btnSavePairing.onclick = async () => {
+    const token = txtPairingToken.value.trim();
+    try {
+      const res = await browser.runtime.sendMessage({ type: "SET_PAIRING_TOKEN", token });
+      if (pairingHint) {
+        pairingHint.textContent = res?.ok ? "✅ 已保存" : "❌ 保存失败";
+        setTimeout(() => { if (pairingHint) pairingHint.textContent = ""; }, 2000);
+      }
+    } catch {
+      if (pairingHint) pairingHint.textContent = "❌ 保存失败";
+    }
+  };
+}
+
 // Initial Load All Lists
 const loadAll = () => {
   autoFillCurrentUrl();
@@ -1035,6 +1140,7 @@ const loadAll = () => {
   fetchPodcasts();
   fetchCaches();
   startStatusPolling();
+  loadPairingToken();
 };
 
 loadAll();

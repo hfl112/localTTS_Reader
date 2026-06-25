@@ -90,6 +90,23 @@
         </div>
       </details>
     </div>
+
+    <div class="divider"></div>
+
+    <div class="cache-section">
+      <details>
+        <summary class="section-header" style="outline: none; cursor: pointer; display: flex; align-items: center; list-style: none;">
+          <span style="display: flex; align-items: center; gap: 4px;">
+            <span class="fold-arrow">▶</span> 后端配对码 (Pairing Token)
+          </span>
+        </summary>
+        <div style="margin-top: 6px; display: flex; gap: 6px;">
+          <input type="text" id="txtPairingToken" class="url-input" placeholder="粘贴 App 里的配对码..." style="flex: 1;" />
+          <button id="btnSavePairing" title="保存配对码">保存</button>
+        </div>
+        <div id="pairingHint" style="margin-top: 4px; font-size: 11px; color: #888;"></div>
+      </details>
+    </div>
   </div>
   <script type="module" src="./main.ts"></script>
 </body>

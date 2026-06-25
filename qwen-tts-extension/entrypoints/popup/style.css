@@ -5,14 +5,57 @@ html, body {
   font-family: system-ui, -apple-system, sans-serif;
 }
 
+:root {
+  color-scheme: light dark;
+  --popup-surface: #f4f4f5;
+  --popup-panel: rgba(255, 255, 255, 0.65);
+  --popup-panel-hover: #ffffff;
+  --popup-control: #ffffff;
+  --popup-text: #18181b;
+  --popup-text-muted: #71717a;
+  --popup-text-subtle: #a1a1aa;
+  --popup-icon: #52525b;
+  --popup-border: rgba(0, 0, 0, 0.12);
+  --popup-border-soft: rgba(0, 0, 0, 0.06);
+  --popup-border-faint: rgba(0, 0, 0, 0.04);
+  --popup-hover: rgba(0, 0, 0, 0.05);
+  --popup-scrollbar: rgba(0, 0, 0, 0.12);
+  --popup-switch-track: rgba(0, 0, 0, 0.08);
+  --popup-shadow: rgba(0, 0, 0, 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --popup-surface: #27272a;
+    --popup-panel: rgba(39, 39, 42, 0.72);
+    --popup-panel-hover: #3f3f46;
+    --popup-control: #18181b;
+    --popup-text: #f4f4f5;
+    --popup-text-muted: #d4d4d8;
+    --popup-text-subtle: #a1a1aa;
+    --popup-icon: #d4d4d8;
+    --popup-border: rgba(255, 255, 255, 0.16);
+    --popup-border-soft: rgba(255, 255, 255, 0.12);
+    --popup-border-faint: rgba(255, 255, 255, 0.08);
+    --popup-hover: rgba(255, 255, 255, 0.08);
+    --popup-scrollbar: rgba(255, 255, 255, 0.2);
+    --popup-switch-track: rgba(255, 255, 255, 0.16);
+    --popup-shadow: rgba(0, 0, 0, 0.35);
+  }
+
+  .lang-select {
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' fill='none' stroke='rgba(244,244,245,0.72)' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+  }
+}
+
 .popup-card {
   width: 320px;
   margin: 8px;
   padding: 12px;
-  background: #f4f4f5; /* 优雅的浅灰色背景 */
+  background: var(--popup-surface);
   border-radius: 16px;
-  border: 1px solid rgba(0, 0, 0, 0.06);
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08); /* 柔和的高级阴影 */
+  border: 1px solid var(--popup-border-soft);
+  box-shadow: 0 10px 30px var(--popup-shadow);
   box-sizing: border-box;
 }
 
@@ -28,7 +71,7 @@ html, body {
   padding: 4px 2px;
   background: transparent;
   border: none;
-  color: #18181b; /* 深黑色文字 */
+  color: var(--popup-text);
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
@@ -45,7 +88,7 @@ html, body {
   width: 16px;
   height: 16px;
   opacity: 0.8;
-  color: #27272a;
+  color: var(--popup-icon);
 }
 
 /* Toggle Switch Styles */
@@ -68,7 +111,7 @@ html, body {
   left: 0;
   right: 0;
   bottom: 0;
-  background-color: rgba(0, 0, 0, 0.08);
+  background-color: var(--popup-switch-track);
   transition: .3s;
   border-radius: 20px;
 }
@@ -96,7 +139,7 @@ input:checked + .slider:before {
 
 .divider {
   height: 1px;
-  background: rgba(0, 0, 0, 0.06);
+  background: var(--popup-border-soft);
   margin: 10px 0;
 }
 
@@ -112,7 +155,7 @@ input:checked + .slider:before {
   align-items: center;
   justify-content: space-between;
   font-size: 12px;
-  color: #71717a; /* 辅助性文字颜色 */
+  color: var(--popup-text-muted);
   font-weight: 600;
   padding: 0 2px;
 }
@@ -126,7 +169,7 @@ input:checked + .slider:before {
 .header-actions button {
   background: transparent;
   border: none;
-  color: #71717a;
+  color: var(--popup-text-muted);
   font-size: 11px;
   cursor: pointer;
   padding: 2px 5px;
@@ -138,8 +181,8 @@ input:checked + .slider:before {
 }
 
 .header-actions button:hover {
-  background: rgba(0, 0, 0, 0.05);
-  color: #18181b;
+  background: var(--popup-hover);
+  color: var(--popup-text);
 }
 
 #btnRefresh svg,
@@ -164,7 +207,7 @@ input:checked + .slider:before {
   width: 4px;
 }
 .cache-list::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.12);
+  background: var(--popup-scrollbar);
   border-radius: 2px;
 }
 
@@ -172,7 +215,7 @@ input:checked + .slider:before {
   text-align: center;
   padding: 16px 0;
   font-size: 12px;
-  color: #a1a1aa;
+  color: var(--popup-text-subtle);
 }
 
 .cache-item {
@@ -180,16 +223,16 @@ input:checked + .slider:before {
   align-items: center;
   justify-content: space-between;
   padding: 6px 8px;
-  background: rgba(255, 255, 255, 0.65); /* 浅色卡片背景 */
-  border: 1px solid rgba(0, 0, 0, 0.04);
+  background: var(--popup-panel);
+  border: 1px solid var(--popup-border-faint);
   border-radius: 8px;
   gap: 8px;
   transition: all 0.2s;
 }
 
 .cache-item:hover {
-  background: white;
-  border-color: rgba(0, 0, 0, 0.08);
+  background: var(--popup-panel-hover);
+  border-color: var(--popup-border-soft);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.02);
 }
 
@@ -202,17 +245,43 @@ input:checked + .slider:before {
 }
 
 .cache-text {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
   font-size: 12px;
-  color: #18181b; /* 深色正文 */
+  color: var(--popup-text);
   white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
   font-weight: 500;
+}
+
+.cache-source-tag {
+  flex: 0 0 auto;
+  font-weight: 700;
+}
+
+.cache-source-tag.source-video {
+  color: #3b82f6;
+}
+
+.cache-source-tag.source-web {
+  color: #8b5cf6;
+}
+
+.cache-source-tag.source-clipboard {
+  color: #10b981;
+}
+
+.cache-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .cache-meta {
   font-size: 10px;
-  color: #71717a;
+  color: var(--popup-text-muted);
   display: flex;
   align-items: center;
   gap: 6px;
@@ -230,7 +299,7 @@ input:checked + .slider:before {
   border-radius: 6px;
   border: none;
   background: transparent;
-  color: #71717a;
+  color: var(--popup-text-muted);
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -239,8 +308,8 @@ input:checked + .slider:before {
 }
 
 .cache-actions button:hover {
-  background: rgba(0, 0, 0, 0.05);
-  color: #18181b;
+  background: var(--popup-hover);
+  color: var(--popup-text);
 }
 
 .btn-export:hover {
@@ -279,10 +348,10 @@ input:checked + .slider:before {
   width: 100%;
   height: 32px;
   padding: 0 10px;
-  background: white; /* 纯白背景提高清晰度 */
-  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: var(--popup-control);
+  border: 1px solid var(--popup-border);
   border-radius: 8px;
-  color: #18181b;
+  color: var(--popup-text);
   font-size: 12px;
   font-weight: 500;
   box-sizing: border-box;
@@ -306,10 +375,10 @@ input:checked + .slider:before {
   flex: 0.65;
   height: 32px;
   padding: 0 24px 0 10px;
-  background: white;
-  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: var(--popup-control);
+  border: 1px solid var(--popup-border);
   border-radius: 8px;
-  color: #18181b;
+  color: var(--popup-text);
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
@@ -327,12 +396,12 @@ input:checked + .slider:before {
 }
 
 .lang-select:hover {
-  background-color: #f4f4f5;
+  background-color: var(--popup-panel-hover);
 }
 
 .lang-select option {
-  background: white;
-  color: #18181b;
+  background: var(--popup-control);
+  color: var(--popup-text);
 }
 
 .action-buttons-group {
@@ -347,9 +416,9 @@ input:checked + .slider:before {
   width: 30px;
   height: 30px;
   border-radius: 8px;
-  border: 1px solid rgba(0, 0, 0, 0.12);
-  background: white;
-  color: #52525b; /* 稍微深一点的冷灰色图标，极具质感 */
+  border: 1px solid var(--popup-border);
+  background: var(--popup-control);
+  color: var(--popup-icon);
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -421,7 +490,7 @@ summary {
   display: inline-block;
   transition: transform 0.2s;
   font-size: 8px;
-  color: #71717a;
+  color: var(--popup-text-muted);
 }
 
 details[open] .fold-arrow {
