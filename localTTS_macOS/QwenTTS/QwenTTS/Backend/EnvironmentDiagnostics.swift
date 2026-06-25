@@ -64,10 +64,17 @@ enum EnvironmentDiagnostics {
                               fixHint: "安装包可能已损坏（backend.py 缺失），请重新下载完整 DMG。"))
         }
 
-        // 4. ffmpeg
+        // 4. ffmpeg：custom/bundle 优先（packaged 后端只用它）；custom/dev 模式下若未配置，
+        //    回退到系统常见位置——与后端一致（dev 下 launcher 不强制 TTS_FFMPEG_PATH，
+        //    后端走 PATH 上的 ffmpeg）。builtin/packaged 不做系统回退，缺 bundled 即 FAIL。
         let ffmpeg = resolved(custom: cfg.ffmpegPath, bundleSubpath: "/Tools/ffmpeg")
-        if !ffmpeg.isEmpty, FileManager.default.isExecutableFile(atPath: ffmpeg) {
+        let fm = FileManager.default
+        if !ffmpeg.isEmpty, fm.isExecutableFile(atPath: ffmpeg) {
             items.append(Item(name: "ffmpeg", status: .ok, detail: ffmpeg, fixHint: nil))
+        } else if EnvironmentConfigManager.shared.mode == .custom,
+                  let sys = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+                    .first(where: { fm.isExecutableFile(atPath: $0) }) {
+            items.append(Item(name: "ffmpeg", status: .ok, detail: "系统 ffmpeg：\(sys)", fixHint: nil))
         } else {
             items.append(Item(name: "ffmpeg", status: .fail,
                               detail: ffmpeg.isEmpty ? "未配置" : "不存在或不可执行：\(ffmpeg)",
