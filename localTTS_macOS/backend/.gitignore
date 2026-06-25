@@ -1,0 +1,9 @@
+**/__pycache__/
+*.py[cod]
+URL-Reader/cache/
+URL-Reader/data/
+URL-Reader/temp_*.md
+data/
+cache/
+logs/
+models/

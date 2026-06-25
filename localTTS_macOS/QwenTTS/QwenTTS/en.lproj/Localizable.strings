@@ -1,0 +1,6 @@
+"wizard_title" = "Welcome to QwenTTS";
+"wizard_continue" = "Start Using Application";
+"wizard_download" = "Download Model";
+"wizard_status_checking" = "Checking environment...";
+"wizard_status_ready" = "Environment is ready";
+"wizard_status_error" = "Configuration error";

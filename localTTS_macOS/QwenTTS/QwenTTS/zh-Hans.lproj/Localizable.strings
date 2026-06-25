@@ -1,0 +1,6 @@
+"wizard_title" = "欢迎使用 QwenTTS";
+"wizard_continue" = "开始使用应用";
+"wizard_download" = "下载模型";
+"wizard_status_checking" = "正在检查环境...";
+"wizard_status_ready" = "环境已准备就绪";
+"wizard_status_error" = "配置异常";
