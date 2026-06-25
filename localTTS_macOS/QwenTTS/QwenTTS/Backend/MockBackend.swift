@@ -73,6 +73,9 @@ final class MockBackend {
         case ("POST", "/read"):
             state = .speaking
             return ok()
+        case ("POST", "/selftest/voice"):
+            state = .speaking
+            return ok()   // mock 视为试音成功（真实后端会等真出声）
         case ("POST", "/pause"):
             state = .paused
             return ok()

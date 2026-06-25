@@ -6,7 +6,7 @@ import mlx.core as mx
 import time
 
 class TTSEngine:
-    def __init__(self, model_path="models/Qwen3-TTS-1.7B-8bit", mlx_audio_path=None):
+    def __init__(self, model_path="models/Qwen3-TTS-0.6B", mlx_audio_path=None):
         self.sample_rate = 24000 # 改回 24k 原生采样率
         
         # 1. 动态确定 mlx_audio 的绝对路径

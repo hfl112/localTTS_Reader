@@ -1,4 +1,5 @@
 import Foundation
+import CoreAudio
 
 /// 首启自助 / 故障排查用的本地环境诊断。检查项与 `BackendProcessManager` 实际使用的
 /// 路径保持一致（dev 自定义配置优先，否则 app bundle 内的 Resources），这样"诊断通过"
@@ -24,7 +25,7 @@ enum EnvironmentDiagnostics {
         return ""
     }
 
-    /// 运行全部 6 项检查，按 Wizard 顺序返回。
+    /// 运行全部 7 项检查，按 Wizard 顺序返回。
     static func run() -> [Item] {
         let cfg = EnvironmentConfigManager.shared.customConfig
         var items: [Item] = []
@@ -115,6 +116,16 @@ enum EnvironmentDiagnostics {
                               fixHint: "参考音频用于 Serena/Ryan 音色锁定，缺失会影响音色；可重新下载完整 DMG。"))
         }
 
+        // 7. 音频输出设备（试音要能从扬声器/耳机出声）。无默认输出设备时给 warn，不硬阻塞——
+        //    设备可能临时不可用；真正无声也会被末页一键试音兜住。
+        if hasDefaultAudioOutput() {
+            items.append(Item(name: "音频输出", status: .ok, detail: "系统默认输出设备可用", fixHint: nil))
+        } else {
+            items.append(Item(name: "音频输出", status: .warn,
+                              detail: "未检测到默认音频输出设备",
+                              fixHint: "请在「系统设置 → 声音 → 输出」选择一个输出设备（扬声器/耳机），再点重新检查。"))
+        }
+
         return items
     }
 
@@ -131,6 +142,19 @@ enum EnvironmentDiagnostics {
         }
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
         return appSupport?.appendingPathComponent("QwenTTS/Models").path ?? ""
+    }
+
+    /// 是否存在可用的默认音频输出设备（CoreAudio，纯本地查询）。
+    private static func hasDefaultAudioOutput() -> Bool {
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID)
+        return status == noErr && deviceID != 0 && deviceID != kAudioObjectUnknown
     }
 
     private static func isAppleSilicon() -> Bool {

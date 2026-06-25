@@ -131,6 +131,20 @@ class BackendAPIClient {
         return status == 200
     }
 
+    /// 首启向导「一键试音」：朗读固定短句并**等待真实结果**。
+    /// 返回 nil 表示真的出声（成功）；返回非 nil 字符串为失败原因（可直接展示）。
+    /// 不同于 readText 只看 HTTP 200——后端会阻塞到产生音频帧或捕获到推理错误才回复，
+    /// 因此能区分"听到声音"与"模型缺失/加载失败导致无声"。
+    func selfTestVoice() async -> String? {
+        let (status, data) = await postJSON(path: "/selftest/voice", body: nil, requireToken: true)
+        guard status == 200, let data = data,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return "试音请求失败（后端无响应或返回异常，HTTP \(status)）"
+        }
+        if (json["ok"] as? Bool) == true { return nil }
+        return (json["error"] as? String) ?? "试音失败：未产生音频"
+    }
+
     func stopPlayback() async -> Bool {
         let (status, _) = await postJSON(path: "/stop", body: nil, requireToken: true)
         return status == 200

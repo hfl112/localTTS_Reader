@@ -15,6 +15,10 @@ class Storage:
         
         # 默认设置
         self.default_config = {
+            # First Sound 默认走轻量 0.6B（向导也只下载/推荐它）；1.7B-8bit 是高质量进阶项，
+            # 由用户在设置里显式选择。务必与 SetupWizard 下载的模型一致，否则首启试音会
+            # 因加载不存在的 1.7B 而无声。
+            "model": "Qwen3-TTS-0.6B",
             "voice": "Serena",
             "temperature": 0.2,
             "top_p": 0.5,

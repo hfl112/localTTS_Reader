@@ -55,8 +55,8 @@ class ApplicationCoordinator {
                         self.startBackend()
                     }
                     Task { @MainActor in
-                        let ok = await self.waitReadyAndTestRead()
-                        done(ok ? nil : "后端未在 40s 内就绪或试读请求失败")
+                        let err = await self.waitReadyAndTestRead()
+                        done(err)   // nil = 真的出声；否则为可展示的失败原因
                     }
                 },
                 onComplete: { [weak self] in
@@ -88,19 +88,21 @@ class ApplicationCoordinator {
         }
     }
 
-    /// Wizard 末页试读：等后端就绪（最多 timeout），再发一句短文本 /read。
-    /// 返回 true 表示后端已就绪且试读请求被接受（HTTP 200）。
-    private func waitReadyAndTestRead(timeout: TimeInterval = 40) async -> Bool {
+    /// Wizard 末页一键试音：等后端就绪（最多 timeout），再调用 /selftest/voice，
+    /// 该接口会**阻塞到真的产生音频或捕获到推理错误**才返回。
+    /// 返回 nil 表示真的出声（成功）；否则返回可直接展示给用户的失败原因。
+    private func waitReadyAndTestRead(timeout: TimeInterval = 40) async -> String? {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if processManager.state == .ready { break }
-            if processManager.state == .failed { return false }
+            if processManager.state == .failed { return "后端启动失败，请查看诊断或重试。" }
             try? await Task.sleep(for: .milliseconds(400))
         }
-        guard processManager.state == .ready else { return false }
-        return await processManager.apiClient?.readText(
-            text: "你好，欢迎使用 QwenTTS。", voice: nil, performanceProfile: nil
-        ) ?? false
+        guard processManager.state == .ready else {
+            return "后端未在 \(Int(timeout)) 秒内就绪。"
+        }
+        guard let client = processManager.apiClient else { return "无法连接后端。" }
+        return await client.selfTestVoice()
     }
 
     func stop() {

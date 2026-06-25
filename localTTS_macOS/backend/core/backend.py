@@ -145,6 +145,12 @@ class SharedState:
         self.vram_mb = mp.Value('d', 0.0)
         self.status_code = mp.Value('i', 0) # 0:IDLE, 1:BUSY, 2:COOLING
         self.current_task_id = mp.Value('i', 0)
+        # 真实出声证据：推理 worker 每推出一帧音频就 +1。播放/试音是否"真的出声"
+        # 不能只看 status（加载失败时 status 仍会短暂 BUSY），必须看是否产生过音频帧。
+        self.audio_frames = mp.Value('i', 0)
+        # 推理子进程最近一次异常文本（如模型加载失败）。主进程据此把失败如实暴露给
+        # /snapshot 与 /selftest/voice，避免"试音假阳性"。
+        self.error_buf = mp.Array('c', 1024)
 
     def set_status(self, status):
         m = {"IDLE": 0, "BUSY": 1, "COOLING": 2}
@@ -153,6 +159,25 @@ class SharedState:
     def get_status(self):
         m = {0: "IDLE", 1: "BUSY", 2: "COOLING"}
         return m.get(self.status_code.value, "IDLE")
+
+    def note_audio_frame(self):
+        with self.audio_frames.get_lock():
+            self.audio_frames.value += 1
+
+    def reset_run_signals(self):
+        """开始一次新的朗读/试音前，清零出声计数与上一次的错误。"""
+        with self.audio_frames.get_lock():
+            self.audio_frames.value = 0
+        self.set_error("")
+
+    def set_error(self, msg):
+        b = (msg or "")[:1023].encode("utf-8", "replace")
+        with self.error_buf.get_lock():
+            self.error_buf.raw = b + b"\x00" * (1024 - len(b))
+
+    def get_error(self):
+        with self.error_buf.get_lock():
+            return self.error_buf.value.decode("utf-8", "replace")
 
 # ==========================================
 # 2. 推理子进程
@@ -213,7 +238,7 @@ def inference_worker(shared_state):
 
             config = task['config']
             profile = get_performance_profile(config.get("performance_profile"))
-            target_model_name = config.get("model", "Qwen3-TTS-1.7B-8bit")
+            target_model_name = config.get("model", "Qwen3-TTS-0.6B")
             target_path = os.path.join(runtime_paths.models_path, target_model_name)
 
             if engine is None:
@@ -248,6 +273,7 @@ def inference_worker(shared_state):
                     for s in range(0, len(cached_audio), SR):
                         if shared_state.stop_event.is_set() or task_id != shared_state.current_task_id.value: break
                         shared_state.audio_q.put((task_id, chunk_index, cached_audio[s:s+SR]))
+                        shared_state.note_audio_frame()
                         time.sleep(0.005)
                     shared_state.audio_q.put("CHUNK_DONE")
                     continue
@@ -263,6 +289,7 @@ def inference_worker(shared_state):
                 if shared_state.stop_event.is_set() or task_id != shared_state.current_task_id.value: 
                     break
                 shared_state.audio_q.put((task_id, chunk_index, samples))
+                shared_state.note_audio_frame()
                 full_audio.append(samples)
                 time.sleep(throttle_sleep)
             
@@ -292,6 +319,9 @@ def inference_worker(shared_state):
         except Exception as e:
             print(f"[InferenceProcess] 异常: {e}")
             traceback.print_exc()
+            # 把失败如实记录到共享状态，供 /snapshot 与 /selftest/voice 读取，
+            # 避免上层（如向导一键试音）把"任务已受理"误判为"已出声"。
+            shared_state.set_error(str(e))
             time.sleep(1.0)
 
 # ==========================================
@@ -601,7 +631,11 @@ async def read_text(data: ReadRequest):
 
     runtime_state.clear_current_media(keep_md5=data.from_saved)
     runtime_state.reset_podcast_generation()
-    
+
+    # 新一次朗读开始：清零出声计数与上一次的推理错误，使 /snapshot 与试音判定只反映本次。
+    if S is not None:
+        S.reset_run_signals()
+
     playback_session_id, new_task_id = playback_service.start_new_session()
     event_log.record(
         "read_requested",
@@ -647,6 +681,34 @@ async def read_text(data: ReadRequest):
         state=state,
     )
     return {"status": "ok"}
+
+
+@app.post("/selftest/voice")
+async def selftest_voice():
+    """首启向导「一键试音」：朗读固定短句，并**等待真实结果**后返回。
+
+    成功条件是真的产生了音频帧（audio_frames>0），而不是 /read 受理成功——后者在
+    模型缺失/加载失败时同样返回 200，会造成"听不到声音却判成功"。失败时回传 inference
+    worker 的真实错误文本，便于向导按错误类型给出下一步。
+    """
+    import asyncio
+
+    if playback_service is None or S is None:
+        raise HTTPException(status_code=503, detail="后端尚未就绪")
+
+    # 走与 /read 完全一致的链路（含 reset_run_signals 清零计数/错误）。
+    await read_text(ReadRequest(text="你好，欢迎使用 QwenTTS。"))
+
+    # 轮询真实信号：出声即成功；出现推理错误即失败；超时按"未出声"失败。
+    deadline = time.time() + 40
+    while time.time() < deadline:
+        err = S.get_error()
+        if err:
+            return {"ok": False, "error": err}
+        if S.audio_frames.value > 0:
+            return {"ok": True, "frames": S.audio_frames.value}
+        await asyncio.sleep(0.3)
+    return {"ok": False, "error": "未在 40 秒内产生音频（模型加载过慢或失败、或音频输出不可用）"}
 
 @app.post("/stop")
 def stop_read():
@@ -1212,6 +1274,10 @@ def get_snapshot():
         "instance_id": INSTANCE_ID,
         "current_article_chunks": chunks_clean,
         "current_article_index": current_index,
+        # 真实出声/失败信号：audio_frames>0 表示本次确有音频产出；inference_error 非空表示
+        # 推理失败（如模型缺失）。供向导一键试音与 UI 如实判定，避免假阳性。
+        "audio_frames": (S.audio_frames.value if S else 0),
+        "inference_error": ((S.get_error() if S else "") or None),
     }
 
 
