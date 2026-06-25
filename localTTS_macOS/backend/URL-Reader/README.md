@@ -2,7 +2,7 @@
 
 本模块是 QwenTTS 生态中专门用于 **“输入网页 URL，自动抓取、净化正文并一键朗读”** 的核心控制与测试工具。它将重型的网页提取、WAF 绕过、正文去噪逻辑留在本地 Python 侧，直接利用正在运行的 macOS 状态栏应用进行语音播放。
 
-当前 URL-Reader 已拆成两层：`reader_service.py` 是可被 QwenTTS-App 后端直接调用的输入管线；`read_url_cli.py` 只是手工调试用的命令行壳。浏览器插件触发 `/read_url` 时不再每次拉起 CLI 子进程。
+当前 URL-Reader 已拆成两层：`reader_service.py` 是可被 QwenTTS native 后端直接调用的输入管线；`read_url_cli.py` 只是手工调试用的命令行壳。浏览器插件触发 `/read_url` 时不再每次拉起 CLI 子进程。
 
 ---
 
@@ -21,7 +21,7 @@
       ↓
  reader_service 缓存与 Gemini 处理模式 (可选：翻译 / 双人翻译 / 双人总结)
       ↓
- 投喂给 QwenTTS-App (8001端口) ──> service 层分发到朗读、稍后朗读或后台播客生成
+ 投喂给 QwenTTS 后端 (默认 8001 端口) ──> service 层分发到朗读、稍后朗读或后台播客生成
 ```
 
 1. **多重网络穿透 (urllib.request + 代理退避 + 浏览器联动)**：
@@ -32,12 +32,12 @@
    * 抓取下来的 HTML 喂给全局的 `defuddle parse --md` 净化器，完美滤除广告、弹窗及无关的脚本，只提取纯净的 Markdown 格式正文。
 3. **本地 TTS 服务分工**：
    * `POST /read`：直接朗读当前正文。
-   * `POST /save_for_later`：保存到 QwenTTS-App 的“稍后朗读”列表。
+   * `POST /save_for_later`：保存到 QwenTTS 后端的“稍后朗读”列表。
    * `POST /generate_single_podcast`：启动后台单篇 podcast 生成，成品写入项目根目录 `podcasts/`。
 4. **缓存与任务状态**：
    * `URL-Reader/cache/source_{hash}.md`：缓存抓取/清洗后的正文。
    * `URL-Reader/cache/{mode}_{hash}.md`：缓存 Gemini 翻译、双人翻译或双人总结结果。
-   * `QwenTTS-App/data/url_jobs.json`：记录 URL 任务 `queued/running/done/failed` 和 `fetching/parsing/gemini/dispatching` 阶段。
+   * 后端 data 目录下的 `url_jobs.json`：记录 URL 任务 `queued/running/done/failed` 和 `fetching/parsing/gemini/dispatching` 阶段。
 
 ---
 
@@ -58,15 +58,13 @@
    ```bash
    npm install -g defuddle
    ```
-2. **确认 QwenTTS 后端已在运行**：
-   确保您在终端或状态栏中已经启动了 [QwenTTS-App](file:///Users/funanhe/00_MyCode/TTS/QwenTTS-App) 服务（占用 8001 端口）。
-   ```bash
-   cd /Users/funanhe/00_MyCode/TTS/QwenTTS-App
-   python app.py
-   ```
+2. **确认 QwenTTS 后端已在运行**（默认 8001 端口；原生 app 的实际端口见 `~/Library/Application Support/QwenTTS/runtime.json`）：
+   - **原生（推荐）**：启动菜单栏 `QwenTTS.app` 即自动拉起后端；开发态可 `cd localTTS_macOS/backend && python core/backend.py`。
+   - **旧版 legacy（仅当你仍在用稳定旧版 App 时）**：`cd ../../../QwenTTS-App && python app.py`。
+   > 本 CLI 只是把净化后的文本 POST 到该端口上的后端，对原生/旧版均适用。
 
 ### B. 执行网页朗读 / 生成
-在项目根目录下，直接在终端中运行 [read_url_cli.py](file:///Users/funanhe/00_MyCode/TTS/URL-Reader/read_url_cli.py) 并传入网页 URL。默认模式是 `--podcast-discuss`，会先通过 Gemini 生成双人总结稿，再投喂给 QwenTTS-App。
+在项目根目录下，直接在终端中运行 [read_url_cli.py](file:///Users/funanhe/00_MyCode/TTS/URL-Reader/read_url_cli.py) 并传入网页 URL。默认模式是 `--podcast-discuss`，会先通过 Gemini 生成双人总结稿，再投喂给 QwenTTS 后端。
 
 ```bash
 cd /Users/funanhe/00_MyCode/TTS/URL-Reader
@@ -103,7 +101,7 @@ python read_url_cli.py 'https://aeon.co/essays/why-did-measuring-earths-true-sha
 1. **保存临时源码**：脚本将抓取净化的原始网页正文写入 `temp_source.md`。
 2. **AI 智能处理**：除 `--original` 外，脚本经 `reader_service.process_with_llm` 分发到引擎层（`translation_engine` 机器翻译 / `llm_engine.call_llm` 多供应商 LLM）执行中文翻译、双人翻译或双人总结。
 3. **保存处理结果**：将处理后的正文写入 `temp_translated.md`。
-4. **投喂本地服务**：CLI 模式下根据参数调用 `QwenTTS-App` 的 `/read`、`/save_for_later` 或 `/generate_single_podcast`；后端 `/read_url` 模式下则直接在进程内分发到对应 endpoint。
+4. **投喂本地服务**：CLI 模式下根据参数调用 QwenTTS 后端的 `/read`、`/save_for_later` 或 `/generate_single_podcast`；后端 `/read_url` 模式下则直接在进程内分发到对应 endpoint。
 
 ## 4. 模式参数速查
 
@@ -113,7 +111,7 @@ python read_url_cli.py 'https://aeon.co/essays/why-did-measuring-earths-true-sha
 | `--translate` / `-t` | 翻译成中文 |
 | `--podcast-trans` / `-pt` | 生成双人翻译稿 |
 | `--podcast-discuss` / `-pd` | 生成双人总结稿；当前默认模式 |
-| `--save` / `-s` | 保存到 QwenTTS-App 稍后朗读 |
+| `--save` / `-s` | 保存到 QwenTTS 后端稍后朗读 |
 | `--podcast` / `-p` | 启动后台单篇 podcast 生成 |
 | `--html-file PATH` | 从本地 HTML 文件提取正文，供 extension 上传页面源码时使用 |
 

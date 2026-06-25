@@ -10,7 +10,7 @@ PORT = int(os.environ.get("TTS_BACKEND_PORT", 8001))
 
 def send_to_qwentts(text: str, voice: str | None = None, source: str = "web") -> None:
     url = f"http://127.0.0.1:{PORT}/read"
-    print("[CLI] 正在将净化后的文本投喂给 QwenTTS-App 进行播放...")
+    print("[CLI] 正在将净化后的文本投喂给 QwenTTS 后端 进行播放...")
 
     payload: dict[str, Any] = {"text": text, "source": source}
     if voice:
@@ -19,11 +19,11 @@ def send_to_qwentts(text: str, voice: str | None = None, source: str = "web") ->
     try:
         response = requests.post(url, json=payload, timeout=10)
         if response.status_code == 200:
-            print("[Success] 投喂成功！QwenTTS-App 已经开始朗读。")
+            print("[Success] 投喂成功！QwenTTS 后端已经开始朗读。")
         else:
             print(f"[Error] 接口返回错误: {response.status_code} - {response.text}")
     except Exception as e:
-        print(f"[Error] 无法连接到 QwenTTS-App 服务: {e}")
+        print(f"[Error] 无法连接到 QwenTTS 后端服务: {e}")
 
 
 def save_to_qwentts(
@@ -36,7 +36,7 @@ def save_to_qwentts(
 ) -> None:
     if do_save:
         url = f"http://127.0.0.1:{PORT}/save_for_later"
-        print("[CLI] 正在将净化后的文本保存到 QwenTTS-App 稍后朗读列表中...")
+        print("[CLI] 正在将净化后的文本保存到 QwenTTS 后端 稍后朗读列表中...")
         payload: dict[str, Any] = {"text": text, "source": source}
         if voice:
             payload["voice"] = voice
@@ -49,7 +49,7 @@ def save_to_qwentts(
             else:
                 print(f"[Error] 接口返回错误: {response.status_code} - {response.text}")
         except Exception as e:
-            print(f"[Error] 无法连接到 QwenTTS-App 服务: {e}")
+            print(f"[Error] 无法连接到 QwenTTS 后端服务: {e}")
 
     if do_podcast:
         podcast_url = f"http://127.0.0.1:{PORT}/generate_single_podcast"

@@ -158,7 +158,9 @@ cd backend && python -m pytest core/tests/ -v    # 后端测试全过（当前 3
 
 ---
 
-## Step 5：新增边界检查脚本 `scripts/check_boundaries.py`
+## Step 5：新增边界检查脚本 `scripts/check_boundaries.py` ✅ 已完成
+
+> 新增依赖级静态检查（非命名级，避免误报注释/print/migration）：发布脚本无父级 legacy 复制、Swift 无硬编码 `QwenTTS-App`、后端运行时无 `import`/`sys.path`/`PYTHONPATH` 注入 legacy。已验证当前 exit 0；注入 `shutil.copytree("../QwenTTS-App/core"...)` 后 exit 1 精确报位，还原后再 exit 0。已提交。
 
 - **目标**：把 Step 4 的边界从"口头约定"变成可执行的静态检查。
 - **步骤**：新增脚本，静态扫描并在违规时非零退出：
