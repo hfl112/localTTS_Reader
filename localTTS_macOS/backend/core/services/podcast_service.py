@@ -69,8 +69,54 @@ def wait_for_podcast_slot(pause_event, shutdown_event, poll_sec: float) -> None:
             raise RuntimeError("podcast generation canceled")
 
 
+def _submit_chunk_and_wait(
+    podcast_q,
+    job_id: str,
+    idx: int,
+    chunk_file: str,
+    text: str,
+    config: dict[str, Any],
+    shutdown_event,
+    poll_sec: float,
+) -> None:
+    """Submit one chunk to the shared engine's podcast lane and block until the
+    engine writes chunk_file (success) or chunk_file.err (failure). File-based
+    signaling means concurrent jobs never steal each other's completions."""
+    err_file = chunk_file + ".err"
+    if os.path.exists(err_file):
+        try:
+            os.remove(err_file)
+        except OSError:
+            pass
+    podcast_q.put(
+        {
+            "job_id": job_id,
+            "chunk_index": idx,
+            "chunk_file": chunk_file,
+            "text": text,
+            "config": config,
+        }
+    )
+    poll = max(0.1, poll_sec)
+    while True:
+        if shutdown_event.is_set():
+            raise RuntimeError("podcast generation canceled")
+        if os.path.exists(chunk_file):
+            return
+        if os.path.exists(err_file):
+            msg = ""
+            try:
+                with open(err_file, encoding="utf-8") as fh:
+                    msg = fh.read()
+            except Exception:
+                pass
+            raise RuntimeError(f"engine failed podcast chunk {idx}: {msg}")
+        shutdown_event.wait(poll)
+
+
 def generate_podcast_chunks(
-    engine: Any,
+    podcast_q: Any,
+    job_id: str,
     text: str,
     config: dict[str, Any],
     chunk_dir: str,
@@ -107,16 +153,20 @@ def generate_podcast_chunks(
             chunk_config = config
             actual_text = chunk
 
-        parts = []
-        for samples in engine.generate_stream(actual_text, chunk_config):
-            if shutdown_event.is_set():
-                raise RuntimeError("podcast generation canceled")
-            parts.append(samples)
-            if shutdown_event.wait(profile["chunk_sleep"]):
-                raise RuntimeError("podcast generation canceled")
+        # Synthesize via the single shared engine (one model, GPU serialized,
+        # reads preempt at chunk boundaries). The engine writes chunk_file.
+        _submit_chunk_and_wait(
+            podcast_q,
+            job_id,
+            idx,
+            chunk_file,
+            actual_text,
+            chunk_config,
+            shutdown_event,
+            profile["podcast_pause_poll_sec"],
+        )
 
-        if parts:
-            np.save(chunk_file, np.concatenate(parts).astype(np.float32))
+        if os.path.exists(chunk_file):
             with open(progress_path, "w", encoding="utf-8") as f:
                 json.dump(
                     {"completed_chunks": idx + 1, "total_chunks": len(chunks)},
@@ -162,7 +212,7 @@ def run_single_podcast_generation_thread(
     source: str,
     pause_event,
     shutdown_event,
-    gpu_lock,
+    podcast_q,
     podcasts_dir: str,
     podcast_chunk_dir: str,
     jobs_file: str,
@@ -193,37 +243,33 @@ def run_single_podcast_generation_thread(
     with open(pending_file, "w") as f:
         f.write(text[:20])
     try:
-        with gpu_lock:
-            from core.tts_engine import TTSEngine
-
-            config = prepare_podcast_config(config, text)
-            engine = TTSEngine(
-                model_path=os.path.join(runtime_paths.models_path, config.get('model', 'Qwen3-TTS-1.7B-8bit')),
-                mlx_audio_path=runtime_paths.mlx_audio_path,
-            )
-            engine.ensure_model_loaded()
-            chunk_dir = os.path.join(podcast_chunk_dir, f"single_{md5[:12]}")
-            chunk_files = generate_podcast_chunks(
-                engine,
-                text,
-                config,
-                chunk_dir,
-                pause_event,
-                shutdown_event,
-            )
-            out_name = f"podcast_单篇_{source}_{safe_title}_{md5[:8]}_{int(time.time())}.wav"
-            output_path = os.path.join(podcasts_dir, out_name)
-            if not write_podcast_wav_from_chunks(chunk_files, output_path):
-                raise RuntimeError("no generated podcast chunks")
-            # 同名 .txt 文稿 sidecar，供内容中心双击查看播客脚本
-            try:
-                with open(output_path[:-4] + ".txt", "w", encoding="utf-8") as tf:
-                    tf.write(text)
-            except Exception:
-                pass
-            job_store.update(job_id, status="done", output_path=output_path, error=None)
-            if event_log:
-                event_log.record("podcast_job_done", job_id=job_id, md5=md5, output_path=output_path)
+        # Synthesis is delegated to the single shared engine process via
+        # podcast_q; this subprocess only orchestrates (no model load, no
+        # gpu_lock — the engine serializes the GPU for read + podcast).
+        config = prepare_podcast_config(config, text)
+        chunk_dir = os.path.join(podcast_chunk_dir, f"single_{md5[:12]}")
+        chunk_files = generate_podcast_chunks(
+            podcast_q,
+            job_id,
+            text,
+            config,
+            chunk_dir,
+            pause_event,
+            shutdown_event,
+        )
+        out_name = f"podcast_单篇_{source}_{safe_title}_{md5[:8]}_{int(time.time())}.wav"
+        output_path = os.path.join(podcasts_dir, out_name)
+        if not write_podcast_wav_from_chunks(chunk_files, output_path):
+            raise RuntimeError("no generated podcast chunks")
+        # 同名 .txt 文稿 sidecar，供内容中心双击查看播客脚本
+        try:
+            with open(output_path[:-4] + ".txt", "w", encoding="utf-8") as tf:
+                tf.write(text)
+        except Exception:
+            pass
+        job_store.update(job_id, status="done", output_path=output_path, error=None)
+        if event_log:
+            event_log.record("podcast_job_done", job_id=job_id, md5=md5, output_path=output_path)
     except Exception as e:
         job_store.update(job_id, status="failed", error=str(e))
         if event_log:
@@ -241,7 +287,7 @@ def run_podcast_generation_thread(
     config: dict[str, Any],
     pause_event,
     shutdown_event,
-    gpu_lock,
+    podcast_q,
     podcast_chunk_dir: str,
     jobs_file: str,
     job_id: str,
@@ -259,36 +305,31 @@ def run_podcast_generation_thread(
     with open(pending_file, "w") as f:
         f.write("pending")
     try:
-        with gpu_lock:
-            from core.tts_engine import TTSEngine
-
-            config = prepare_podcast_config(config, text, force_small_model=True)
-            engine = TTSEngine(
-                model_path=os.path.join(runtime_paths.models_path, config.get('model', 'Qwen3-TTS-1.7B-8bit')),
-                mlx_audio_path=runtime_paths.mlx_audio_path,
-            )
-            engine.ensure_model_loaded()
-            batch_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
-            chunk_dir = os.path.join(podcast_chunk_dir, f"batch_{batch_hash[:12]}")
-            chunk_files = generate_podcast_chunks(
-                engine,
-                text,
-                config,
-                chunk_dir,
-                pause_event,
-                shutdown_event,
-            )
-            if not write_podcast_wav_from_chunks(chunk_files, filename):
-                raise RuntimeError("no generated podcast chunks")
-            # 同名 .txt 文稿 sidecar，供内容中心双击查看播客脚本
-            try:
-                with open(filename[:-4] + ".txt", "w", encoding="utf-8") as tf:
-                    tf.write(text)
-            except Exception:
-                pass
-            job_store.update(job_id, status="done", output_path=filename, error=None)
-            if event_log:
-                event_log.record("podcast_job_done", job_id=job_id, output_path=filename)
+        # Synthesis delegated to the shared engine via podcast_q (no model load,
+        # no gpu_lock — the engine serializes the GPU for read + podcast).
+        config = prepare_podcast_config(config, text, force_small_model=True)
+        batch_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+        chunk_dir = os.path.join(podcast_chunk_dir, f"batch_{batch_hash[:12]}")
+        chunk_files = generate_podcast_chunks(
+            podcast_q,
+            job_id,
+            text,
+            config,
+            chunk_dir,
+            pause_event,
+            shutdown_event,
+        )
+        if not write_podcast_wav_from_chunks(chunk_files, filename):
+            raise RuntimeError("no generated podcast chunks")
+        # 同名 .txt 文稿 sidecar，供内容中心双击查看播客脚本
+        try:
+            with open(filename[:-4] + ".txt", "w", encoding="utf-8") as tf:
+                tf.write(text)
+        except Exception:
+            pass
+        job_store.update(job_id, status="done", output_path=filename, error=None)
+        if event_log:
+            event_log.record("podcast_job_done", job_id=job_id, output_path=filename)
     except Exception as e:
         job_store.update(job_id, status="failed", error=str(e))
         if event_log:
@@ -312,6 +353,7 @@ class PodcastService:
         is_frontend_active: Callable[[], bool] | None = None,
         is_device_switching: Callable[[], bool] | None = None,
         get_battery_policy: Callable[[], str] | None = None,
+        podcast_q: Any | None = None,
     ) -> None:
         self.podcasts_dir = podcasts_dir
         self.podcast_chunk_dir = podcast_chunk_dir
@@ -328,7 +370,9 @@ class PodcastService:
         self.event_log = event_log
         self.pause_event = mp.Event()
         self.worker_shutdown_event = mp.Event()
-        self.gpu_lock = mp.Lock()
+        # Synthesis goes through the shared engine's podcast lane; this service
+        # no longer loads its own model or serializes the GPU with a lock.
+        self.podcast_q = podcast_q
         self.active_procs: list[mp.Process] = []
         self.active_tasks: dict[str, mp.Process] = {}
         self.active_job_ids: dict[str, str] = {}
@@ -485,7 +529,7 @@ class PodcastService:
                 source,
                 self.pause_event,
                 self.worker_shutdown_event,
-                self.gpu_lock,
+                self.podcast_q,
                 self.podcasts_dir,
                 self.podcast_chunk_dir,
                 self.job_store.path,
@@ -536,7 +580,7 @@ class PodcastService:
                 config,
                 self.pause_event,
                 self.worker_shutdown_event,
-                self.gpu_lock,
+                self.podcast_q,
                 self.podcast_chunk_dir,
                 self.job_store.path,
                 job_id,

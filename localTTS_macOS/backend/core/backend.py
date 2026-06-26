@@ -5,14 +5,12 @@ import time
 from typing import List, Dict, Any
 import threading
 import multiprocessing as mp
-import mlx.core as mx
 import numpy as np
 import scipy.io.wavfile
 import hashlib
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 import uvicorn
-import traceback
 import signal
 import uuid
 
@@ -31,7 +29,6 @@ RUNTIME_EVENTS_FILE = os.path.join(runtime_paths.data_path, "runtime_events.json
 PODCAST_JOBS_FILE = os.path.join(runtime_paths.data_path, "podcast_jobs.json")
 URL_JOBS_FILE = os.path.join(runtime_paths.data_path, "url_jobs.json")
 
-from core.tts_engine import TTSEngine
 from core.api_models import (
     DeleteSavedRequest,
     FilenameRequest,
@@ -107,32 +104,9 @@ def get_text_hash(text):
 # as 10 in two places). The DB `created_at` order is authoritative for eviction.
 CACHE_MAX_ITEMS = 10
 
-def manage_cache_limit(max_items=None, storage_obj=None):
-    """Evict oldest cache entries beyond the limit, driven by the DB's
-    created_at order (authoritative) rather than filesystem mtime. Deletes each
-    evicted row's file via its stored file_path, then the row — keeping DB and
-    disk consistent (the old mtime+filename approach drifted from the DB)."""
-    if storage_obj is None:
-        return
-    if max_items is None:
-        max_items = CACHE_MAX_ITEMS
-    try:
-        rows = storage_obj.get_all_cache()  # newest-first (ORDER BY created_at DESC)
-        for row in rows[max_items:]:
-            file_path = row.get("file_path")
-            if file_path and os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except OSError as e:
-                    print(f"[Cache] Failed to remove {file_path}: {e}")
-            md5_val = row.get("md5")
-            if md5_val:
-                try:
-                    storage_obj.delete_cache_by_md5(md5_val)
-                except Exception as e:
-                    print(f"[Cache] Failed to delete row {md5_val}: {e}")
-    except Exception as e:
-        print(f"[Cache] manage_cache_limit error: {e}")
+# Cache eviction now lives in InferenceEngine.evict_cache (core/inference/engine.py),
+# which owns the read-through audio cache. The old module-level manage_cache_limit
+# was removed with the inference_worker rewrite (ADR-001).
 
 # ==========================================
 # 1. 跨进程共享状态
@@ -141,6 +115,13 @@ class SharedState:
     def __init__(self):
         self.text_q = mp.Queue()
         self.audio_q = mp.Queue()
+        # Low-priority lane for podcast chunk synthesis. The engine drains
+        # text_q (reads) first so reads preempt podcast work at chunk
+        # boundaries (ADR-001 #2). The engine signals each chunk's completion
+        # by writing chunk_<idx>.npy (or chunk_<idx>.npy.err on failure); the
+        # podcast subprocess polls those files — no shared result queue, so
+        # concurrent jobs can't steal each other's signals.
+        self.podcast_q = mp.Queue()
         self.stop_event = mp.Event()
         self.vram_mb = mp.Value('d', 0.0)
         self.status_code = mp.Value('i', 0) # 0:IDLE, 1:BUSY, 2:COOLING
@@ -183,146 +164,30 @@ class SharedState:
 # 2. 推理子进程
 # ==========================================
 def inference_worker(shared_state):
-    print(f"[InferenceProcess] 启动成功, PID: {os.getpid()}")
-    engine = None
-    # The application bundle is read-only after installation.  Worker metadata
-    # must live in Application Support just like the main process metadata.
-    worker_storage = Storage(data_dir=runtime_paths.data_path)
-    last_active_time = time.time()
-    metal_warning_reported = False
-    
+    """Inference process entry. Constructs the InferenceEngine (over MLXBackend)
+    from runtime paths and hands control to its run_loop, which owns the read
+    lane (text_q→audio_q, protocol unchanged) and the podcast lane (podcast_q→
+    chunk files). See ADR-001 in CONTEXT.md. Cache, normalization, model
+    switching, idle-unload and the 串音 cache-key fix all live in the engine."""
+    from core.inference.engine import InferenceEngine
+    from core.inference.model_backend import MLXBackend
+
     def handle_signal(sig, frame):
         sys.exit(0)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    while True:
-        try:
-            try:
-                shared_state.vram_mb.value = mx.get_active_memory() / 1024 / 1024
-                metal_warning_reported = False
-            except RuntimeError as error:
-                # Querying Metal while idle is diagnostic-only.  A missing or
-                # temporarily unavailable device must not create a hot error
-                # loop that consumes a CPU core and floods the logs.
-                shared_state.vram_mb.value = 0.0
-                if not metal_warning_reported:
-                    print(f"[InferenceProcess] Metal memory query unavailable: {error}")
-                    metal_warning_reported = True
-            
-            try:
-                task = shared_state.text_q.get(timeout=2)
-                last_active_time = time.time()
-            except mp.queues.Empty:
-                if engine and engine.model is not None and (time.time() - last_active_time > 600):
-                    print("[InferenceProcess] 空闲自动卸载模型...")
-                    engine.model = None
-                    mx.clear_cache()
-                    import gc
-                    gc.collect()
-                continue
-
-            if task is None: break
-            
-            # 识别可靠的字符串哨兵
-            if isinstance(task, str) and task == GLOBAL_SENTINEL:
-                shared_state.audio_q.put(GLOBAL_SENTINEL)
-                continue
-
-            if not isinstance(task, dict): continue
-
-            # 校验 Task ID
-            task_id = task.get('task_id', -1)
-            chunk_index = task.get('chunk_index', -1)
-            if task_id != shared_state.current_task_id.value:
-                continue
-
-            config = task['config']
-            profile = get_performance_profile(config.get("performance_profile"))
-            target_model_name = config.get("model", "Qwen3-TTS-0.6B")
-            target_path = os.path.join(runtime_paths.models_path, target_model_name)
-
-            if engine is None:
-                engine = TTSEngine(
-                    model_path=target_path,
-                    mlx_audio_path=runtime_paths.mlx_audio_path,
-                )
-            
-            if engine.abs_model_path != os.path.abspath(os.path.join(engine.base_dir, target_path)):
-                print(f"[InferenceProcess] 模型切换 -> {target_model_name}")
-                engine = TTSEngine(
-                    model_path=target_path,
-                    mlx_audio_path=runtime_paths.mlx_audio_path,
-                )
-            
-            if engine.model is None:
-                engine.ensure_model_loaded()
-            
-            # 针对 0.6B Base 模型的音色加固
-            if "0.6B" in target_model_name:
-                config["instruct"] = f"Persona Anchor: {config.get('voice', 'Serena')}. " + config.get("instruct", "")
-
-            text = task['text']
-            text_hash = task.get('hash')
-            
-            # 1. 检查缓存
-            cache_file = os.path.join(CACHE_DIR, f"{text_hash}.npy") if text_hash else None
-            if cache_file and os.path.exists(cache_file):
-                try:
-                    cached_audio = np.load(cache_file)
-                    SR = 16000
-                    for s in range(0, len(cached_audio), SR):
-                        if shared_state.stop_event.is_set() or task_id != shared_state.current_task_id.value: break
-                        shared_state.audio_q.put((task_id, chunk_index, cached_audio[s:s+SR]))
-                        shared_state.note_audio_frame()
-                        time.sleep(0.005)
-                    shared_state.audio_q.put("CHUNK_DONE")
-                    continue
-                except Exception as e:
-                    # 缓存重放失败：回退到正常合成（不要吞 KeyboardInterrupt/SystemExit）
-                    print(f"[InferenceProcess] Cache replay failed, will re-synthesize: {e}")
-
-            # 2. 实时推理
-            full_audio = []
-            throttle_sleep = profile["chunk_sleep"]
-
-            for samples in engine.generate_stream(text, config):
-                if shared_state.stop_event.is_set() or task_id != shared_state.current_task_id.value: 
-                    break
-                shared_state.audio_q.put((task_id, chunk_index, samples))
-                shared_state.note_audio_frame()
-                full_audio.append(samples)
-                time.sleep(throttle_sleep)
-            
-            if not shared_state.stop_event.is_set() and task_id == shared_state.current_task_id.value and cache_file and full_audio:
-                try:
-                    concat_audio = np.concatenate(full_audio)
-                    np.save(cache_file, concat_audio)
-                    duration = len(concat_audio) / 24000.0
-                    try:
-                        worker_storage.add_cache_metadata(
-                            md5=text_hash,
-                            text=text,
-                            model=target_model_name,
-                            voice=config.get("voice", "Serena"),
-                            duration=duration,
-                            file_path=cache_file
-                        )
-                    except Exception as db_err:
-                        print(f"[InferenceProcess] Failed to save cache metadata: {db_err}")
-                    manage_cache_limit(CACHE_MAX_ITEMS, worker_storage)
-                except Exception as save_err:
-                    print(f"[InferenceProcess] Save cache failed: {save_err}")
-            
-            shared_state.audio_q.put("CHUNK_DONE")
-            # 注意：子进程不再随意 set_status("IDLE")，防止监控误报
-            
-        except Exception as e:
-            print(f"[InferenceProcess] 异常: {e}")
-            traceback.print_exc()
-            # 把失败如实记录到共享状态，供 /snapshot 与 /selftest/voice 读取，
-            # 避免上层（如向导一键试音）把"任务已受理"误判为"已出声"。
-            shared_state.set_error(str(e))
-            time.sleep(1.0)
+    # Worker metadata must live in Application Support (bundle is read-only).
+    worker_storage = Storage(data_dir=runtime_paths.data_path)
+    backend = MLXBackend(mlx_audio_path=runtime_paths.mlx_audio_path)
+    engine = InferenceEngine(
+        backend=backend,
+        cache_dir=CACHE_DIR,
+        storage=worker_storage,
+        reference_base=runtime_paths.reference_path,
+        max_cache_items=CACHE_MAX_ITEMS,
+        models_path=runtime_paths.models_path,
+    )
+    engine.run_loop(shared_state, sentinel=GLOBAL_SENTINEL, profile_fn=get_performance_profile)
 
 # ==========================================
 # 3. 主进程逻辑
@@ -401,6 +266,7 @@ def init_runtime_services() -> None:
         ),
         is_device_switching=lambda: bool(player is not None and player.is_device_switching()),
         get_battery_policy=lambda: storage.load_config().get("battery_podcast_policy", "pause"),
+        podcast_q=S.podcast_q,
     )
 
     runtime_supervisor = RuntimeSupervisor(
@@ -1272,6 +1138,15 @@ def get_snapshot():
         **podcast_snap,
         "active_url_tasks": list(ACTIVE_URL_TASKS.keys()),
         "instance_id": INSTANCE_ID,
+        # 暂停态：UI 的播放/暂停切换（Console/Popover/AppStateStore）读 snapshot.is_paused，
+        # 此前 /snapshot 漏发这两个字段（只有 /status 有），导致前端 isPaused 恒为 false、
+        # 暂停/恢复切换在所有播放来源（朗读/saved/播客）都失灵。补齐，与 /status 算法一致。
+        "is_paused": (player.is_paused if player is not None else False),
+        "is_playing": (
+            bool(runtime_snapshot.get("main_is_playing"))
+            and player is not None
+            and not player.is_paused
+        ),
         "current_article_chunks": chunks_clean,
         "current_article_index": current_index,
         # 真实出声/失败信号：audio_frames>0 表示本次确有音频产出；inference_error 非空表示

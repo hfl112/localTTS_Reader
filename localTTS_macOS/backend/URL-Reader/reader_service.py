@@ -239,8 +239,7 @@ def write_cache(path: str, text: str) -> None:
         f.write(text)
 
 
-# Podcast prompts (verbatim from gemini_engine.generate_podcast_*). Reused so
-# they can be dispatched through the provider-agnostic LLM engine.
+# Podcast prompts, dispatched through the provider-agnostic LLM engine.
 _PODCAST_DISCUSS_PROMPT = (
     "你是一个播客脚本创作专家。请将以下输入的文章或网页内容，改编为一个类似 NotebookLM 风格的双人对谈播客脚本。\n"
     "要求：\n"

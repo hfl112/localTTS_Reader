@@ -41,7 +41,7 @@ class LLMProvider:
 
 class GeminiProvider(LLMProvider):
     """官方 google-genai SDK，单模型（默认 gemini-2.5-flash）。
-    key 只来自前端配置（完全解耦本地 .env），不再依赖 gemini_engine。"""
+    key 只来自前端配置（完全解耦本地 .env）。"""
 
     name = "gemini"
 
