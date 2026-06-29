@@ -13,8 +13,37 @@ import time
 
 import numpy as np
 
-from core.inference.engine import InferenceEngine, _IDLE
+from core.inference.engine import InferenceEngine, trim_silence, _IDLE
 from core.inference.model_backend import FakeBackend
+
+
+class _SilencePaddedBackend:
+    """Yields silence → 1s tone → silence, so the read lane's per-chunk trim has
+    head/tail silence to strip (FakeBackend's tone has none)."""
+
+    def __init__(self, sr: int = 24000):
+        self.sr = sr
+        self._loaded = False
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._loaded
+
+    def load(self, abs_model_path: str) -> None:
+        self._loaded = True
+
+    def unload(self) -> None:
+        self._loaded = False
+
+    def active_memory_mb(self) -> float:
+        return 0.0
+
+    def generate(self, text, generate_kwargs):
+        sr = self.sr
+        yield np.zeros(sr // 2, dtype=np.float32)  # 0.5s leading silence
+        t = np.arange(sr, dtype=np.float32) / sr
+        yield (0.5 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)  # 1s tone
+        yield np.zeros(sr // 2, dtype=np.float32)  # 0.5s trailing silence
 
 
 class _Val:
@@ -104,6 +133,33 @@ def test_sentinel_passthrough(tmp_path):
 
     eng.run_loop(sh, sentinel="SENT", profile_fn=_PROFILE)
     assert _drain(sh.audio_q) == ["SENT"]
+
+
+# --- E3: read lane trims per-sentence head/tail silence (Bug 1 for reads) ---
+
+def test_trim_silence_strips_head_and_tail():
+    sr = 24000
+    silence = np.zeros((sr // 2, 2), dtype=np.float32)
+    t = np.arange(sr, dtype=np.float32) / sr
+    tone = np.stack([0.5 * np.sin(2 * np.pi * 220.0 * t)] * 2, axis=1).astype(np.float32)
+    audio = np.concatenate([silence, tone, silence])
+    trimmed = trim_silence(audio, sr=sr, pad_ms=20)
+    pad = int(sr * 0.02)
+    assert len(tone) - 5 <= len(trimmed) <= len(tone) + 2 * pad + 5  # tone kept, silence gone
+
+
+def test_read_lane_trims_chunk_silence(tmp_path):
+    eng = InferenceEngine(_SilencePaddedBackend(), cache_dir=str(tmp_path), models_path=None)
+    sh = FakeShared(current_task_id=1)
+    sh.text_q.put({"task_id": 1, "chunk_index": 0, "text": "你好", "config": {"voice": "Serena"}})
+    sh.text_q.put(None)
+
+    eng.run_loop(sh, sentinel="SENT", profile_fn=_PROFILE)
+
+    tuples = [it for it in _drain(sh.audio_q) if isinstance(it, tuple)]
+    total = sum(len(t[2]) for t in tuples)
+    raw = 24000 * 2  # 0.5 + 1 + 0.5 s before trimming
+    assert 0 < total < raw * 0.7, f"read lane did not trim silence (got {total}, raw {raw})"
 
 
 # --- read priority: text_q drained before podcast_q ---

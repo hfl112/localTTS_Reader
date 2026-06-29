@@ -12,6 +12,7 @@ from typing import Any, Callable
 import numpy as np
 import scipy.io.wavfile
 
+from core.inference.engine import trim_silence
 from core.paths import runtime_paths
 from core.processor import TextProcessor
 from core.services.podcast_jobs import PodcastJobStore
@@ -122,7 +123,7 @@ def generate_podcast_chunks(
     chunk_dir: str,
     pause_event,
     shutdown_event,
-) -> list[str]:
+) -> tuple[list[str], list[Any]]:
     profile = get_performance_profile(config.get("performance_profile"))
     os.makedirs(chunk_dir, exist_ok=True)
     chunks = TextProcessor().parse_dialogue_or_text(
@@ -130,6 +131,7 @@ def generate_podcast_chunks(
         performance_profile=config.get("performance_profile", "quiet"),
     )
     chunk_files: list[str] = []
+    speakers: list[Any] = []
     progress_path = os.path.join(chunk_dir, "progress.json")
 
     for idx, chunk in enumerate(chunks):
@@ -137,6 +139,10 @@ def generate_podcast_chunks(
             raise RuntimeError("podcast generation canceled")
         chunk_file = os.path.join(chunk_dir, f"chunk_{idx:05d}.npy")
         chunk_files.append(chunk_file)
+        # Track the speaker per chunk (aligned with chunk_files, incl. resumed
+        # ones) so write_podcast_wav_from_chunks can size inter-chunk pauses by
+        # speaker change.
+        speakers.append(chunk.get("config", {}).get("voice") if isinstance(chunk, dict) else None)
         if os.path.exists(chunk_file):
             continue
 
@@ -177,15 +183,62 @@ def generate_podcast_chunks(
         if shutdown_event.wait(profile["sentence_sleep"]):
             raise RuntimeError("podcast generation canceled")
 
-    return chunk_files
+    return chunk_files, speakers
 
 
-def write_podcast_wav_from_chunks(chunk_files: list[str], output_path: str) -> bool:
-    existing_chunks = [path for path in chunk_files if os.path.exists(path)]
-    if not existing_chunks:
+def assemble_podcast_audio(
+    parts: list[Any],
+    speakers: list[Any] | None = None,
+    sr: int = 24000,
+    same_gap_ms: int = 120,
+    switch_gap_ms: int = 350,
+) -> Any:
+    """Trim each chunk's head/tail silence, then join with a *fixed* inter-chunk
+    pause: ``same_gap_ms`` within one speaker, ``switch_gap_ms`` when the speaker
+    changes. Replaces the variable model-generated gaps that made podcasts sound
+    choppy (Bug 1). Returns None if nothing survives trimming."""
+    trimmed = []
+    for i, p in enumerate(parts):
+        t = trim_silence(p, sr)
+        if len(t) == 0:
+            continue
+        spk = speakers[i] if speakers and i < len(speakers) else None
+        trimmed.append((t, spk))
+    if not trimmed:
+        return None
+
+    out = [trimmed[0][0]]
+    prev_spk = trimmed[0][1]
+    for audio, spk in trimmed[1:]:
+        gap_ms = switch_gap_ms if spk != prev_spk else same_gap_ms
+        gap = int(sr * gap_ms / 1000)
+        if gap > 0:
+            if audio.ndim == 2:
+                out.append(np.zeros((gap, audio.shape[1]), dtype=audio.dtype))
+            else:
+                out.append(np.zeros(gap, dtype=audio.dtype))
+        out.append(audio)
+        prev_spk = spk
+    return np.concatenate(out)
+
+
+def write_podcast_wav_from_chunks(
+    chunk_files: list[str], output_path: str, speakers: list[Any] | None = None
+) -> bool:
+    # Keep chunk_files and speakers aligned while dropping any chunk whose file
+    # is missing (partial/failed synthesis), so speaker-aware gaps stay correct.
+    existing = [
+        (path, (speakers[i] if speakers and i < len(speakers) else None))
+        for i, path in enumerate(chunk_files)
+        if os.path.exists(path)
+    ]
+    if not existing:
         return False
-    audio_parts = [np.load(path) for path in existing_chunks]
-    full_wav = np.concatenate(audio_parts)
+    parts = [np.load(path) for path, _ in existing]
+    spk = [s for _, s in existing]
+    full_wav = assemble_podcast_audio(parts, spk)
+    if full_wav is None or len(full_wav) == 0:
+        return False
     wav_data = (np.clip(full_wav, -1.0, 1.0) * 32767).astype(np.int16)
     scipy.io.wavfile.write(output_path, 24000, wav_data)
     return True
@@ -248,7 +301,7 @@ def run_single_podcast_generation_thread(
         # gpu_lock — the engine serializes the GPU for read + podcast).
         config = prepare_podcast_config(config, text)
         chunk_dir = os.path.join(podcast_chunk_dir, f"single_{md5[:12]}")
-        chunk_files = generate_podcast_chunks(
+        chunk_files, speakers = generate_podcast_chunks(
             podcast_q,
             job_id,
             text,
@@ -259,7 +312,7 @@ def run_single_podcast_generation_thread(
         )
         out_name = f"podcast_单篇_{source}_{safe_title}_{md5[:8]}_{int(time.time())}.wav"
         output_path = os.path.join(podcasts_dir, out_name)
-        if not write_podcast_wav_from_chunks(chunk_files, output_path):
+        if not write_podcast_wav_from_chunks(chunk_files, output_path, speakers):
             raise RuntimeError("no generated podcast chunks")
         # 同名 .txt 文稿 sidecar，供内容中心双击查看播客脚本
         try:
@@ -310,7 +363,7 @@ def run_podcast_generation_thread(
         config = prepare_podcast_config(config, text, force_small_model=True)
         batch_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
         chunk_dir = os.path.join(podcast_chunk_dir, f"batch_{batch_hash[:12]}")
-        chunk_files = generate_podcast_chunks(
+        chunk_files, speakers = generate_podcast_chunks(
             podcast_q,
             job_id,
             text,
@@ -319,7 +372,7 @@ def run_podcast_generation_thread(
             pause_event,
             shutdown_event,
         )
-        if not write_podcast_wav_from_chunks(chunk_files, filename):
+        if not write_podcast_wav_from_chunks(chunk_files, filename, speakers):
             raise RuntimeError("no generated podcast chunks")
         # 同名 .txt 文稿 sidecar，供内容中心双击查看播客脚本
         try:

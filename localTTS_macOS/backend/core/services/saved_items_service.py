@@ -86,6 +86,19 @@ class SavedItemsService:
             return True
         return False
 
+    def toggle_pin(self, md5: str) -> bool:
+        """Flip the `pinned` flag on the item with this md5, persisting in place.
+        ADR-003 F4: storage ORDER IS NOT CHANGED — /play_saved and the frontend
+        address items by their original index, so sorting pinned-first must happen
+        only in the frontend display layer, never here."""
+        items = self.load()
+        for item in items:
+            if item.get("md5") == md5:
+                item["pinned"] = not item.get("pinned", False)
+                self.write(items)
+                return True
+        return False
+
     def clear(self) -> None:
         self.write([])
 

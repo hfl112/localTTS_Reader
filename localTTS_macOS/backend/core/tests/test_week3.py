@@ -93,6 +93,132 @@ def test_storage_load_is_corruption_safe_and_isolated():
         assert glob.glob(storage.state_path + ".corrupt.*"), "corrupt file should be backed up"
 
 
+def test_snapshot_and_status_expose_agreeing_playback_status():
+    """ADR-003 A2: /snapshot and /status both expose playback_status from the
+    one owner (PlaybackService.playback_status()), so they always agree, and it
+    reflects the real player ground truth (not a hardcoded value)."""
+    import core.backend as backend_mod
+
+    init_runtime_services()
+    client = TestClient(app)
+    p = backend_mod.player
+    assert p is not None
+
+    # Force a "playing" ground truth directly on the real player.
+    p.is_paused = False
+    p.is_prebuffering = False
+    p.playback_finished_event.clear()  # is_running() -> True
+    snap = client.get("/snapshot").json()
+    status = client.get("/status").json()
+    assert snap["playback_status"] == "playing"
+    assert status["playback_status"] == "playing"
+    assert snap["playback_status"] == status["playback_status"]
+
+    # Not running -> idle, on both endpoints.
+    p.playback_finished_event.set()
+    assert client.get("/snapshot").json()["playback_status"] == "idle"
+    assert client.get("/status").json()["playback_status"] == "idle"
+
+
+def test_playback_commands_return_new_status(monkeypatch):
+    """ADR-003 A3: /pause /resume /stop return the new playback_status in the
+    body so the UI applies it optimistically (no ~500ms poll lag)."""
+    import core.backend as backend_mod
+
+    # State-changing POSTs are auth-gated; use the loopback dev bypass for the
+    # TestClient ("testclient" host is loopback under pytest).
+    monkeypatch.setenv("TTS_LEGACY_LOOPBACK_CLIENTS", "1")
+    init_runtime_services()
+    client = TestClient(app)
+    p = backend_mod.player
+    assert p is not None
+    p.playback_finished_event.clear()  # running
+    p.is_prebuffering = False
+    p.is_paused = False
+
+    assert client.post("/pause").json()["playback_status"] == "paused"
+    assert client.post("/resume").json()["playback_status"] in ("playing", "generating")
+    assert client.post("/stop").json()["playback_status"] == "idle"
+
+
+def test_snapshot_contract():
+    """ADR-003 A4: cross-seam contract. ① playback_status present+valid on both
+    endpoints; ② steady-state equivalence between computed status and the wire
+    is_paused alias (driven synchronously on the real player — NOT via the async
+    play() path, which has a set_main-leads-start transient that would be flaky);
+    ③ /snapshot carries the keys the frontend consumes."""
+    import core.backend as backend_mod
+
+    init_runtime_services()
+    client = TestClient(app)
+    p = backend_mod.player
+    assert p is not None
+    VALID = {"idle", "generating", "playing", "paused"}
+
+    # ① present + valid on both endpoints
+    snap = client.get("/snapshot").json()
+    st = client.get("/status").json()
+    assert snap["playback_status"] in VALID
+    assert st["playback_status"] in VALID
+
+    # ③ frontend-consumed key set present
+    for k in (
+        "main_title", "main_progress", "main_is_playing", "is_paused",
+        "playback_status", "status_code", "current_article_chunks",
+        "current_article_index", "instance_id",
+    ):
+        assert k in snap, f"/snapshot missing frontend-consumed key: {k}"
+
+    # ② steady-state equivalence (running, paused, prebuffering) -> expected status
+    cases = [
+        (False, False, False, "idle"),
+        (True,  False, False, "playing"),
+        (True,  False, True,  "generating"),
+        (True,  True,  False, "paused"),
+    ]
+    for running, paused, prebuf, expect in cases:
+        if running:
+            p.playback_finished_event.clear()
+        else:
+            p.playback_finished_event.set()
+        p.is_paused = paused
+        p.is_prebuffering = prebuf
+        s = client.get("/snapshot").json()
+        assert s["playback_status"] == expect, (running, paused, prebuf, s["playback_status"])
+        # the legacy wire alias never contradicts the computed truth
+        assert s["is_paused"] == paused
+        if expect == "paused":
+            assert s["is_paused"] is True
+
+
+def test_restart_mode_replays_from_start_and_noops_when_empty(monkeypatch):
+    """ADR-003 F2: the play button when idle restarts the CURRENT article from
+    the beginning (start_idx=0, current_index reset to 0). With no article it
+    must be a safe no-op, not a KeyError 500."""
+    import core.backend as backend_mod
+
+    monkeypatch.setenv("TTS_LEGACY_LOOPBACK_CLIENTS", "1")
+    init_runtime_services()
+    client = TestClient(app)
+
+    # No current article → safe no-op (this used to KeyError 500).
+    st = backend_mod.storage.load_state()
+    st.pop("current_article", None)
+    backend_mod.storage.save_state(st)
+    r = client.post("/read", json={"text": "RESTART_MODE"})
+    assert r.status_code == 200
+    assert r.json().get("status") == "noop"
+
+    # With an article at index 2 → restart from 0.
+    st = backend_mod.storage.load_state()
+    st["current_article"] = {"title": "T", "chunks": ["a", "b", "c"], "current_index": 2}
+    backend_mod.storage.save_state(st)
+    r = client.post("/read", json={"text": "RESTART_MODE"})
+    assert r.status_code == 200
+    assert r.json().get("status") == "ok"
+    assert backend_mod.storage.load_state()["current_article"]["current_index"] == 0
+
+
 def test_new_routes():
     init_runtime_services()
     client = TestClient(app)
@@ -148,4 +274,3 @@ def test_new_routes():
         response = client.post("/control/shutdown")
         assert response.status_code == 200
         assert response.json() == {"status": "shutting_down"}
-

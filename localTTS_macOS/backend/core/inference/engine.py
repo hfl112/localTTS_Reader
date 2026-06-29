@@ -52,6 +52,30 @@ def normalize_frame(mono: np.ndarray) -> np.ndarray:
     return np.clip(stereo, -0.98, 0.98).astype(np.float32)
 
 
+def trim_silence(audio: np.ndarray, sr: int = 24000, pad_ms: int = 20) -> np.ndarray:
+    """Trim leading/trailing near-silence from one synthesized chunk (mono or
+    stereo). Each chunk carries model-generated head/tail silence (amplified by
+    the trailing ``"。  "`` text padding in build_generate_kwargs); leaving it in
+    makes both podcasts (concatenated) and live reads (sequential) audibly choppy
+    at every sentence boundary (Bug 1). A short pad keeps word onsets/tails intact.
+    Shared by the podcast assembler and the read lane so there's one trim, not two."""
+    a = np.asarray(audio)
+    if a.size == 0:
+        return a
+    env = np.abs(a).max(axis=1) if a.ndim == 2 else np.abs(a)
+    peak = float(env.max())
+    if peak <= 0:
+        return a[:0]
+    thresh = max(0.02 * peak, 0.004)
+    loud = np.where(env > thresh)[0]
+    if loud.size == 0:
+        return a[:0]
+    pad = int(sr * pad_ms / 1000)
+    start = max(0, int(loud[0]) - pad)
+    end = min(len(a), int(loud[-1]) + 1 + pad)
+    return a[start:end]
+
+
 def build_generate_kwargs(text: str, config: dict, reference_base: Optional[str]):
     """Faithful port of the prompt-kwargs construction from tts_engine: text
     padding, dynamic max_tokens, per-chunk language autodetect, base sampling
@@ -353,13 +377,27 @@ class InferenceEngine:
                 profile = profile_fn(config.get("performance_profile"))
                 throttle = profile.get("chunk_sleep", 0.0) if isinstance(profile, dict) else 0.0
 
+                # E3: collect the whole sentence-chunk, trim its head/tail silence
+                # (same fix as podcasts), then emit in player-sized frames — so
+                # live reads aren't choppy at every sentence boundary. Cost: this
+                # sentence's first audio waits for its full synthesis.
+                def _still_current() -> bool:
+                    return not shared_state.stop_event.is_set() and task_id == shared_state.current_task_id.value
+
+                chunk_frames = []
                 for frame in self.synthesize_local(task["text"], config):
-                    if shared_state.stop_event.is_set() or task_id != shared_state.current_task_id.value:
+                    if not _still_current():
                         break
-                    shared_state.audio_q.put((task_id, chunk_index, frame))
-                    shared_state.note_audio_frame()
-                    if throttle:
-                        time.sleep(throttle)
+                    chunk_frames.append(frame)
+                if chunk_frames and _still_current():
+                    trimmed = trim_silence(np.concatenate(chunk_frames))
+                    for s in range(0, len(trimmed), _CACHE_REPLAY_FRAME):
+                        if not _still_current():
+                            break
+                        shared_state.audio_q.put((task_id, chunk_index, trimmed[s : s + _CACHE_REPLAY_FRAME]))
+                        shared_state.note_audio_frame()
+                        if throttle:
+                            time.sleep(throttle)
                 shared_state.audio_q.put("CHUNK_DONE")
             except Exception as e:
                 import traceback

@@ -34,22 +34,44 @@ def test_performance_profile_defaults_to_balanced():
     assert get_performance_profile("missing")["name"] == "balanced"
 
 
-def test_runtime_state_snapshot_and_podcast_buffer():
+def test_runtime_state_snapshot():
     state = RuntimeState()
     state.set_main(is_playing=True, title="Title", progress="1/2")
     state.set_current_media(podcast="a.wav", md5="abc")
-    state.set_podcast_file("/tmp/out.wav")
-    state.append_podcast_audio("chunk")
 
     snapshot = state.snapshot()
     assert snapshot["main_is_playing"] is True
     assert snapshot["main_title"] == "Title"
-    assert snapshot["podcast_buffer_chunks"] == 1
+    assert snapshot["current_podcast_file"] == "a.wav"
+    assert snapshot["current_playing_md5"] == "abc"
 
-    podcast_file, buffer = state.consume_podcast_buffer()
-    assert podcast_file == "/tmp/out.wav"
-    assert buffer == ["chunk"]
-    assert state.snapshot()["podcast_buffer_chunks"] == 0
+
+def test_saved_items_pin_toggle_keeps_order():
+    """ADR-003 F4: toggle_pin flips a persisted `pinned` flag by md5 WITHOUT
+    reordering storage (frontend sorts for display; /play_saved is index-based,
+    so reordering here would play the wrong item). Old items lacking the field
+    default to unpinned."""
+    with tempfile.TemporaryDirectory() as tmp:
+        service = SavedItemsService(tmp)
+        service.save("alpha", source="web", title="A")
+        service.save("beta", source="web", title="B")
+        service.save("gamma", source="web", title="C")
+        before = [i["md5"] for i in service.load()]
+        assert all(not i.get("pinned", False) for i in service.load())  # default unpinned
+
+        beta_md5 = service.load()[1]["md5"]
+        assert service.toggle_pin(beta_md5) is True
+
+        items = service.load()
+        assert [i["md5"] for i in items] == before, "toggle_pin must NOT reorder storage"
+        assert items[1].get("pinned") is True  # beta pinned, still at index 1
+        assert items[0].get("pinned", False) is False
+
+        # idempotent toggle back
+        assert service.toggle_pin(beta_md5) is True
+        assert service.load()[1].get("pinned") is False
+        # unknown md5
+        assert service.toggle_pin("nope") is False
 
 
 def test_saved_items_service_round_trip():
@@ -290,22 +312,534 @@ class DummyPlayer:
         self.stop_count += 1
 
 
+def test_playback_status_predicate():
+    """ADR-003 A1: playback_status() is computed on-read from the player (no
+    stored main_is_playing flag). Priority: not running→idle; paused→paused;
+    prebuffering→generating; else→playing."""
+    from core.services.playback_service import PlaybackService
+
+    class FakePlayer:
+        def __init__(self):
+            self.running = False
+            self.is_paused = False
+            self.is_prebuffering = False
+
+        def is_running(self):
+            return self.running
+
+    player = FakePlayer()
+    svc = PlaybackService(
+        shared_state=DummySharedState(),
+        player=player,
+        storage=None,
+        runtime_state=RuntimeState(),
+        sentinel="X",
+        get_text_hash=lambda t: t,
+        get_performance_profile=get_performance_profile,
+        event_log=None,
+    )
+
+    assert svc.playback_status() == "idle"        # not running
+    player.running = True
+    assert svc.playback_status() == "playing"      # running, not paused/prebuffering
+    player.is_prebuffering = True
+    assert svc.playback_status() == "generating"   # running + prebuffering
+    player.is_paused = True
+    assert svc.playback_status() == "paused"        # paused beats prebuffering
+    player.running = False
+    assert svc.playback_status() == "idle"          # not running beats everything
+
+
 def test_playback_controller_invalidates_old_sessions():
     shared_state = DummySharedState()
     player = DummyPlayer()
     controller = PlaybackController(shared_state, player)
 
-    first_session, first_task = controller.start_new_session()
-    assert controller.can_feed_audio(first_session, first_task)
+    first_session = controller.start_new_session()
+    assert controller.can_feed_audio(first_session)
 
-    second_session, second_task = controller.start_new_session()
-    assert not controller.can_feed_audio(first_session, first_task)
-    assert controller.can_feed_audio(second_session, second_task)
+    second_session = controller.start_new_session()
+    assert not controller.can_feed_audio(first_session)
+    assert controller.can_feed_audio(second_session)
     assert player.stop_count == 2
 
     controller.stop_current_session()
-    assert not controller.can_feed_audio(second_session, second_task)
+    assert not controller.can_feed_audio(second_session)
     assert shared_state.stop_event.is_set()
+
+
+def test_playback_session_tracks_single_identity():
+    # ADR-002: PlaybackSession.id == current_task_id; is_current() flips as new
+    # sessions are started (no separate _session_id shadow).
+    from core.services.playback_service import PlaybackController, PlaybackSession
+
+    shared_state = DummySharedState()
+    controller = PlaybackController(shared_state, DummyPlayer())
+
+    s1 = PlaybackSession(id=controller.start_new_session(), chunks=["a"], config={})
+    assert controller.is_current(s1.id)
+    assert s1.start_idx == 0 and s1.title is None
+
+    s2 = PlaybackSession(id=controller.start_new_session(), chunks=["b"], config={})
+    assert controller.is_current(s2.id)
+    assert not controller.is_current(s1.id)
+
+
+def _silence_gap_runs(mono, sr, rel=0.02):
+    """Return inner silence-gap lengths (seconds) in a mono signal, excluding
+    leading/trailing silence. Mirrors the podcast WAV analyzer used to diagnose
+    Bug 1."""
+    import numpy as np
+
+    env = np.abs(mono)
+    peak = float(env.max()) or 1.0
+    quiet = env < (rel * peak)
+    runs = []
+    i = 0
+    n = len(quiet)
+    while i < n:
+        if quiet[i]:
+            j = i
+            while j < n and quiet[j]:
+                j += 1
+            runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    inner = [(a, b) for a, b in runs if a > 0 and b < n]
+    return [(b - a) / sr for a, b in inner]
+
+
+def test_podcast_assembly_trims_silence_and_inserts_speaker_aware_gaps():
+    """Bug 1 repro+fix at the real seam: each synthesized chunk carries model
+    head/tail silence; raw concatenation yields a ~700ms gap at every sentence
+    boundary (15% of the podcast was silence → choppy). assemble_podcast_audio
+    must trim each chunk and join with a fixed pause: ~120ms within a speaker,
+    ~350ms across speakers."""
+    import numpy as np
+
+    from core.services.podcast_service import assemble_podcast_audio
+
+    sr = 24000
+
+    def chunk(lead_ms, tone_ms, tail_ms):
+        lead = np.zeros((int(sr * lead_ms / 1000), 2), dtype=np.float32)
+        t = np.arange(int(sr * tone_ms / 1000)) / sr
+        tone = (0.5 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+        tone = np.stack([tone, tone], axis=1)
+        tail = np.zeros((int(sr * tail_ms / 1000), 2), dtype=np.float32)
+        return np.concatenate([lead, tone, tail])
+
+    parts = [chunk(300, 500, 400) for _ in range(4)]
+    speakers = ["Serena", "Serena", "Ryan", "Ryan"]
+
+    out = assemble_podcast_audio(parts, speakers, sr=sr, same_gap_ms=120, switch_gap_ms=350)
+    assert out is not None and out.ndim == 2
+
+    dur = len(out) / sr
+    # Raw concat would be 4*1.2s = 4.8s. Trimmed: 4*0.5s tone + 0.12+0.35+0.12
+    # gaps + small pads ≈ 2.6-3.0s. Proves trimming happened.
+    assert 2.3 < dur < 3.2, f"unexpected assembled duration {dur:.2f}s (trim failed?)"
+
+    gaps = sorted(_silence_gap_runs(np.abs(out).max(axis=1), sr))
+    # No raw 700ms boundary gaps survive.
+    assert max(gaps) < 0.45, f"a silence gap of {max(gaps):.2f}s survived trimming"
+    # Exactly one cross-speaker gap (~350ms) and it is the largest.
+    assert max(gaps) > 0.28, f"speaker-switch gap missing/too small: {max(gaps):.2f}s"
+    # Same-speaker gaps are clearly shorter than the switch gap.
+    same = [g for g in gaps if g < 0.28]
+    assert same and all(g < 0.22 for g in same), f"same-speaker gaps too long: {same}"
+
+
+def test_play_wav_after_read_tail_keeps_is_playing_true():
+    """Bug 2 repro: a read finishes generating and parks in the finally's
+    wait_until_finished(); then a podcast starts (set_main(is_playing=True) then
+    start_new_session()→player.stop()). player.stop() wakes the parked read
+    thread, which then runs set_main(is_playing=False) and clobbers the podcast's
+    True. The UI snapshot then shows main_is_playing=False, so the pause button
+    can't pause the first podcast played after a read."""
+    import queue as _queue
+    import threading
+
+    from core.services.playback_service import PlaybackService, PlaybackSession
+
+    class TailSharedState:
+        def __init__(self):
+            self.text_q = _queue.Queue()
+            self.audio_q = _queue.Queue()
+            self.stop_event = mp.Event()
+            self.current_task_id = mp.Value("i", 0)
+
+        def set_status(self, _code):
+            pass
+
+    class BlockingPlayer:
+        """Models the real player: stop() fires playback_finished_event, which
+        is what wait_until_finished() blocks on."""
+
+        def __init__(self):
+            self.audio_queue = _queue.Queue()
+            self.is_paused = False
+            self._release = threading.Event()
+            self.entered_wait = threading.Event()
+
+        def start(self):
+            self._release.clear()
+
+        def stop(self, graceful=False):
+            self._release.set()
+
+        def wait_until_finished(self, timeout=120.0):
+            self.entered_wait.set()
+            return self._release.wait(timeout)
+
+        def get_queue_duration(self):
+            return 0.0
+
+    shared_state = TailSharedState()
+    player = BlockingPlayer()
+    runtime_state = RuntimeState()
+    service = PlaybackService(
+        shared_state=shared_state,
+        player=player,
+        storage=None,
+        runtime_state=runtime_state,
+        sentinel="PIPELINE_END_STRICT_V1",
+        get_text_hash=lambda t: t,
+        get_performance_profile=get_performance_profile,
+        event_log=None,
+    )
+
+    # A "read" session that immediately hits the finally (no chunks to stream).
+    read_session = PlaybackSession(
+        id=service.controller.start_new_session(), chunks=[], config={}
+    )
+    runtime_state.set_main(is_playing=True)
+
+    t = threading.Thread(target=service._shared_task_loop, args=(read_session,))
+    t.start()
+    # Wait until the read thread is parked in wait_until_finished (it has already
+    # passed the `if is_current(sid)` check at this point).
+    assert player.entered_wait.wait(2.0), "read thread never reached the wait"
+
+    # Now start a podcast exactly like play_wav_file: set True, then a new
+    # session whose start_new_session()→player.stop() wakes the parked read.
+    runtime_state.set_main(is_playing=True)
+    service.controller.start_new_session()  # calls player.stop() → releases wait
+
+    t.join(2.0)
+    assert not t.is_alive(), "read thread did not finish"
+
+    assert runtime_state.snapshot()["main_is_playing"] is True, (
+        "stale read thread clobbered is_playing=False after a new session started"
+    )
+
+
+def test_short_wav_stays_playing_until_playback_finishes():
+    """Bug 3 repro: a SHORT podcast's wav producer feeds all chunks almost
+    instantly (qsize never throttles), exits, and the finally sets
+    is_playing=False while ~7s of audio is still queued. The UI then sees
+    main_is_playing=False and can't pause the short podcast. is_playing must
+    track *playback* finishing, not the producer thread finishing."""
+    import os
+    import queue as _queue
+    import tempfile
+    import threading
+
+    import numpy as np
+    import scipy.io.wavfile as wavfile
+
+    from core.services.playback_service import PlaybackService
+
+    class TailSharedState:
+        def __init__(self):
+            self.text_q = _queue.Queue()
+            self.audio_q = _queue.Queue()
+            self.stop_event = mp.Event()
+            self.current_task_id = mp.Value("i", 0)
+
+        def set_status(self, _code):
+            pass
+
+    class BlockingPlayer:
+        def __init__(self):
+            self.audio_queue = _queue.Queue()
+            self.is_paused = False
+            self._release = threading.Event()
+            self.entered_wait = threading.Event()
+
+        def start(self):
+            self._release.clear()
+
+        def stop(self, graceful=False):
+            self._release.set()
+
+        def play_chunk(self, _c):
+            pass
+
+        def signal_end_of_article(self):
+            pass
+
+        def wait_until_finished(self, timeout=120.0):
+            self.entered_wait.set()
+            return self._release.wait(timeout)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        wav_path = os.path.join(tmp, "short.wav")
+        wavfile.write(wav_path, 24000, (np.zeros(12000) ).astype(np.int16))
+
+        shared_state = TailSharedState()
+        player = BlockingPlayer()
+        runtime_state = RuntimeState()
+        service = PlaybackService(
+            shared_state=shared_state,
+            player=player,
+            storage=None,
+            runtime_state=runtime_state,
+            sentinel="PIPELINE_END_STRICT_V1",
+            get_text_hash=lambda t: t,
+            get_performance_profile=get_performance_profile,
+            event_log=None,
+        )
+
+        session_id = service.controller.start_new_session()
+        runtime_state.set_main(is_playing=True)
+
+        t = threading.Thread(
+            target=service._play_wav_thread, args=(wav_path, session_id, [], "short")
+        )
+        t.start()
+
+        # The producer finishes feeding almost instantly; with the fix it then
+        # parks in wait_until_finished (playback still ongoing). Either way give
+        # it a moment to get past the feed loop.
+        assert player.entered_wait.wait(2.0), "wav thread never waited for playback to finish"
+
+        # Playback (our player) has NOT finished yet → still playing → pausable.
+        assert runtime_state.snapshot()["main_is_playing"] is True, (
+            "is_playing went False while audio still playing (short podcast can't pause)"
+        )
+
+        player.stop()  # playback actually finishes
+        t.join(2.0)
+        assert not t.is_alive()
+        assert runtime_state.snapshot()["main_is_playing"] is False
+
+
+def test_play_marks_playing_synchronously():
+    """#1 (pause after 'next'): seek calls play() synchronously, so play() must
+    set main_is_playing=True before it returns — no deferred/async restart that
+    leaves a window where the UI sees not-playing and the pause button breaks."""
+    import queue as _queue
+
+    from core.services.playback_service import PlaybackService
+
+    class TailSharedState:
+        def __init__(self):
+            self.text_q = _queue.Queue()
+            self.audio_q = _queue.Queue()
+            self.stop_event = mp.Event()
+            self.current_task_id = mp.Value("i", 0)
+
+        def set_status(self, _code):
+            pass
+
+    import threading
+
+    class BlockingPlayer:
+        """Models real playback: the producer parks in wait_until_finished until
+        audio actually drains, so it can't prematurely flip is_playing=False."""
+
+        def __init__(self):
+            self.audio_queue = _queue.Queue()
+            self.is_paused = False
+            self.min_chunks_to_start = 1
+            self._release = threading.Event()
+            self.playback_finished_event = threading.Event()
+
+        def start(self):
+            self._release.clear()  # real player clears playback_finished_event on start
+
+        def stop(self, graceful=False):
+            self._release.set()
+
+        def wait_until_finished(self, timeout=120.0):
+            return self._release.wait(timeout)
+
+        def get_queue_duration(self):
+            return 0.0
+
+    runtime_state = RuntimeState()
+    assert runtime_state.snapshot()["main_is_playing"] is False
+    player = BlockingPlayer()
+    service = PlaybackService(
+        shared_state=TailSharedState(),
+        player=player,
+        storage=None,
+        runtime_state=runtime_state,
+        sentinel="PIPELINE_END_STRICT_V1",
+        get_text_hash=lambda t: t,
+        get_performance_profile=get_performance_profile,
+        event_log=None,
+    )
+    try:
+        service.play(["a", "b", "c"], {}, start_idx=1, prebuffer_frames=6)
+        # The moment play() returns the UI must already read "playing", and it
+        # must STAY playing while playback is ongoing (the seek pause-button fix).
+        assert runtime_state.snapshot()["main_is_playing"] is True
+        time.sleep(0.1)
+        assert runtime_state.snapshot()["main_is_playing"] is True
+    finally:
+        player.stop()  # let the producer thread finish and exit cleanly
+        service.shutdown(join_timeout=2.0)
+
+
+def test_play_starts_player_synchronously_and_marks_generating():
+    """ADR-003 F1: play() starts the player BEFORE returning (was: in the
+    producer thread), so a command response computed right after play() sees
+    'generating' instead of stale 'idle' — which had flipped the pause button to
+    'play' after seek/next. Also the seek prebuffer is applied at start. Replaces
+    the old _shared_task_loop-driven prebuffer test."""
+    import queue as _queue
+    import threading
+
+    from core.services.playback_service import PlaybackService
+
+    class TailSharedState:
+        def __init__(self):
+            self.text_q = _queue.Queue()
+            self.audio_q = _queue.Queue()
+            self.stop_event = mp.Event()
+            self.current_task_id = mp.Value("i", 0)
+
+        def set_status(self, _code):
+            pass
+
+    class RecPlayer:
+        def __init__(self):
+            self.audio_queue = _queue.Queue()
+            self.is_paused = False
+            self.is_prebuffering = False
+            self.min_chunks_to_start = 1
+            self.seen_at_start = None
+            self.running = False
+            self._release = threading.Event()
+            self.playback_finished_event = threading.Event()
+
+        def start(self):
+            self.seen_at_start = self.min_chunks_to_start
+            self.running = True
+            self.is_prebuffering = True
+            self._release.clear()
+
+        def stop(self, graceful=False):
+            self.running = False
+            self._release.set()
+
+        def is_running(self):
+            return self.running
+
+        def wait_until_finished(self, timeout=120.0):
+            return self._release.wait(timeout)
+
+        def get_queue_duration(self):
+            return 0.0
+
+    player = RecPlayer()
+    service = PlaybackService(
+        shared_state=TailSharedState(),
+        player=player,
+        storage=None,
+        runtime_state=RuntimeState(),
+        sentinel="PIPELINE_END_STRICT_V1",
+        get_text_hash=lambda t: t,
+        get_performance_profile=get_performance_profile,
+        event_log=None,
+    )
+
+    try:
+        # Seek: prebuffer applied at start, AND status is generating right away.
+        service.play(["a"], {}, prebuffer_frames=6)
+        assert player.seen_at_start == 6, "seek prebuffer not applied at start()"
+        assert service.playback_status() == "generating", "play() must mark generating synchronously"
+
+        # Normal read keeps prebuffer 1 (the new session stops the first).
+        service.play(["a"], {})
+        assert player.seen_at_start == 1, "normal read should keep prebuffer_frames=1"
+    finally:
+        player.stop()
+        service.shutdown(join_timeout=2.0)
+
+
+def test_wav_playback_resets_seek_prebuffer():
+    """A WAV is fully available, so _play_wav_thread must reset min_chunks_to_start
+    to 1 before start(). Otherwise a large pre-roll left over from a prior seek
+    could exceed a short podcast's total chunk count and stall it forever."""
+    import os
+    import queue as _queue
+    import tempfile
+    import threading
+
+    import numpy as np
+    import scipy.io.wavfile as wavfile
+
+    from core.services.playback_service import PlaybackService
+
+    class TailSharedState:
+        def __init__(self):
+            self.text_q = _queue.Queue()
+            self.audio_q = _queue.Queue()
+            self.stop_event = mp.Event()
+            self.current_task_id = mp.Value("i", 0)
+
+        def set_status(self, _code):
+            pass
+
+    class RecPlayer:
+        def __init__(self):
+            self.audio_queue = _queue.Queue()
+            self.is_paused = False
+            self.min_chunks_to_start = 99  # leftover from a prior seek
+            self.seen_at_start = None
+
+        def start(self):
+            self.seen_at_start = self.min_chunks_to_start
+
+        def stop(self, graceful=False):
+            pass
+
+        def play_chunk(self, _c):
+            pass
+
+        def signal_end_of_article(self):
+            pass
+
+        def wait_until_finished(self, timeout=120.0):
+            return True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        wav_path = os.path.join(tmp, "short.wav")
+        wavfile.write(wav_path, 24000, np.zeros(12000).astype(np.int16))
+        shared_state = TailSharedState()
+        player = RecPlayer()
+        service = PlaybackService(
+            shared_state=shared_state,
+            player=player,
+            storage=None,
+            runtime_state=RuntimeState(),
+            sentinel="PIPELINE_END_STRICT_V1",
+            get_text_hash=lambda t: t,
+            get_performance_profile=get_performance_profile,
+            event_log=None,
+        )
+        session_id = service.controller.start_new_session()
+        t = threading.Thread(
+            target=service._play_wav_thread, args=(wav_path, session_id, [], "x")
+        )
+        t.start()
+        t.join(2.0)
+        assert not t.is_alive()
+        assert player.seen_at_start == 1, "WAV playback did not reset seek prebuffer"
 
 
 def test_url_job_store_round_trip():

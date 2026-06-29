@@ -5,8 +5,6 @@ import time
 from typing import List, Dict, Any
 import threading
 import multiprocessing as mp
-import numpy as np
-import scipy.io.wavfile
 import hashlib
 from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
@@ -202,6 +200,11 @@ cache_service: CacheService | None = None
 event_log: RuntimeEventLog | None = None
 url_job_store: UrlJobStore | None = None
 playback_service: PlaybackService | None = None
+
+# Seek tuning: a seek into not-yet-generated audio waits for ~SEEK_PREBUFFER_FRAMES
+# audio frames (~0.5s each) before playing, so it doesn't stutter into an empty
+# buffer. Tunable.
+SEEK_PREBUFFER_FRAMES = 6
 podcast_service: PodcastService | None = None
 runtime_supervisor: RuntimeSupervisor | None = None
 ACTIVE_URL_TASKS: dict[str, dict] = {}
@@ -312,53 +315,9 @@ def performance_monitor_thread(shutdown_event: threading.Event):
         except Exception:
             shutdown_event.wait(5)
 
-def audio_feeder_thread(shutdown_event: threading.Event):
-    if S is None or player is None or runtime_state is None:
-        return
-    while not shutdown_event.is_set():
-        try:
-            item = S.audio_q.get()
-            if item is None: break
-            if isinstance(item, str) and item == GLOBAL_SENTINEL:
-                snapshot = runtime_state.snapshot()
-                if snapshot["podcast_file"]:
-                    try:
-                        podcast_file, podcast_buffer = runtime_state.consume_podcast_buffer()
-                        if podcast_file and podcast_buffer:
-                            wav_data = np.concatenate(podcast_buffer)
-                            wav_data = (np.clip(wav_data, -1.0, 1.0) * 32767).astype(np.int16)
-                            scipy.io.wavfile.write(podcast_file, 24000, wav_data)
-                            print(f"[Podcast] Saved to {podcast_file}")
-                            event_log.record("podcast_buffer_saved", output_path=podcast_file)
-                            
-                            saved_items_service.clear()
-                    except Exception as e:
-                        print(f"[Podcast] Error saving: {e}")
-                        event_log.record("podcast_buffer_save_failed", error=str(e))
-                else:
-                    player.signal_end_of_article()
-                continue
-            
-            if isinstance(item, tuple):
-                if len(item) == 3:
-                    tid, chunk_idx, samples = item
-                elif len(item) == 2:
-                    tid, samples = item
-                    chunk_idx = -1
-                else:
-                    continue
-
-                if tid == S.current_task_id.value:
-                    if runtime_state.snapshot()["podcast_file"] is not None:
-                        runtime_state.append_podcast_audio(samples)
-                    else:
-                        if chunk_idx is not None and chunk_idx >= 0:
-                            player.play_chunk((samples, chunk_idx))
-                        else:
-                            player.play_chunk(samples)
-        except Exception:
-            if shutdown_event.is_set():
-                break
+# audio_feeder_thread moved into PlaybackService.feed_audio_loop (ADR-002):
+# the inference audio_q now feeds only the player; the old podcast-buffer
+# routing was dead after ADR-001.
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -377,7 +336,7 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("runtime shared state failed to initialize")
         runtime_supervisor.start_watchdog(asyncio.get_running_loop())
         runtime_supervisor.start_inference(inference_worker, (S,))
-        runtime_supervisor.start_thread(audio_feeder_thread, name="audio-feeder")
+        runtime_supervisor.start_thread(playback_service.feed_audio_loop, name="audio-feeder")
         runtime_supervisor.start_thread(
             performance_monitor_thread,
             name="performance-monitor",
@@ -477,7 +436,7 @@ async def read_text(data: ReadRequest):
 
     # 非原文模式：先经翻译/LLM 引擎处理文本，再走正常朗读流程
     mode = (data.mode or "original").strip()
-    if text and text != "RESUME_MODE" and mode not in ("", "original"):
+    if text and text != "RESTART_MODE" and mode not in ("", "original"):
         from fastapi.concurrency import run_in_threadpool
         reader_dir = os.path.join(BASE_DIR, "URL-Reader")
         if reader_dir not in sys.path:
@@ -496,22 +455,11 @@ async def read_text(data: ReadRequest):
             raise HTTPException(status_code=500, detail=f"{mode} 处理失败: {e}")
 
     runtime_state.clear_current_media(keep_md5=data.from_saved)
-    runtime_state.reset_podcast_generation()
 
     # 新一次朗读开始：清零出声计数与上一次的推理错误，使 /snapshot 与试音判定只反映本次。
     if S is not None:
         S.reset_run_signals()
 
-    playback_session_id, new_task_id = playback_service.start_new_session()
-    event_log.record(
-        "read_requested",
-        source=source,
-        voice=voice,
-        text_chars=len(text),
-        session_id=playback_session_id,
-        task_id=new_task_id,
-    )
-    
     state = storage.load_state()
     config = storage.load_config()
     config["performance_profile"] = data.performance_profile or config.get(
@@ -519,32 +467,42 @@ async def read_text(data: ReadRequest):
     )
     if voice:
         config["voice"] = voice
-        
-    if text == "RESUME_MODE":
+
+    if text == "RESTART_MODE":
+        # Restart the CURRENT article from the beginning (play button when idle).
+        # Empty-state guard: no article → safe no-op (avoids the
+        # state["current_article"]["title"] KeyError → 500 below).
         current_art = state.get("current_article", {})
         chunks = current_art.get("chunks", [])
-        curr_idx = current_art.get("current_index", 0)
+        if not chunks:
+            return {"status": "noop"}
+        curr_idx = 0
+        current_art["current_index"] = 0
+        state["current_article"] = current_art
+        storage.save_state(state)
     else:
         if source == "clipboard" and text:
             try:
                 saved_items_service.save(text, source="clipboard", voice=voice)
             except Exception as e:
                 print(f"[Backend] Auto-saving clipboard text failed: {e}")
-                
+
         chunks = processor.parse_dialogue_or_text(text, performance_profile=config["performance_profile"])
         state["current_article"] = {"title": text[:15].replace("\n", " ") + "...", "chunks": chunks, "current_index": 0}
         storage.save_state(state)
         curr_idx = 0
-    
-    runtime_state.set_main(title=state["current_article"]["title"], is_playing=True)
-    
-    playback_service.start_tts_thread(
-        session_id=playback_session_id,
-        task_id=new_task_id,
-        start_idx=curr_idx,
-        chunks=chunks,
-        config=config,
-        state=state,
+
+    # Single playback entry (ADR-002): owns session + producer thread + runtime
+    # 'playing' state. Routes only do the content prep above.
+    session = playback_service.play(
+        chunks, config, start_idx=curr_idx, title=state["current_article"]["title"]
+    )
+    event_log.record(
+        "read_requested",
+        source=source,
+        voice=voice,
+        text_chars=len(text),
+        session_id=session.id,
     )
     return {"status": "ok"}
 
@@ -580,7 +538,6 @@ async def selftest_voice():
 def stop_read():
     event_log.record("stop_requested")
     runtime_state.clear_current_media()
-    runtime_state.reset_podcast_generation()
     
     playback_service.stop_current_session()
     runtime_state.set_main(is_playing=False)
@@ -588,8 +545,8 @@ def stop_read():
     
     podcast_service.cancel_all()
     podcast_service.cleanup_pending_files()
-                
-    return {"status": "ok"}
+
+    return {"status": "ok", "playback_status": playback_service.playback_status()}
 
 @app.get("/status")
 def get_status():
@@ -625,9 +582,13 @@ def get_status():
     if generating_title and status_code == "IDLE":
         status_code = "BUSY"
         
+    # ADR-003 C1: derive the wire aliases from the single computed truth (same
+    # owner as /snapshot → the two endpoints can't disagree).
+    pb_status = playback_service.playback_status() if playback_service is not None else "idle"
     return {
-        "is_playing": runtime_snapshot["main_is_playing"] and not player.is_paused,
-        "is_paused": player.is_paused,
+        "playback_status": pb_status,
+        "is_playing": pb_status in ("playing", "generating"),
+        "is_paused": pb_status == "paused",
         "current_podcast_file": runtime_snapshot["current_podcast_file"],
         "current_playing_md5": runtime_snapshot["current_playing_md5"],
         "title": runtime_snapshot["main_title"],
@@ -655,12 +616,14 @@ def debug_events(limit: int = 50):
 @app.post("/pause")
 def pause_playback():
     playback_service.pause()
-    return {"status": "paused"}
+    # ADR-003 A3: return the new authoritative status so the UI applies it
+    # optimistically instead of waiting for the next ~500ms poll.
+    return {"status": "paused", "playback_status": playback_service.playback_status()}
 
 @app.post("/resume")
 def resume_playback():
     playback_service.resume()
-    return {"status": "resumed"}
+    return {"status": "resumed", "playback_status": playback_service.playback_status()}
 
 @app.post("/restart_audio")
 def restart_audio():
@@ -676,43 +639,43 @@ def restart_audio():
 def seek_playback(data: SeekRequest):
     direction = data.direction  # 1 for next, -1 for prev
     event_log.record("seek_requested", direction=direction)
-    
-    runtime_state.reset_podcast_generation()
-    
+
+
     state = storage.load_state()
     current_art = state.get("current_article", {})
     chunks = current_art.get("chunks", [])
-    
+
     if not chunks:
         raise HTTPException(status_code=400, detail="No active article")
-        
+
     curr = current_art.get("current_index", 0)
-        
+
     new_idx = curr + direction
     if new_idx < 0: new_idx = 0
     if new_idx >= len(chunks): new_idx = len(chunks) - 1
-    
-    # Update state
+
     state["current_article"]["current_index"] = new_idx
     storage.save_state(state)
-    
-    # Restart playback at new index by triggering the read flow but simulating "RESUME_MODE"
-    # We must stop current task first
-    playback_session_id, new_task_id = playback_service.start_new_session()
-    
-    runtime_state.set_main(is_playing=True)
+
     config = storage.load_config()
     config["performance_profile"] = config.get("performance_profile", "balanced")
-    
-    playback_service.start_tts_thread(
-        session_id=playback_session_id,
-        task_id=new_task_id,
-        start_idx=new_idx,
-        chunks=chunks,
-        config=config,
-        state=state,
+
+    # seek = play() from the new index, applied IMMEDIATELY so the UI flips to
+    # "playing" at once (the pause button stays usable right after pressing
+    # next/prev). The larger prebuffer means a seek into not-yet-generated audio
+    # waits for a cushion instead of stuttering into an empty buffer; during a
+    # 疯狂跳 burst, each press restarts before the cushion fills, so it simply
+    # stays silent until the presses stop and then plays from the final index —
+    # which gives the debounce effect without deferring play() (ADR-002: play()'s
+    # start_new_session invalidates the prior session first).
+    playback_service.play(
+        chunks, config, start_idx=new_idx, prebuffer_frames=SEEK_PREBUFFER_FRAMES
     )
-    return {"status": "seeking", "new_index": new_idx}
+    return {
+        "status": "seeking",
+        "new_index": new_idx,
+        "playback_status": playback_service.playback_status(),
+    }
 
 import asyncio
 
@@ -888,6 +851,16 @@ def delete_saved(data: DeleteSavedRequest):
         return {"status": "ok"}
     raise HTTPException(status_code=404, detail="Item not found")
 
+@app.post("/saved/toggle_pin")
+def toggle_saved_pin(data: dict):
+    """ADR-003 F4: pin/unpin a saved item by md5 (storage order unchanged)."""
+    md5 = data.get("md5")
+    if not md5:
+        raise HTTPException(status_code=400, detail="md5 required")
+    if saved_items_service.toggle_pin(md5):
+        return {"status": "ok"}
+    raise HTTPException(status_code=404, detail="Item not found")
+
 @app.get("/podcasts/list")
 def list_podcasts():
     return podcast_service.list_files()
@@ -1047,6 +1020,10 @@ def get_saved_items():
                 "is_exported": False,
                 "is_pending": True
             })
+    # ADR-003 F4: expose pin state as is_pinned (back-compat: absent → False).
+    # Order is preserved; the frontend sorts pinned-first for DISPLAY only.
+    for it in saved_items:
+        it["is_pinned"] = bool(it.get("pinned", False))
     return saved_items
 
 @app.post("/play_saved")
@@ -1131,6 +1108,14 @@ def get_snapshot():
             # 实时覆盖进度串，避免显示上一次播放残留的 main_progress
             runtime_snapshot["main_progress"] = f"{curr_idx + 1}/{len(chunks)}"
 
+    # ADR-003 C1: playback_status is the single computed truth. The legacy wire
+    # aliases is_playing/is_paused/main_is_playing are now DERIVED FROM it (was:
+    # is_playing from the racy stored main_is_playing flag), so they can never
+    # contradict the truth. Kept on the wire because the Chrome extension reads
+    # is_playing/is_paused/status_code.
+    pb_status = playback_service.playback_status() if playback_service is not None else "idle"
+    pb_is_playing = pb_status in ("playing", "generating")
+    pb_is_paused = pb_status == "paused"
     return {
         **playback_snap,
         "status_code": S.get_status() if S else "IDLE",
@@ -1138,15 +1123,12 @@ def get_snapshot():
         **podcast_snap,
         "active_url_tasks": list(ACTIVE_URL_TASKS.keys()),
         "instance_id": INSTANCE_ID,
-        # 暂停态：UI 的播放/暂停切换（Console/Popover/AppStateStore）读 snapshot.is_paused，
-        # 此前 /snapshot 漏发这两个字段（只有 /status 有），导致前端 isPaused 恒为 false、
-        # 暂停/恢复切换在所有播放来源（朗读/saved/播客）都失灵。补齐，与 /status 算法一致。
-        "is_paused": (player.is_paused if player is not None else False),
-        "is_playing": (
-            bool(runtime_snapshot.get("main_is_playing"))
-            and player is not None
-            and not player.is_paused
-        ),
+        "playback_status": pb_status,
+        "is_paused": pb_is_paused,
+        "is_playing": pb_is_playing,
+        # main_is_playing wire alias derived from the truth (overrides the stored
+        # runtime_snapshot value, which is now vestigial — see CONTEXT.md §4c C1).
+        "main_is_playing": pb_is_playing or pb_is_paused,
         "current_article_chunks": chunks_clean,
         "current_article_index": current_index,
         # 真实出声/失败信号：audio_frames>0 表示本次确有音频产出；inference_error 非空表示
