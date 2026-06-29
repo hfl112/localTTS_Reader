@@ -23,6 +23,13 @@ class AppStateStore {
     private(set) var isPlaying: Bool = false
     private(set) var isPaused: Bool = false
 
+    // ADR-003: the single reconciled playback truth the UI renders. Updated
+    // optimistically from command responses and from polls (stale polls dropped).
+    private(set) var playbackStatus: PlaybackStatus = .idle
+    /// When the last playback command's result was applied — polls issued before
+    /// this are pre-command views and must not overwrite the optimistic status.
+    private var lastCommandAt: Date?
+
     /// 最新一次拉到的完整 Snapshot（单一数据源）
     private(set) var lastSnapshot: Snapshot?
 
@@ -64,9 +71,25 @@ class AppStateStore {
         self.isPaused = paused
     }
 
+    /// ADR-003: apply a playback command's returned status optimistically, so the
+    /// UI flips immediately instead of waiting for the next ~500ms poll. Records
+    /// the time so in-flight (pre-command) polls don't overwrite it.
+    func applyCommandResult(_ status: PlaybackStatus, at now: Date = Date()) {
+        self.playbackStatus = status
+        self.lastCommandAt = now
+    }
+
     /// 单一轮询器拉到 snapshot 后调用：更新派生字段并通知所有监听者。
-    func updateSnapshot(_ snapshot: Snapshot) {
+    /// `issuedAt` = 该次轮询请求的发起时刻，用于丢弃命令之前的过期视图（ADR-003 #5）。
+    func updateSnapshot(_ snapshot: Snapshot, issuedAt: Date = Date()) {
         self.lastSnapshot = snapshot
+        let polled = PlaybackStatus(rawValue: snapshot.playback_status ?? "") ?? .unknown
+        self.playbackStatus = PlaybackReconciler.reconcile(
+            current: self.playbackStatus,
+            polled: polled,
+            polledIssuedAt: issuedAt,
+            lastCommandAt: self.lastCommandAt
+        )
         updatePlayback(
             title: snapshot.main_title ?? "",
             progress: snapshot.main_progress ?? "",

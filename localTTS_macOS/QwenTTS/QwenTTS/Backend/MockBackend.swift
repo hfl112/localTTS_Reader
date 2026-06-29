@@ -72,21 +72,22 @@ final class MockBackend {
             return json(snapshotDict())
         case ("POST", "/read"):
             state = .speaking
-            return ok()
+            return playbackOk()
         case ("POST", "/selftest/voice"):
             state = .speaking
             return ok()   // mock 视为试音成功（真实后端会等真出声）
         case ("POST", "/pause"):
             state = .paused
-            return ok()
+            return playbackOk()
         case ("POST", "/resume"):
             state = .speaking
-            return ok()
+            return playbackOk()
         case ("POST", "/stop"):
             state = .idle
-            return ok()
+            return playbackOk()
         case ("POST", "/seek"):
-            return ok()
+            state = .speaking
+            return playbackOk()
         case ("POST", "/control/shutdown"):
             return ok()
 
@@ -107,6 +108,10 @@ final class MockBackend {
             return json([["title": "Mock 保存项", "md5": "mockmd5", "source": "web"]])
         case ("POST", "/save_for_later"), ("POST", "/play_saved"),
              ("POST", "/delete_saved"), ("POST", "/saved_items/clear"):
+            if route == "/play_saved" {
+                state = .speaking
+                return playbackOk()
+            }
             return ok()
 
         // --- URL / Podcast / Cache (§4.3) ---
@@ -128,11 +133,19 @@ final class MockBackend {
             return json(["text": "Mock transcript line 1\nMock transcript line 2"])
         case ("POST", "/podcasts/play"), ("POST", "/podcasts/delete"),
              ("POST", "/podcasts/toggle_pin"), ("POST", "/podcasts/clear"):
+            if route == "/podcasts/play" {
+                state = .speaking
+                return playbackOk()
+            }
             return ok()
         case ("GET", "/cache/items"):
             return json([["md5": "cachemd5", "title": "Mock Cache", "size": 12345]])
         case ("POST", "/cache/play"), ("POST", "/cache/export"),
              ("POST", "/cache/delete"), ("POST", "/cache/clear"):
+            if route == "/cache/play" {
+                state = .speaking
+                return playbackOk()
+            }
             return ok()
         case ("GET", "/debug/state"), ("GET", "/debug/events"):
             return json([:])
@@ -144,6 +157,18 @@ final class MockBackend {
     }
 
     // MARK: - Fixture 构造
+
+    /// ADR-003 B5: mock state → playback_status, consistent with the backend
+    /// predicate. COOLING folds into "playing" (it's buffer-throttle, audio is
+    /// flowing) — NOT "generating".
+    static func playbackStatusString(for state: PlaybackState) -> String {
+        switch state {
+        case .idle: return "idle"
+        case .speaking: return "playing"
+        case .paused: return "paused"
+        case .cooling: return "playing"
+        }
+    }
 
     private func snapshotDict() -> [String: Any] {
         let playing = (state == .speaking || state == .paused)
@@ -158,6 +183,7 @@ final class MockBackend {
             "main_progress": "2/8",
             "main_is_playing": playing,
             "is_paused": state == .paused,
+            "playback_status": Self.playbackStatusString(for: state),
             "status_code": statusCode,
             "current_article_chunks": ["第一段", "第二段", "第三段"],
             "current_article_index": 1,
@@ -215,6 +241,10 @@ final class MockBackend {
     // MARK: - JSON helpers
 
     private func ok() -> (Int, Data?) { json(["ok": true]) }
+
+    private func playbackOk() -> (Int, Data?) {
+        json(["ok": true, "playback_status": Self.playbackStatusString(for: state)])
+    }
 
     private func json(_ obj: Any) -> (Int, Data?) {
         let data = try? JSONSerialization.data(withJSONObject: obj)

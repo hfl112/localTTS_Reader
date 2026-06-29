@@ -6,6 +6,7 @@ struct Snapshot: Codable {
     var main_progress: String?
     var main_is_playing: Bool?
     var is_paused: Bool?
+    var playback_status: String?        // ADR-003: single computed playback truth
     var status_code: String?            // "IDLE"/"BUSY"/"COOLING"
     var current_article_chunks: [String]?
     var current_article_index: Int?
@@ -14,8 +15,6 @@ struct Snapshot: Codable {
     // 注意：podcast_jobs（对象数组）刻意不纳入，播客任务列表走 fetchPodcastJobs() 专门端点
     var current_podcast_file: String?
     var current_playing_md5: String?
-    var podcast_file: String?
-    var podcast_buffer_chunks: Int?
     var podcast_generation_paused: Bool?
     var podcast_generation_pause_reason: String?
     var active_podcast_processes: Int?

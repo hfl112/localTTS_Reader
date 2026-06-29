@@ -14,6 +14,7 @@ struct LibraryItem: Identifiable, Hashable {
     var md5: String? = nil       // saved/cache：用于删除/播放缓存
     var filename: String? = nil  // podcast：文件名
     var fullText: String = ""    // 完整文本（双击查看）
+    var isPinned: Bool = false   // podcast：是否已置顶
 
     enum ItemType {
         case instant, saved, podcast, cache
@@ -86,16 +87,18 @@ final class LibraryViewModel: ObservableObject {
                 let title = rawTitle.isEmpty ? truncate(text) : rawTitle
                 let timestamp = dict["timestamp"] as? Double ?? 0
                 let md5 = dict["md5"] as? String
+                let isPinned = dict["is_pinned"] as? Bool ?? false
                 return LibraryItem(
                     title: title,
                     source: source.isEmpty ? "保存" : source,
-                    status: "已保存",
+                    status: isPinned ? "已置顶" : "已保存",
                     time: formatTime(timestamp),
                     isPlaying: false,
                     type: isClipboard ? .instant : .saved,
                     savedIndex: idx,
                     md5: md5,
-                    fullText: text
+                    fullText: text,
+                    isPinned: isPinned
                 )
             }
             items = mapped
@@ -112,7 +115,8 @@ final class LibraryViewModel: ObservableObject {
                     time: dict["date"] as? String ?? "",
                     isPlaying: false,
                     type: .podcast,
-                    filename: filename
+                    filename: filename,
+                    isPinned: isPinned
                 )
             }
 
@@ -146,6 +150,10 @@ final class LibraryViewModel: ObservableObject {
         default:
             items = []
         }
+        // ADR-003 F4: pinned-first for DISPLAY ONLY. savedIndex was already
+        // captured from the backend's original order above, so play/delete still
+        // hit the right item; this only changes what the user sees.
+        items = items.filter { $0.isPinned } + items.filter { !$0.isPinned }
     }
 
     // MARK: 操作
@@ -180,6 +188,33 @@ final class LibraryViewModel: ObservableObject {
                 if let md5 = item.md5 { _ = await client.deleteCache(md5: md5) }
             }
             await load(tab: currentTab)
+        }
+    }
+
+    /// 置顶/取消置顶播客（仅 .podcast 行有意义；后端 /podcasts/toggle_pin）。
+    func togglePin(_ item: LibraryItem, currentTab: Int) {
+        guard let client = apiClient else { return }
+        Task {
+            switch item.type {
+            case .podcast:
+                if let filename = item.filename { _ = await client.togglePodcastPin(filename: filename) }
+            case .instant, .saved:
+                if let md5 = item.md5 { _ = await client.toggleSavedPin(md5: md5) }
+            default:
+                return
+            }
+            await load(tab: currentTab)
+        }
+    }
+
+    /// ADR-003 F3: turn a 即时/稍后阅读 item into a background single-voice podcast
+    /// (generate_single_podcast is pure TTS — no LLM key needed, so no gate).
+    func generatePodcast(_ item: LibraryItem) {
+        guard let client = apiClient, !item.fullText.isEmpty else { return }
+        Task {
+            _ = await client.generateSinglePodcast(
+                text: item.fullText, source: item.source, voice: nil, title: item.title
+            )
         }
     }
 
@@ -373,7 +408,9 @@ struct LibraryView: View {
                                 isHovered: hoveredItem == item.id,
                                 isSelected: selectedItems.contains(item.id),
                                 onPlay: { viewModel.play(item) },
-                                onDelete: { viewModel.delete(item, currentTab: selectedTab) }
+                                onDelete: { viewModel.delete(item, currentTab: selectedTab) },
+                                onPin: { viewModel.togglePin(item, currentTab: selectedTab) },
+                                onGeneratePodcast: { viewModel.generatePodcast(item) }
                             )
                             .onHover { isHovered in
                                 if isHovered {
@@ -448,7 +485,9 @@ struct LibraryRowView: View {
     let isSelected: Bool
     var onPlay: () -> Void = {}
     var onDelete: () -> Void = {}
-    
+    var onPin: () -> Void = {}
+    var onGeneratePodcast: () -> Void = {}
+
     var body: some View {
         HStack(spacing: 16) {
             // Selection / Status Icon
@@ -505,18 +544,28 @@ struct LibraryRowView: View {
                         .buttonStyle(.plain)
                         .help("播放")
 
-                    Button(action: {}) { Image(systemName: "bookmark") }
+                    // 生成播客：仅即时/稍后阅读行——用该条 fullText 起一个后台单人
+                    // 播客任务（generate_single_podcast，纯 TTS，不需 LLM key）。
+                    if item.type == .instant || item.type == .saved {
+                        Button(action: { onGeneratePodcast() }) { Image(systemName: "waveform") }
+                            .buttonStyle(.plain)
+                            .help("生成播客")
+                    }
+
+                    // 置顶：播客 + 即时/稍后阅读均可（缓存行不可）。
+                    if item.type != .cache {
+                        Button(action: { onPin() }) {
+                            Image(systemName: item.isPinned ? "pin.fill" : "pin")
+                        }
                         .buttonStyle(.plain)
-                        .help("保存")
+                        .foregroundColor(item.isPinned ? .accentColor : .secondary)
+                        .help(item.isPinned ? "取消置顶" : "置顶")
+                    }
 
                     Button(action: { onDelete() }) { Image(systemName: "trash") }
                         .buttonStyle(.plain)
                         .foregroundColor(.red)
                         .help("删除")
-
-                    Button(action: {}) { Image(systemName: "ellipsis") }
-                        .buttonStyle(.plain)
-                        .help("更多操作")
                 }
                 .padding(.trailing, 8)
                 .foregroundColor(.secondary)

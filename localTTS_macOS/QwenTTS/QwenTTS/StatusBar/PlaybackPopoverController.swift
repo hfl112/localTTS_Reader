@@ -106,24 +106,17 @@ class PlaybackPopoverController: NSViewController {
         let progSuffix = stateStore.progressText.isEmpty ? "" : " [\(stateStore.progressText)]"
         titleLabel?.stringValue = stateStore.currentTitle.isEmpty ? "当前暂无朗读内容" : "\(stateStore.currentTitle)\(progSuffix)"
         
-        // 更新播放按钮文字
-        if stateStore.isPaused {
-            playButton?.title = "继续"
-        } else if stateStore.isPlaying {
-            playButton?.title = "暂停"
-        } else {
-            playButton?.title = "播放"
-        }
+        // ADR-003: button label from the single reconciled status via the one
+        // mapping table (same source as Console — the two buttons can't disagree).
+        playButton?.title = PlaybackPresentation(stateStore.playbackStatus).buttonLabel
     }
 
     @objc private func clickPlayPause() {
         guard let stateStore = coordinator?.stateStore else { return }
-        if stateStore.isPaused {
-            coordinator?.resumePlayback()
-        } else if stateStore.isPlaying {
-            coordinator?.pausePlayback()
-        } else {
-            coordinator?.readClipboard()
+        switch PlaybackPresentation(stateStore.playbackStatus).action {
+        case .pause: coordinator?.pausePlayback()
+        case .resume: coordinator?.resumePlayback()
+        case .read: coordinator?.readClipboard()   // popover's idle action = read clipboard
         }
     }
 

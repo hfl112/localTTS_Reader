@@ -145,24 +145,33 @@ class BackendAPIClient {
         return (json["error"] as? String) ?? "试音失败：未产生音频"
     }
 
-    func stopPlayback() async -> Bool {
-        let (status, _) = await postJSON(path: "/stop", body: nil, requireToken: true)
-        return status == 200
+    /// ADR-003: playback commands return the new authoritative playback_status
+    /// (nil on failure) so the caller can apply it optimistically.
+    private static func parsePlaybackStatus(_ data: Data?) -> PlaybackStatus? {
+        guard let data,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let raw = obj["playback_status"] as? String else { return nil }
+        return PlaybackStatus(rawValue: raw) ?? .unknown
     }
 
-    func pausePlayback() async -> Bool {
-        let (status, _) = await postJSON(path: "/pause", body: nil)
-        return status == 200
+    func stopPlayback() async -> PlaybackStatus? {
+        let (status, data) = await postJSON(path: "/stop", body: nil, requireToken: true)
+        return status == 200 ? Self.parsePlaybackStatus(data) : nil
     }
 
-    func resumePlayback() async -> Bool {
-        let (status, _) = await postJSON(path: "/resume", body: nil)
-        return status == 200
+    func pausePlayback() async -> PlaybackStatus? {
+        let (status, data) = await postJSON(path: "/pause", body: nil)
+        return status == 200 ? Self.parsePlaybackStatus(data) : nil
     }
 
-    func seekPlayback(direction: Int) async -> Bool {
-        let (status, _) = await postJSON(path: "/seek", body: ["direction": direction])
-        return status == 200
+    func resumePlayback() async -> PlaybackStatus? {
+        let (status, data) = await postJSON(path: "/resume", body: nil)
+        return status == 200 ? Self.parsePlaybackStatus(data) : nil
+    }
+
+    func seekPlayback(direction: Int) async -> PlaybackStatus? {
+        let (status, data) = await postJSON(path: "/seek", body: ["direction": direction])
+        return status == 200 ? Self.parsePlaybackStatus(data) : nil
     }
 
     func fetchSnapshot() async -> Snapshot? {
@@ -341,6 +350,12 @@ class BackendAPIClient {
 
     func togglePodcastPin(filename: String) async -> Bool {
         let (status, _) = await postJSON(path: "/podcasts/toggle_pin", body: ["filename": filename])
+        return status == 200
+    }
+
+    // ADR-003 F4: pin/unpin a 即时/稍后阅读 item by md5 (storage order unchanged).
+    func toggleSavedPin(md5: String) async -> Bool {
+        let (status, _) = await postJSON(path: "/saved/toggle_pin", body: ["md5": md5])
         return status == 200
     }
 

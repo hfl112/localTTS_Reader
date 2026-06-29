@@ -20,7 +20,8 @@ class ConsoleViewController: NSViewController {
     private var currentChunks: [String] = []
     private var currentSentenceIndex = 0
     private var transcriptLabels: [NSTextField] = []
-    private var lastSnapshot: Snapshot?
+    // ADR-003: no local snapshot cache — the button/render read the single
+    // reconciled truth from AppStateStore (coordinator.stateStore.playbackStatus).
     /// AppStateStore 订阅 token；不再自己轮询 /snapshot，改为订阅集中状态源。
     private var snapshotListenerToken: Int?
     
@@ -33,6 +34,7 @@ class ConsoleViewController: NSViewController {
     private let rewind15Btn = NSButton()
     private let prevBtn = NSButton()
     private let playBtn = NSButton()
+    private let pauseBtn = NSButton()
     private let stopBtn = NSButton()
     private let nextBtn = NSButton()
     private let forward15Btn = NSButton()
@@ -437,47 +439,48 @@ class ConsoleViewController: NSViewController {
         }, completionHandler: nil)
     }
 
-    @objc private func handleNextSentence() {
+    /// ADR-003: one seek path that applies the returned status optimistically.
+    private func seek(_ direction: Int) {
         Task {
-            _ = await coordinator?.processManager.apiClient?.seekPlayback(direction: 1)
+            if let s = await coordinator?.processManager.apiClient?.seekPlayback(direction: direction) {
+                coordinator?.stateStore.applyCommandResult(s)
+            }
         }
     }
-    
-    @objc private func handlePrevSentence() {
-        Task {
-            _ = await coordinator?.processManager.apiClient?.seekPlayback(direction: -1)
-        }
-    }
-    
-    @objc private func handleRewind15() {
-        Task {
-            _ = await coordinator?.processManager.apiClient?.seekPlayback(direction: -3)
-        }
-    }
-    
+
+    @objc private func handleNextSentence() { seek(1) }
+
+    @objc private func handlePrevSentence() { seek(-1) }
+
+    @objc private func handleRewind15() { seek(-3) }
+
     @objc private func handleForward15() {
-        Task {
-            _ = await coordinator?.processManager.apiClient?.seekPlayback(direction: 3)
-        }
+        seek(3)
     }
     
+    // 三独立键（放弃播放/暂停合一）：
+    // ▶ 播放 = 从头播放（输入框有字→读输入；否则当前文章 RESTART_MODE 从头读）。
+    // ⏸ 暂停 = 暂停⇄续读切换（续读归此键）。 ⏹ 停止 = 停止。
+    // ▶ 播放键：之前暂停→继续；否则→从头播放当前文章。(读新输入是「即时阅读」键的事。)
     @objc private func handlePlayBtn() {
         guard let coordinator = coordinator else { return }
-        let snap = lastSnapshot
-        let isPlaying = snap?.main_is_playing ?? false
-        let isPaused = snap?.is_paused ?? false
-        
-        if isPlaying {
-            if isPaused {
-                coordinator.resumePlayback()
-            } else {
-                coordinator.pausePlayback()
+        switch playButtonIntent(for: coordinator.stateStore.playbackStatus) {
+        case .resume:
+            coordinator.resumePlayback()
+        case .restartFromBeginning:
+            Task {
+                _ = await coordinator.processManager.apiClient?.readText(
+                    text: "RESTART_MODE", voice: nil, performanceProfile: nil
+                )
             }
-        } else {
-            triggerInstantRead()
         }
     }
-    
+
+    // ⏸ 暂停键：只暂停。 ⏹ 停止键：只停止。
+    @objc private func handlePauseBtn() {
+        coordinator?.pausePlayback()
+    }
+
     @objc private func handleStopBtn() {
         coordinator?.stopPlayback()
     }
@@ -751,11 +754,14 @@ class ConsoleViewController: NSViewController {
 
         if backendState == .ready {
             if let snap = snapshot {
-                lastSnapshot = snap
-                isPlaying = snap.main_is_playing ?? false
-                isPaused = snap.is_paused ?? false
-                let statusCode = snap.status_code ?? "IDLE"
-                isGenerating = (statusCode == "BUSY" || statusCode == "COOLING")
+                // ADR-003: status badge/icon come from the single reconciled
+                // status (set by the store from this same poll), not re-derived
+                // from raw snapshot booleans. isPlaying stays true while paused so
+                // the existing badge/time logic below is preserved.
+                let status = coordinator.stateStore.playbackStatus
+                isPlaying = (status == .playing || status == .paused)
+                isPaused = (status == .paused)
+                isGenerating = (status == .generating)
 
                 chunks = snap.current_article_chunks ?? []
                 currentIdx = snap.current_article_index ?? 0
@@ -772,6 +778,10 @@ class ConsoleViewController: NSViewController {
                 } else if isGenerating {
                     statusText = "GENERATING"
                     statusColor = .systemBlue
+                } else if (snap.active_podcast_processes ?? 0) > 0 {
+                    // 朗读空闲，但后台正在生成播客——让用户感知到播客在跑。
+                    statusText = "🎙️ 播客生成中"
+                    statusColor = .systemPurple
                 } else {
                     statusText = "IDLE"
                     statusColor = .systemGray
@@ -810,10 +820,8 @@ class ConsoleViewController: NSViewController {
             updateTranscriptState(animated: true)
         }
         
-        // Update play button icon
-        let playIcon = (isPlaying && !isPaused) ? "pause.fill" : "play.fill"
-        let playConfig = NSImage.SymbolConfiguration(pointSize: 36, weight: .regular)
-        playBtn.image = NSImage(systemSymbolName: playIcon, accessibilityDescription: nil)?.withSymbolConfiguration(playConfig)
+        // 三独立键图标固定（▶ / ⏸ / ⏹，在 setup 里设好）：播放键管播放/继续，
+        // 暂停键只暂停，停止键只停止。不禁用、不切换图标。
         
         // Update progress label
         if !mainProgress.isEmpty {
@@ -919,13 +927,19 @@ class ConsoleViewController: NSViewController {
         prevBtn.target = self
         prevBtn.action = #selector(handlePrevSentence)
         
-        playBtn.image = makeTransportBtn(icon: "play.fill", size: 36, tooltip: "播放 / 暂停").image
+        playBtn.image = makeTransportBtn(icon: "play.fill", size: 36, tooltip: "播放（从头）").image
         playBtn.isBordered = false
         playBtn.contentTintColor = .controlAccentColor
-        playBtn.toolTip = "播放 / 暂停"
+        playBtn.toolTip = "播放（从头）"
         playBtn.target = self
         playBtn.action = #selector(handlePlayBtn)
-        
+
+        pauseBtn.image = makeTransportBtn(icon: "pause.fill", size: 30, tooltip: "暂停 / 继续").image
+        pauseBtn.isBordered = false
+        pauseBtn.toolTip = "暂停 / 继续"
+        pauseBtn.target = self
+        pauseBtn.action = #selector(handlePauseBtn)
+
         stopBtn.image = makeTransportBtn(icon: "stop.fill", tooltip: "停止").image
         stopBtn.isBordered = false
         stopBtn.toolTip = "停止"
@@ -950,6 +964,7 @@ class ConsoleViewController: NSViewController {
         centerControls.addArrangedSubview(rewind15Btn)
         centerControls.addArrangedSubview(prevBtn)
         centerControls.addArrangedSubview(playBtn)
+        centerControls.addArrangedSubview(pauseBtn)
         centerControls.addArrangedSubview(stopBtn)
         centerControls.addArrangedSubview(nextBtn)
         centerControls.addArrangedSubview(forward15Btn)

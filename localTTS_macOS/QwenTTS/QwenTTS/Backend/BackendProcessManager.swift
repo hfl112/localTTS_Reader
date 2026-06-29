@@ -217,13 +217,18 @@ class BackendProcessManager {
 
     func triggerAction(_ action: String) {
         Task {
+            let status: PlaybackStatus?
             switch action {
-            case "stop": _ = await apiClient?.stopPlayback()
-            case "pause": _ = await apiClient?.pausePlayback()
-            case "resume": _ = await apiClient?.resumePlayback()
-            case "next": _ = await apiClient?.seekPlayback(direction: 1)
-            case "prev": _ = await apiClient?.seekPlayback(direction: -1)
-            default: break
+            case "stop": status = await apiClient?.stopPlayback()
+            case "pause": status = await apiClient?.pausePlayback()
+            case "resume": status = await apiClient?.resumePlayback()
+            case "next": status = await apiClient?.seekPlayback(direction: 1)
+            case "prev": status = await apiClient?.seekPlayback(direction: -1)
+            default: status = nil
+            }
+            // ADR-003: apply the command's returned status optimistically.
+            if let status {
+                await MainActor.run { self.stateStore?.applyCommandResult(status) }
             }
         }
     }
@@ -262,9 +267,12 @@ class BackendProcessManager {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(500))
                 guard let self, !Task.isCancelled else { return }
+                // Stamp the fetch issue time BEFORE awaiting, so a poll that was
+                // in flight when a command landed is correctly judged stale (ADR-003 #5).
+                let issuedAt = Date()
                 if let snap = await self.apiClient?.fetchSnapshot() {
                     // 1) 写入集中状态源并通知所有订阅者（含派生字段、连接健康度）
-                    self.stateStore?.updateSnapshot(snap)
+                    self.stateStore?.updateSnapshot(snap, issuedAt: issuedAt)
                     // 2) 保留既有回调，避免破坏 ApplicationCoordinator / popover 调用方
                     let title = snap.main_title ?? ""
                     let progress = snap.main_progress ?? ""
